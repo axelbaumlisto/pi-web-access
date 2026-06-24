@@ -293,6 +293,7 @@ interface PendingCurate {
 	finish: (value: unknown) => void;
 	cancel: (reason?: "user" | "stale") => void;
 	browserPromise?: Promise<void>;
+	browserOpenError?: string;
 }
 
 
@@ -651,6 +652,8 @@ export default function (pi: ExtensionAPI) {
 			queryCount?: number;
 			browserConnected?: boolean;
 			lastHeartbeatAgeMs?: number | null;
+			curatorUrl?: string;
+			browserOpenError?: string;
 		},
 	) {
 		const message = `Search curation cancelled (${reason}).`;
@@ -662,6 +665,9 @@ export default function (pi: ExtensionAPI) {
 				resultCount: q.results?.length ?? 0,
 			}))
 			: undefined;
+		const extraLines: string[] = [];
+		if (partial?.curatorUrl) extraLines.push(`curator: ${partial.curatorUrl}`);
+		if (partial?.browserOpenError) extraLines.push(`browser open error: ${partial.browserOpenError}`);
 		return {
 			content: [{ type: "text", text: message }],
 			details: {
@@ -672,6 +678,7 @@ export default function (pi: ExtensionAPI) {
 				lastHeartbeatAgeMs: partial?.lastHeartbeatAgeMs,
 				queryCount: partial?.queryCount,
 				cancelledQueries,
+				extraLines: extraLines.length > 0 ? extraLines : undefined,
 			},
 		};
 	}
@@ -1046,6 +1053,8 @@ export default function (pi: ExtensionAPI) {
 								queryCount: pc.queryList.length,
 								browserConnected: conn?.browserConnected,
 								lastHeartbeatAgeMs: conn?.lastHeartbeatAgeMs,
+								curatorUrl: pc.curatorUrl,
+								browserOpenError: pc.browserOpenError,
 							}));
 						}
 						closeCurator(callId);
@@ -1123,6 +1132,20 @@ export default function (pi: ExtensionAPI) {
 			}
 			if (searchesComplete) handle.searchesDone();
 
+			const sendCuratorFallbackUpdate = (message: string) => {
+				pc.onUpdate?.({
+					content: [{ type: "text", text: `${message}\nOpen manually: ${handle.url}` }],
+					details: {
+						phase: "curator-fallback",
+						progress: searchesComplete ? 1 : 0.5,
+						curatorUrl: handle.url,
+						timeoutSeconds: pc.timeoutSeconds,
+						shortcut: curateKey,
+						browserOpenError: pc.browserOpenError,
+					},
+				});
+			};
+
 			pc.onUpdate?.({
 				content: [{ type: "text", text: searchesComplete ? "Waiting for summary approval in browser..." : "Searches streaming to browser..." }],
 				details: {
@@ -1156,7 +1179,10 @@ export default function (pi: ExtensionAPI) {
 		} catch (err) {
 			const message = err instanceof Error ? err.message : String(err);
 			console.error(`Failed to open curator UI: ${message}`);
-			if (pendingCurates.get(callId) === pc || (handle && activeCurators.get(callId) === handle)) {
+			if (handle && activeCurators.get(callId) === handle && pendingCurates.get(callId) === pc) {
+				pc.browserOpenError = message;
+				sendCuratorFallbackUpdate("Search curator is running, but the browser did not open automatically.");
+			} else if (pendingCurates.get(callId) === pc || (handle && activeCurators.get(callId) === handle)) {
 				closeCurator(callId);
 			}
 		}
@@ -1335,6 +1361,8 @@ export default function (pi: ExtensionAPI) {
 						queryCount: queryList.length,
 						browserConnected: conn?.browserConnected,
 						lastHeartbeatAgeMs: conn?.lastHeartbeatAgeMs,
+						curatorUrl: pc.curatorUrl,
+						browserOpenError: pc.browserOpenError,
 					}));
 				};
 
@@ -1394,16 +1422,30 @@ export default function (pi: ExtensionAPI) {
 				const curator = activeCurators.get(callId);
 				if (curator && !cancelled) {
 					curator.searchesDone();
-					pc.onUpdate?.({
-						content: [{ type: "text", text: "All searches complete — waiting for summary approval in browser..." }],
-						details: {
-							phase: "curating",
-							progress: 1,
-							curatorUrl: pc.curatorUrl,
-							timeoutSeconds: pc.timeoutSeconds,
-							shortcut: curateKey,
-						},
-					});
+					if (pc.browserOpenError) {
+						pc.onUpdate?.({
+							content: [{ type: "text", text: `All searches complete. Open the curator manually: ${pc.curatorUrl}` }],
+							details: {
+								phase: "curator-fallback",
+								progress: 1,
+								curatorUrl: pc.curatorUrl,
+								timeoutSeconds: pc.timeoutSeconds,
+								shortcut: curateKey,
+								browserOpenError: pc.browserOpenError,
+							},
+						});
+					} else {
+						pc.onUpdate?.({
+							content: [{ type: "text", text: "All searches complete — waiting for summary approval in browser..." }],
+							details: {
+								phase: "curating",
+								progress: 1,
+								curatorUrl: pc.curatorUrl,
+								timeoutSeconds: pc.timeoutSeconds,
+								shortcut: curateKey,
+							},
+						});
+					}
 				}
 
 				return promise;
@@ -1538,6 +1580,7 @@ export default function (pi: ExtensionAPI) {
 				lastHeartbeatAgeMs?: number | null;
 				cancelledQueries?: import("./render-search-error.ts").CancelledQueryDetail[];
 				curatorUrl?: string;
+				browserOpenError?: string;
 				timeoutSeconds?: number;
 				shortcut?: string;
 				summary?: {
@@ -1553,6 +1596,15 @@ export default function (pi: ExtensionAPI) {
 			};
 
 			if (isPartial) {
+				if (details?.phase === "curator-fallback") {
+					const lines = [theme.fg("warning", "Open the search curator manually:")];
+					if (details?.curatorUrl) lines.push(theme.fg("muted", `  ${details.curatorUrl}`));
+					if (details?.browserOpenError) lines.push(theme.fg("dim", `  auto-open failed: ${details.browserOpenError}`));
+					const timeout = typeof details?.timeoutSeconds === "number" ? details.timeoutSeconds : undefined;
+					const shortcut = typeof details?.shortcut === "string" ? details.shortcut : curateKey;
+					lines.push(theme.fg("dim", timeout ? `  auto-submits after ${timeout}s idle; ${shortcut} reopens` : `  ${shortcut} reopens`));
+					return new Text(lines.join("\n"), 0, 0);
+				}
 				if (details?.phase === "curating" || details?.phase === "waiting-for-approval" || details?.phase === "generating-summary") {
 					const phaseText = details?.phase === "generating-summary"
 						? "generating summary draft..."
@@ -2323,6 +2375,7 @@ export default function (pi: ExtensionAPI) {
 				commandHandle = handle;
 				activeCurators.set(commandCallId, handle);
 				const open = platform() === "darwin" ? await getGlimpseOpen() : null;
+				let browserOpenError: string | null = null;
 				if (open) {
 					try {
 						const win = openInGlimpse(open, handle.url, "Search Curator");
@@ -2337,10 +2390,22 @@ export default function (pi: ExtensionAPI) {
 						const message = err instanceof Error ? err.message : String(err);
 						console.error(`Failed to open Glimpse curator window: ${message}`);
 						glimpseWins.delete(commandCallId);
-						await openInBrowser(pi, handle.url);
+						try {
+							await openInBrowser(pi, handle.url);
+						} catch (browserErr) {
+							browserOpenError = browserErr instanceof Error ? browserErr.message : String(browserErr);
+						}
 					}
 				} else {
-					await openInBrowser(pi, handle.url);
+					try {
+						await openInBrowser(pi, handle.url);
+					} catch (browserErr) {
+						browserOpenError = browserErr instanceof Error ? browserErr.message : String(browserErr);
+					}
+				}
+				if (browserOpenError) {
+					console.error(`Failed to open curator UI: ${browserOpenError}`);
+					ctx.ui.notify(`Search curator is running, but the browser did not open automatically. Open manually: ${handle.url}`, "info");
 				}
 
 				if (queries.length > 0) {
