@@ -1,13 +1,16 @@
 import { existsSync, readFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
+import type { ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { activityMonitor } from "./activity.ts";
 import { getApiKey, API_BASE, DEFAULT_MODEL } from "./gemini-api.ts";
 import { isGeminiWebAvailable, queryWithCookies } from "./gemini-web.ts";
 import { isPerplexityAvailable, searchWithPerplexity, type SearchResult, type SearchResponse, type SearchOptions } from "./perplexity.ts";
 import { hasExaApiKey, isExaAvailable, searchWithExa } from "./exa.ts";
+import { isBraveAvailable, searchWithBrave } from "./brave.ts";
+import { isOpenAISearchAvailable, searchWithOpenAI } from "./openai-search.ts";
 
-export type SearchProvider = "auto" | "perplexity" | "gemini" | "exa";
+export type SearchProvider = "auto" | "openai" | "brave" | "perplexity" | "gemini" | "exa";
 export type ResolvedSearchProvider = Exclude<SearchProvider, "auto">;
 
 export interface AttributedSearchResponse extends SearchResponse {
@@ -57,14 +60,14 @@ function normalizeSearchModel(value: unknown): string | undefined {
 
 function normalizeSearchProvider(value: unknown): SearchProvider {
 	const normalized = typeof value === "string" ? value.trim().toLowerCase() : "";
-	return normalized === "auto" || normalized === "perplexity" || normalized === "gemini" || normalized === "exa"
-		? normalized
-		: "auto";
+	const valid: SearchProvider[] = ["auto", "openai", "brave", "perplexity", "gemini", "exa"];
+	return valid.includes(normalized as SearchProvider) ? normalized as SearchProvider : "auto";
 }
 
 export interface FullSearchOptions extends SearchOptions {
 	provider?: SearchProvider;
 	includeContent?: boolean;
+	extensionContext?: ExtensionContext;
 }
 
 function errorMessage(err: unknown): string {
@@ -73,6 +76,14 @@ function errorMessage(err: unknown): string {
 
 function isAbortError(err: unknown): boolean {
 	return errorMessage(err).toLowerCase().includes("abort");
+}
+
+function shouldTryOpenAIInAuto(options: SearchOptions): boolean {
+	if (options.recencyFilter) return false;
+	if (typeof options.numResults === "number" && Number.isFinite(options.numResults) && Math.floor(options.numResults) !== 5) {
+		return false;
+	}
+	return true;
 }
 
 async function searchWithGemini(
@@ -108,6 +119,16 @@ async function searchWithGemini(
 export async function search(query: string, options: FullSearchOptions = {}): Promise<AttributedSearchResponse> {
 	const config = getSearchConfig();
 	const provider = options.provider ?? config.searchProvider;
+
+	if (provider === "openai") {
+		const result = await searchWithOpenAI(query, options, options.extensionContext);
+		return { ...result, provider: "openai" };
+	}
+
+	if (provider === "brave") {
+		const result = await searchWithBrave(query, options);
+		return { ...result, provider: "brave" };
+	}
 
 	if (provider === "perplexity") {
 		const result = await searchWithPerplexity(query, options);
@@ -148,6 +169,18 @@ export async function search(query: string, options: FullSearchOptions = {}): Pr
 
 	const fallbackErrors: string[] = [];
 
+	if (shouldTryOpenAIInAuto(options)) {
+		try {
+			if (await isOpenAISearchAvailable(options.extensionContext)) {
+				const result = await searchWithOpenAI(query, options, options.extensionContext);
+				return { ...result, provider: "openai" };
+			}
+		} catch (err) {
+			if (isAbortError(err)) throw err;
+			fallbackErrors.push(`OpenAI: ${errorMessage(err)}`);
+		}
+	}
+
 	if (provider !== "exa" && isExaAvailable()) {
 		try {
 			const result = await searchWithExa(query, options);
@@ -155,6 +188,16 @@ export async function search(query: string, options: FullSearchOptions = {}): Pr
 		} catch (err) {
 			if (isAbortError(err)) throw err;
 			fallbackErrors.push(`Exa: ${errorMessage(err)}`);
+		}
+	}
+
+	if (isBraveAvailable()) {
+		try {
+			const result = await searchWithBrave(query, options);
+			return { ...result, provider: "brave" };
+		} catch (err) {
+			if (isAbortError(err)) throw err;
+			fallbackErrors.push(`Brave: ${errorMessage(err)}`);
 		}
 	}
 
@@ -182,9 +225,9 @@ export async function search(query: string, options: FullSearchOptions = {}): Pr
 
 	throw new Error(
 		"No search provider available. Either:\n" +
-		"  1. Set perplexityApiKey in ~/.pi/web-search.json\n" +
-		"  2. Set EXA_API_KEY (or exaApiKey) in ~/.pi/web-search.json\n" +
-		"  3. Set GEMINI_API_KEY in ~/.pi/web-search.json\n" +
+		"  1. Use /login to sign in with a Codex subscription for OpenAI web search\n" +
+		"  2. Set openaiApiKey, braveApiKey, perplexityApiKey, exaApiKey, or geminiApiKey in ~/.pi/web-search.json\n" +
+		"  3. Set OPENAI_API_KEY, BRAVE_API_KEY, EXA_API_KEY, PERPLEXITY_API_KEY, or GEMINI_API_KEY env vars\n" +
 		"  4. Sign into gemini.google.com in a supported Chromium-based browser"
 	);
 }

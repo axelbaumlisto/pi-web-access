@@ -4,6 +4,13 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+## [0.11.0] - 2026-06-24
+
+### Added
+- Added OpenAI Responses API web search with Codex subscription auth, OpenAI API key auth, required web-search tool use, model-registry header forwarding, and source extraction from citations and web-search sources.
+- Added Brave Search API provider with `BRAVE_API_KEY` / `braveApiKey`, freshness mapping, and domain include/exclude handling.
+- Added OpenAI and Brave to `auto` provider routing, explicit `provider` selection, curator provider buttons, provider tags, and provider availability checks.
+
 ### Changed
 - Updated extension imports for Pi 0.80.x, including the `@earendil-works` package namespace, `.ts` local module specifiers, and the `@earendil-works/pi-ai/compat` entrypoint for legacy model helpers.
 - Declared Pi-bundled packages as peer dependencies so Pi can provide its runtime aliases when loading the extension.
@@ -11,6 +18,8 @@ All notable changes to this project will be documented in this file.
 ### Fixed
 - Aligned custom message display values and widget clearing with the current Pi extension API types.
 - Surfaced real YouTube Gemini API failures instead of replacing them with the generic Chrome/API-key guidance.
+- Kept Brave snippets out of `inlineContent` so `includeContent` searches still fetch full page content through the background extraction pipeline.
+- Prevented constrained auto searches from silently losing recency/count constraints by preferring Exa/Brave over OpenAI when OpenAI cannot enforce them strictly.
 
 ### Removed
 - Removed the committed `package-lock.json` from the extension package and ignored future lockfiles.

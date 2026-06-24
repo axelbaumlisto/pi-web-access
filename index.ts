@@ -38,6 +38,8 @@ import { isExaAvailable } from "./exa.ts";
 import { isGeminiApiAvailable } from "./gemini-api.ts";
 import { getActiveGoogleEmail, isGeminiWebAvailable } from "./gemini-web.ts";
 import { isBrowserCookieAccessAllowed } from "./gemini-web-config.ts";
+import { isBraveAvailable } from "./brave.ts";
+import { isOpenAISearchAvailable } from "./openai-search.ts";
 
 const WEB_SEARCH_CONFIG_PATH = join(homedir(), ".pi", "web-search.json");
 
@@ -53,6 +55,8 @@ interface WebSearchConfig {
 }
 
 interface ProviderAvailability {
+	openai: boolean;
+	brave: boolean;
 	perplexity: boolean;
 	exa: boolean;
 	gemini: boolean;
@@ -114,10 +118,8 @@ function normalizeProviderInput(value: unknown): SearchProvider | undefined {
 	if (value === undefined) return undefined;
 	if (typeof value !== "string") return "auto";
 	const normalized = value.trim().toLowerCase();
-	if (normalized === "auto" || normalized === "exa" || normalized === "perplexity" || normalized === "gemini") {
-		return normalized;
-	}
-	return "auto";
+	const valid: SearchProvider[] = ["auto", "openai", "brave", "exa", "perplexity", "gemini"];
+	return valid.includes(normalized as SearchProvider) ? normalized as SearchProvider : "auto";
 }
 
 function normalizeCuratorTimeoutSeconds(value: unknown): number | undefined {
@@ -148,47 +150,73 @@ function getCuratorTimeoutSeconds(): number {
 	return normalizeCuratorTimeoutSeconds(source.curatorTimeoutSeconds) ?? DEFAULT_CURATOR_TIMEOUT_SECONDS;
 }
 
-async function getProviderAvailability(): Promise<ProviderAvailability> {
+async function getProviderAvailability(ctx: ExtensionContext): Promise<ProviderAvailability> {
 	const geminiWebAvail = await isGeminiWebAvailable();
 	return {
+		openai: await isOpenAISearchAvailable(ctx),
+		brave: isBraveAvailable(),
 		perplexity: isPerplexityAvailable(),
 		exa: isExaAvailable(),
 		gemini: isGeminiApiAvailable() || !!geminiWebAvail,
 	};
 }
 
-async function loadCuratorBootstrap(requestedProvider: unknown): Promise<CuratorBootstrap> {
-	const availableProviders = await getProviderAvailability();
+function shouldPreferOpenAI(options?: Pick<PendingCurate, "numResults" | "recencyFilter">): boolean {
+	if (!options) return true;
+	if (options.recencyFilter) return false;
+	if (typeof options.numResults === "number" && Number.isFinite(options.numResults) && Math.floor(options.numResults) !== 5) {
+		return false;
+	}
+	return true;
+}
+
+async function loadCuratorBootstrap(
+	requestedProvider: unknown,
+	ctx: ExtensionContext,
+	options?: Pick<PendingCurate, "numResults" | "recencyFilter">,
+): Promise<CuratorBootstrap> {
+	const availableProviders = await getProviderAvailability(ctx);
 	return {
 		availableProviders,
-		defaultProvider: resolveProvider(requestedProvider, availableProviders),
+		defaultProvider: resolveProvider(requestedProvider, availableProviders, options),
 		timeoutSeconds: getCuratorTimeoutSeconds(),
 	};
+}
+
+function firstAvailableProvider(available: ProviderAvailability, preferOpenAI: boolean, fallback: ResolvedSearchProvider): ResolvedSearchProvider {
+	if (preferOpenAI && available.openai) return "openai";
+	if (available.exa) return "exa";
+	if (available.brave) return "brave";
+	if (available.perplexity) return "perplexity";
+	if (available.gemini) return "gemini";
+	return fallback;
 }
 
 function resolveProvider(
 	requested: unknown,
 	available: ProviderAvailability,
+	options?: Pick<PendingCurate, "numResults" | "recencyFilter">,
 ): ResolvedSearchProvider {
 	const provider = normalizeProviderInput(requested ?? loadConfig().provider ?? "auto") ?? "auto";
+	const preferOpenAI = shouldPreferOpenAI(options);
 
 	if (provider === "auto") {
-		if (available.exa) return "exa";
-		if (available.perplexity) return "perplexity";
-		if (available.gemini) return "gemini";
-		return "exa";
+		return firstAvailableProvider(available, preferOpenAI, "exa");
+	}
+	if (provider === "openai" && !available.openai) {
+		return firstAvailableProvider(available, false, "openai");
+	}
+	if (provider === "brave" && !available.brave) {
+		return firstAvailableProvider(available, preferOpenAI, "brave");
 	}
 	if (provider === "exa" && !available.exa) {
-		if (available.perplexity) return "perplexity";
-		return available.gemini ? "gemini" : "exa";
+		return firstAvailableProvider(available, preferOpenAI, "exa");
 	}
 	if (provider === "perplexity" && !available.perplexity) {
-		if (available.exa) return "exa";
-		return available.gemini ? "gemini" : "perplexity";
+		return firstAvailableProvider(available, preferOpenAI, "perplexity");
 	}
 	if (provider === "gemini" && !available.gemini) {
-		if (available.exa) return "exa";
-		return available.perplexity ? "perplexity" : "gemini";
+		return firstAvailableProvider(available, preferOpenAI, "gemini");
 	}
 	return provider;
 }
@@ -213,6 +241,7 @@ interface PendingCurate {
 	domainFilter?: string[];
 	availableProviders: ProviderAvailability;
 	defaultProvider: ResolvedSearchProvider;
+	searchProvider: SearchProvider;
 	summaryModels: Array<{ value: string; label: string }>;
 	defaultSummaryModel: string | null;
 	timeoutSeconds: number;
@@ -864,6 +893,7 @@ export default function (pi: ExtensionAPI) {
 					timeout: pc.timeoutSeconds,
 					availableProviders: pc.availableProviders,
 					defaultProvider: pc.defaultProvider,
+					searchProvider: pc.searchProvider,
 					summaryModels: pc.summaryModels,
 					defaultSummaryModel: pc.defaultSummaryModel,
 				},
@@ -943,6 +973,7 @@ export default function (pi: ExtensionAPI) {
 						const normalized = normalizeProviderInput(provider);
 						if (!normalized || normalized === "auto") return;
 						pc.defaultProvider = normalized;
+						pc.searchProvider = normalized;
 						try {
 							saveConfig({ provider: normalized });
 						} catch (err) {
@@ -954,7 +985,7 @@ export default function (pi: ExtensionAPI) {
 						if (pendingCurate !== pc) throw new Error("Curator session is no longer active.");
 						const normalizedProvider = normalizeProviderInput(provider);
 						const requestedProvider = !normalizedProvider || normalizedProvider === "auto"
-							? pc.defaultProvider
+							? pc.searchProvider
 							: normalizedProvider;
 						try {
 							const { answer, results, inlineContent, provider: actualProvider } = await search(query, {
@@ -964,6 +995,7 @@ export default function (pi: ExtensionAPI) {
 								domainFilter: pc.domainFilter,
 								includeContent: pc.includeContent,
 								signal: addSearchSignal,
+								extensionContext: ctx,
 							});
 							if (pendingCurate !== pc) throw new Error("Curator session is no longer active.");
 							pc.searchResults.set(queryIndex, { query, answer, results, error: null, provider: actualProvider });
@@ -1089,7 +1121,7 @@ export default function (pi: ExtensionAPI) {
 		name: "web_search",
 		label: "Web Search",
 		description:
-			`Search the web using Perplexity AI, Exa, or Gemini. Returns an AI-synthesized answer with source citations. For comprehensive research, prefer queries (plural) with 2-4 varied angles over a single query — each query gets its own synthesized answer, so varying phrasing and scope gives much broader coverage. When includeContent is true, full page content is fetched in the background. Searches auto-open the interactive browser curator and stream results live; set workflow to "none" to skip curation. Provider auto-selects: Exa (direct API with key, MCP fallback without), else Perplexity (needs key), else Gemini API (needs key), else Gemini Web (needs a supported Chromium-based browser login).`,
+			`Search the web using OpenAI, Brave, Exa, Perplexity, or Gemini. Returns an AI-synthesized answer with source citations. OpenAI web_search uses a Codex subscription or OpenAI API key. For comprehensive research, prefer queries (plural) with 2-4 varied angles over a single query — each query gets its own synthesized answer, so varying phrasing and scope gives much broader coverage. When includeContent is true, full page content is fetched in the background. Searches auto-open the interactive browser curator and stream results live; set workflow to "none" to skip curation. Provider auto-selects: OpenAI when suitable and available, then Exa, Brave, Perplexity, Gemini API, then Gemini Web.`,
 		promptSnippet:
 			"Use for web research questions. Prefer {queries:[...]} with 2-4 varied angles over a single query for broader coverage.",
 		parameters: Type.Object({
@@ -1102,7 +1134,7 @@ export default function (pi: ExtensionAPI) {
 			),
 			domainFilter: Type.Optional(Type.Array(Type.String(), { description: "Limit to domains (prefix with - to exclude)" })),
 			provider: Type.Optional(
-				StringEnum(["auto", "perplexity", "gemini", "exa"], { description: "Search provider (default: auto)" }),
+				StringEnum(["auto", "openai", "brave", "exa", "perplexity", "gemini"], { description: "Search provider (default: auto)" }),
 			),
 			workflow: Type.Optional(
 				StringEnum(["none", "summary-review"], {
@@ -1150,9 +1182,14 @@ export default function (pi: ExtensionAPI) {
 					: searchAbort.signal;
 				let cancelled = false;
 
-				const bootstrap = await loadCuratorBootstrap(params.provider);
+				const bootstrap = await loadCuratorBootstrap(params.provider, ctx, {
+					numResults: params.numResults,
+					recencyFilter: params.recencyFilter,
+				});
 				const availableProviders = bootstrap.availableProviders;
 				const defaultProvider = bootstrap.defaultProvider;
+				const rawSearchProvider = normalizeProviderInput(params.provider ?? loadConfig().provider ?? "auto") ?? "auto";
+				const searchProvider = rawSearchProvider === "auto" ? "auto" : defaultProvider;
 				const curatorTimeoutSeconds = bootstrap.timeoutSeconds;
 				const curatorWorkflow: CuratorWorkflow = "summary-review";
 
@@ -1175,6 +1212,7 @@ export default function (pi: ExtensionAPI) {
 					domainFilter: params.domainFilter,
 					availableProviders,
 					defaultProvider,
+					searchProvider,
 					summaryModels: summaryModelChoices.summaryModels,
 					defaultSummaryModel: summaryModelChoices.defaultSummaryModel,
 					timeoutSeconds: curatorTimeoutSeconds,
@@ -1215,7 +1253,7 @@ export default function (pi: ExtensionAPI) {
 						content: [{ type: "text", text: `Searching ${qi + 1}/${queryList.length}: "${queryList[qi]}"...` }],
 						details: { phase: "searching", progress: qi / queryList.length, currentQuery: queryList[qi] },
 					});
-					const requestedProvider = pc.defaultProvider;
+					const requestedProvider = pc.searchProvider;
 					try {
 						const { answer, results, inlineContent, provider } = await search(queryList[qi], {
 							provider: requestedProvider,
@@ -1224,6 +1262,7 @@ export default function (pi: ExtensionAPI) {
 							domainFilter: params.domainFilter,
 							includeContent: params.includeContent,
 							signal: searchSignal,
+							extensionContext: ctx,
 						});
 						if (signal?.aborted || cancelled || searchAbort.signal.aborted) break;
 						searchResults.set(qi, { query: queryList[qi], answer, results, error: null, provider });
@@ -1283,6 +1322,7 @@ export default function (pi: ExtensionAPI) {
 						domainFilter: params.domainFilter,
 						includeContent: params.includeContent,
 						signal,
+						extensionContext: ctx,
 					});
 
 					searchResults.push({ query, answer, results, error: null, provider });
@@ -1987,7 +2027,7 @@ export default function (pi: ExtensionAPI) {
 
 			let bootstrap: CuratorBootstrap;
 			try {
-				bootstrap = await loadCuratorBootstrap(undefined);
+				bootstrap = await loadCuratorBootstrap(undefined, ctx);
 			} catch (err) {
 				const message = err instanceof Error ? err.message : String(err);
 				ctx.ui.notify(`Failed to load web search config: ${message}`, "error");
@@ -1997,6 +2037,8 @@ export default function (pi: ExtensionAPI) {
 			const initialProvider = bootstrap.defaultProvider;
 			const curatorTimeoutSeconds = bootstrap.timeoutSeconds;
 			let currentProvider = initialProvider;
+			const rawSearchProvider = normalizeProviderInput(loadConfig().provider ?? "auto") ?? "auto";
+			let currentSearchProvider = rawSearchProvider === "auto" ? "auto" : initialProvider;
 			const summaryContext: SummaryGenerationContext = {
 				model: ctx.model,
 				modelRegistry: ctx.modelRegistry,
@@ -2027,6 +2069,7 @@ export default function (pi: ExtensionAPI) {
 						timeout: curatorTimeoutSeconds,
 						availableProviders,
 						defaultProvider: initialProvider,
+						searchProvider: currentSearchProvider,
 						summaryModels: summaryModelChoices.summaryModels,
 						defaultSummaryModel: summaryModelChoices.defaultSummaryModel,
 					},
@@ -2094,6 +2137,7 @@ export default function (pi: ExtensionAPI) {
 							const normalized = normalizeProviderInput(provider);
 							if (!normalized || normalized === "auto") return;
 							currentProvider = normalized;
+							currentSearchProvider = normalized;
 							try {
 								saveConfig({ provider: normalized });
 							} catch (err) {
@@ -2107,12 +2151,13 @@ export default function (pi: ExtensionAPI) {
 							}
 							const normalizedProvider = normalizeProviderInput(provider);
 							const requestedProvider = !normalizedProvider || normalizedProvider === "auto"
-								? currentProvider
+								? currentSearchProvider
 								: normalizedProvider;
 							try {
 								const { answer, results, provider: actualProvider } = await search(query, {
 									provider: requestedProvider,
 									signal: searchAbort.signal,
+									extensionContext: ctx,
 								});
 								if (commandHandle && activeCurator !== commandHandle) {
 									throw new Error("Curator session is no longer active.");
@@ -2167,11 +2212,12 @@ export default function (pi: ExtensionAPI) {
 					(async () => {
 						for (let qi = 0; qi < queries.length; qi++) {
 							if (aborted || activeCurator !== handle) break;
-							const requestedProvider = currentProvider;
+							const requestedProvider = currentSearchProvider;
 							try {
 								const { answer, results, provider } = await search(queries[qi], {
 									provider: requestedProvider,
 									signal: searchAbort.signal,
+									extensionContext: ctx,
 								});
 								if (aborted || activeCurator !== handle) break;
 								handle.pushResult(qi, {
