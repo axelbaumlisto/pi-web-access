@@ -10,6 +10,7 @@ import { isYouTubeURL, isYouTubeEnabled, extractYouTube, extractYouTubeFrame, ex
 import { extractWithUrlContext, extractWithGeminiWeb } from "./gemini-url-context.ts";
 import { extractWithParallel, isParallelAvailable } from "./parallel.ts";
 import { isVideoFile, extractVideo, extractVideoFrame, getLocalVideoDuration } from "./video-extract.ts";
+import { existsSync, readFileSync } from "node:fs";
 import { fetchRemoteUrl, validateRemoteUrl } from "./ssrf-protection.ts";
 import { formatSeconds, getWebSearchConfigPath } from "./utils.ts";
 
@@ -19,6 +20,27 @@ const CONCURRENT_LIMIT = 3;
 const NON_RECOVERABLE_ERRORS = ["Unsupported content type", "Response too large"];
 const MIN_USEFUL_CONTENT = 500;
 const WEB_SEARCH_CONFIG_PATH = getWebSearchConfigPath();
+
+/**
+ * Read `ssrf.allowRanges` (CIDR strings) from web-search.json. Returns [] when
+ * unset or unreadable so SSRF protection stays fully on by default. Exempts
+ * synthetic ranges used by TUN/fake-IP proxies (e.g. 198.18.0.0/15).
+ */
+function loadSsrfAllowRanges(): string[] {
+	try {
+		if (!existsSync(WEB_SEARCH_CONFIG_PATH)) return [];
+		const raw = readFileSync(WEB_SEARCH_CONFIG_PATH, "utf-8");
+		const parsed = JSON.parse(raw) as { ssrf?: { allowRanges?: unknown } };
+		const value = parsed?.ssrf?.allowRanges;
+		if (!Array.isArray(value)) return [];
+		return value
+			.filter((entry): entry is string => typeof entry === "string")
+			.map(entry => entry.trim())
+			.filter(entry => entry.length > 0);
+	} catch {
+		return [];
+	}
+}
 
 function errorMessage(err: unknown): string {
 	return err instanceof Error ? err.message : String(err);
@@ -83,7 +105,7 @@ async function extractWithJinaReader(
 	const activityId = activityMonitor.logStart({ type: "api", query: `jina: ${url}` });
 
 	try {
-		await validateRemoteUrl(url);
+		await validateRemoteUrl(url, { allowRanges: loadSsrfAllowRanges() });
 		const res = await fetch(jinaUrl, {
 			headers: {
 				"Accept": "text/markdown",
@@ -370,7 +392,7 @@ export async function extractContent(
 	try {
 		const parsed = new URL(url);
 		if (parsed.protocol === "http:" || parsed.protocol === "https:") {
-			await validateRemoteUrl(parsed);
+			await validateRemoteUrl(parsed, { allowRanges: loadSsrfAllowRanges() });
 		}
 	} catch (err) {
 		return { url, title: "", content: "", error: errorMessage(err) };
@@ -504,20 +526,24 @@ async function extractViaHttp(
 	signal?.addEventListener("abort", onAbort);
 
 	try {
-		const response = await fetchRemoteUrl(url, {
-			signal: controller.signal,
-			headers: {
-				"User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36",
-				"Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8",
-				"Accept-Language": "en-US,en;q=0.9",
-				"Cache-Control": "no-cache",
-				"Sec-Fetch-Dest": "document",
-				"Sec-Fetch-Mode": "navigate",
-				"Sec-Fetch-Site": "none",
-				"Sec-Fetch-User": "?1",
-				"Upgrade-Insecure-Requests": "1",
+		const response = await fetchRemoteUrl(
+			url,
+			{
+				signal: controller.signal,
+				headers: {
+					"User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36",
+					"Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8",
+					"Accept-Language": "en-US,en;q=0.9",
+					"Cache-Control": "no-cache",
+					"Sec-Fetch-Dest": "document",
+					"Sec-Fetch-Mode": "navigate",
+					"Sec-Fetch-Site": "none",
+					"Sec-Fetch-User": "?1",
+					"Upgrade-Insecure-Requests": "1",
+				},
 			},
-		});
+			{ allowRanges: loadSsrfAllowRanges() },
+		);
 
 		if (!response.ok) {
 			activityMonitor.logComplete(activityId, response.status);

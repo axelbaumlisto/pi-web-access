@@ -91,3 +91,93 @@ test("fetchRemoteUrl follows validated public redirects manually", async () => {
 	assert.equal(await response.text(), "ok");
 	assert.deepEqual(requested, ["https://example.com/start", "https://example.com/next"]);
 });
+
+test("allowRanges exempts a synthetic fake-IP range (e.g. 198.18.0.0/15)", async () => {
+	const fakeIpLookup = async () => [{ address: "198.18.0.56", family: 4 }];
+
+	// Without the exemption this is blocked (the fake-IP proxy case).
+	await assert.rejects(
+		validateRemoteUrl("https://example.test/", { lookup: fakeIpLookup }),
+		/Blocked internal address for example\.test: 198\.18\.0\.56/,
+	);
+
+	// With allowRanges it passes.
+	const url = await validateRemoteUrl("https://example.test/", {
+		lookup: fakeIpLookup,
+		allowRanges: ["198.18.0.0/15"],
+	});
+	assert.equal(url.hostname, "example.test");
+
+	// A bare literal IP in the range is also exempted.
+	assert.equal((await validateRemoteUrl("http://198.18.0.99/", { allowRanges: ["198.18.0.0/15"] })).hostname, "198.18.0.99");
+});
+
+test("allowRanges works for IPv6 ranges", async () => {
+	const fakeIp6Lookup = async () => [{ address: "fd00::1", family: 6 }];
+
+	await assert.rejects(
+		validateRemoteUrl("https://example.test/", { lookup: fakeIp6Lookup }),
+		/Blocked internal address for example\.test: fd00::1/,
+	);
+
+	const url = await validateRemoteUrl("https://example.test/", {
+		lookup: fakeIp6Lookup,
+		allowRanges: ["fd00::/8"],
+	});
+	assert.equal(url.hostname, "example.test");
+});
+
+test("allowRanges does not relax protection outside the listed range", async () => {
+	// 10.0.0.1 is private; an unrelated exemption must NOT cover it.
+	await assert.rejects(
+		validateRemoteUrl("https://example.test/", {
+			lookup: async () => [{ address: "10.0.0.1", family: 4 }],
+			allowRanges: ["198.18.0.0/15"],
+		}),
+		/Blocked internal address for example\.test: 10\.0\.0\.1/,
+	);
+
+	// Exact /32 boundary: allowed in-range, blocked just outside.
+	assert.equal((await validateRemoteUrl("http://198.18.0.0/", { allowRanges: ["198.18.0.0/31"] })).hostname, "198.18.0.0");
+	assert.equal((await validateRemoteUrl("http://198.18.0.1/", { allowRanges: ["198.18.0.0/31"] })).hostname, "198.18.0.1");
+	await assert.rejects(
+		validateRemoteUrl("http://198.18.0.2/", { allowRanges: ["198.18.0.0/31"] }),
+		/Blocked internal address/,
+	);
+});
+
+test("allowRanges accepts a bare host (no prefix) and treats it as /32", async () => {
+	assert.equal((await validateRemoteUrl("http://198.18.1.2/", { allowRanges: ["198.18.1.2"] })).hostname, "198.18.1.2");
+});
+
+test("invalid allowRanges entries throw a descriptive error", async () => {
+	for (const bad of ["not-an-ip", "198.18.0.0/33", "198.18.0.0/-1", "999.0.0.0/8", "fd00::/129"]) {
+		await assert.rejects(
+			validateRemoteUrl("http://198.18.0.5/", { allowRanges: [bad] }),
+			new RegExp(`Invalid CIDR notation in ssrf\.allowRanges: "${bad.replace(/[.*+?^${}()|[\\]\\\\]/g, "\\\$&")}"`),
+		);
+	}
+	await assert.rejects(
+		validateRemoteUrl("http://198.18.0.5/", { allowRanges: "198.18.0.0/15" }),
+		/ssrf\.allowRanges must be an array/,
+	);
+});
+
+test("allowRanges flows through fetchRemoteUrl and its redirect targets", async () => {
+	const requested = [];
+	const fetchImpl = async (url) => {
+		requested.push(url.toString());
+		if (requested.length === 1) {
+			return new Response("", { status: 302, headers: { location: "http://198.18.0.99/admin" } });
+		}
+		return new Response("ok", { status: 200 });
+	};
+
+	const response = await fetchRemoteUrl(
+		"https://example.com/",
+		{},
+		{ lookup: publicLookup, fetch: fetchImpl, allowRanges: ["198.18.0.0/15"] },
+	);
+	assert.equal(response.status, 200);
+	assert.deepEqual(requested, ["https://example.com/", "http://198.18.0.99/admin"]);
+});

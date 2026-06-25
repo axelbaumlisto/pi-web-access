@@ -77,6 +77,10 @@ interface WebSearchConfig {
 		curate?: string;
 		activity?: string;
 	};
+	ssrf?: {
+		/** CIDR ranges exempted from the SSRF guard (e.g. fake-IP proxy ranges). */
+		allowRanges?: string[];
+	};
 }
 
 interface ProviderAvailability {
