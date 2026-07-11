@@ -3,9 +3,12 @@ import { activityMonitor } from "./activity.ts";
 import type { ExtractedContent, ExtractOptions } from "./extract.ts";
 import type { SearchOptions, SearchResponse } from "./perplexity.ts";
 import { getWebSearchConfigPath } from "./utils.ts";
+import { providerUrl } from "./provider-endpoints.ts";
 
-const PARALLEL_SEARCH_URL = "https://api.parallel.ai/v1/search";
-const PARALLEL_EXTRACT_URL = "https://api.parallel.ai/v1/extract";
+// Base override lives in provider-endpoints.ts (env > config > default);
+// /v1/search and /v1/extract are appended to it.
+const PARALLEL_SEARCH_URL = () => `${providerUrl("parallel")}/v1/search`;
+const PARALLEL_EXTRACT_URL = () => `${providerUrl("parallel")}/v1/extract`;
 const CONFIG_PATH = getWebSearchConfigPath();
 const MIN_PARALLEL_API_KEY_LENGTH = 8;
 const MIN_USEFUL_CONTENT = 500;
@@ -285,14 +288,14 @@ async function fetchAndMapExtractResult(
 	body: Record<string, unknown>,
 	signal?: AbortSignal,
 ): Promise<{ mapped: ExtractedContent | null; result: V1ExtractResult | undefined }> {
-	const data = await parallelFetch(PARALLEL_EXTRACT_URL, body, signal);
+	const data = await parallelFetch(PARALLEL_EXTRACT_URL(), body, signal);
 	if (hasExtractUrlError(data.errors, url)) return { mapped: null, result: undefined };
 	const result = findExtractResult(data.results as V1ExtractResult[] | undefined, url);
 	return { mapped: mapExtractResult(result), result };
 }
 
 export async function searchWithParallel(query: string, options: ParallelSearchOptions = {}): Promise<SearchResponse> {
-	const data = await parallelFetch(PARALLEL_SEARCH_URL, buildSearchRequestBody(query, options), options.signal);
+	const data = await parallelFetch(PARALLEL_SEARCH_URL(), buildSearchRequestBody(query, options), options.signal);
 	const results = data.results as V1WebSearchResult[] | undefined;
 	const response: SearchResponse = {
 		answer: buildAnswerFromExcerpts(results),

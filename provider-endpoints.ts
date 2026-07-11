@@ -16,7 +16,19 @@
 import { existsSync, readFileSync } from "node:fs";
 import { getWebSearchConfigPath } from "./utils.ts";
 
-export type SearchProviderId = "exa" | "brave" | "perplexity";
+export type SearchProviderId =
+	| "exa"
+	| "brave"
+	| "perplexity"
+	| "tavily"
+	| "parallel"
+	| "openai";
+
+// gemini is intentionally NOT here: gemini-api.ts keeps its own resolver
+// (getApiHost) because it also detects Cloudflare AI Gateway routing and
+// applies API_VERSION — logic that doesn't fit the simple base/URL swap here.
+// OpenAI's codex endpoint (chatgpt.com backend) is likewise left hardcoded in
+// openai-search.ts: it's a separate OAuth/codex flow, not a plain key swap.
 
 interface ProviderEndpoint {
 	/** Default base/URL when no override is set. */
@@ -47,6 +59,23 @@ export const PROVIDER_ENDPOINTS: Record<SearchProviderId, ProviderEndpoint> = {
 		default: "https://api.perplexity.ai/chat/completions",
 		env: "PERPLEXITY_BASE_URL",
 		configKey: "perplexityBaseUrl",
+	},
+	tavily: {
+		default: "https://api.tavily.com/search",
+		env: "TAVILY_BASE_URL",
+		configKey: "tavilyBaseUrl",
+	},
+	// parallel is a *base* (paths /v1/search and /v1/extract are appended).
+	parallel: {
+		default: "https://api.parallel.ai",
+		env: "PARALLEL_BASE_URL",
+		configKey: "parallelBaseUrl",
+	},
+	// openai's standard Responses endpoint (the codex endpoint stays hardcoded).
+	openai: {
+		default: "https://api.openai.com/v1/responses",
+		env: "OPENAI_RESPONSES_URL",
+		configKey: "openaiResponsesUrl",
 	},
 };
 

@@ -3,8 +3,10 @@ import { activityMonitor } from "./activity.ts";
 import type { ExtractedContent } from "./extract.ts";
 import type { SearchOptions, SearchResponse } from "./perplexity.ts";
 import { getWebSearchConfigPath } from "./utils.ts";
+import { providerUrl } from "./provider-endpoints.ts";
 
-const TAVILY_API_URL = "https://api.tavily.com/search";
+// Endpoint override lives in provider-endpoints.ts (env > config > default).
+const TAVILY_API_URL = () => providerUrl("tavily");
 const CONFIG_PATH = getWebSearchConfigPath();
 const SEARCH_TIMEOUT_MS = 60_000;
 
@@ -162,7 +164,7 @@ export async function searchWithTavily(query: string, options: TavilySearchOptio
 	const activityId = activityMonitor.logStart({ type: "api", query });
 	let response: Response;
 	try {
-		response = await fetch(TAVILY_API_URL, {
+		response = await fetch(TAVILY_API_URL(), {
 			method: "POST",
 			headers: {
 				"Authorization": `Bearer ${requireApiKey()}`,

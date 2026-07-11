@@ -3,8 +3,12 @@ import type { ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { activityMonitor } from "./activity.ts";
 import type { SearchOptions, SearchResponse, SearchResult } from "./perplexity.ts";
 import { getWebSearchConfigPath } from "./utils.ts";
+import { providerUrl } from "./provider-endpoints.ts";
 
-const OPENAI_RESPONSES_URL = "https://api.openai.com/v1/responses";
+// Standard Responses endpoint override lives in provider-endpoints.ts
+// (env OPENAI_RESPONSES_URL > config openaiResponsesUrl > default). The codex
+// endpoint (chatgpt.com backend) stays hardcoded — separate OAuth/codex flow.
+const OPENAI_RESPONSES_URL = () => providerUrl("openai");
 const CODEX_RESPONSES_URL = "https://chatgpt.com/backend-api/codex/responses";
 const CONFIG_PATH = getWebSearchConfigPath();
 const SEARCH_TIMEOUT_MS = 60_000;
@@ -361,7 +365,7 @@ export async function searchWithOpenAI(
 	};
 
 	try {
-		const response = await fetch(useCodexEndpoint ? CODEX_RESPONSES_URL : OPENAI_RESPONSES_URL, {
+		const response = await fetch(useCodexEndpoint ? CODEX_RESPONSES_URL : OPENAI_RESPONSES_URL(), {
 			method: "POST",
 			headers,
 			body: JSON.stringify(body),
