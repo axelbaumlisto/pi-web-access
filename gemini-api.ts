@@ -53,8 +53,27 @@ function isCloudflareGateway(): boolean {
 	return getApiHost().includes("gateway.ai.cloudflare.com");
 }
 
+function isDirectGoogleHost(): boolean {
+	const apiHost = getApiHost();
+	if (apiHost === DEFAULT_API_HOST) return true;
+	try {
+		return new URL(apiHost).hostname.endsWith(".googleapis.com");
+	} catch {
+		return false;
+	}
+}
+
+function getConfiguredApiKey(): string | null {
+	return normalizeApiKey(loadConfig().geminiApiKey);
+}
+
 export function getApiKey(): string | null {
-	return normalizeApiKey(process.env.GEMINI_API_KEY) ?? normalizeApiKey(loadConfig().geminiApiKey);
+	// Resolve the destination before the credential: an ambient personal Google
+	// key must never be sent to an arbitrary override/proxy host.
+	if (isDirectGoogleHost()) {
+		return normalizeApiKey(process.env.GEMINI_API_KEY) ?? getConfiguredApiKey();
+	}
+	return getConfiguredApiKey();
 }
 
 export function getApiHost(): string {
@@ -70,8 +89,9 @@ export function getVersionedApiBase(): string {
 }
 
 export function buildKeyParam(apiKey: string | null): string {
-	if (!apiKey || isCloudflareGateway()) return "";
-	return `?key=${apiKey}`;
+	if (isCloudflareGateway()) return "";
+	const destinationKey = isDirectGoogleHost() ? apiKey : getConfiguredApiKey();
+	return destinationKey ? `?key=${destinationKey}` : "";
 }
 
 export function getCloudflareApiKey(): string | null {
