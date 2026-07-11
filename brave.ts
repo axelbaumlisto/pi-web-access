@@ -55,6 +55,35 @@ function normalizeCount(value: number | undefined): number {
 	return Math.max(1, Math.min(Math.floor(value), 20));
 }
 
+function stripHtml(s: string): string {
+	const namedEntities: Record<string, string> = {
+		"&amp;": "&",
+		"&lt;": "<",
+		"&gt;": ">",
+		"&quot;": "\"",
+		"&#39;": "'",
+		"&#x27;": "'",
+		"&nbsp;": " ",
+	};
+
+	return s
+		.replace(/<[^>]+>/g, "")
+		.replace(/&(?:amp|lt|gt|quot|nbsp|#39|#x27);|&#\d+;|&#x[0-9a-f]+;/gi, (entity) => {
+			const named = namedEntities[entity.toLowerCase()];
+			if (named !== undefined) return named;
+
+			const radix = entity.slice(0, 3).toLowerCase() === "&#x" ? 16 : 10;
+			const value = Number.parseInt(entity.slice(radix === 16 ? 3 : 2, -1), radix);
+			try {
+				return String.fromCodePoint(value);
+			} catch {
+				return entity;
+			}
+		})
+		.replace(/[ \t]{2,}/g, " ")
+		.trim();
+}
+
 function normalizeDomain(value: string): string | null {
 	let input = value.trim().toLowerCase();
 	if (!input) return null;
@@ -196,9 +225,9 @@ export async function searchWithBrave(
 		for (const item of data.web?.results ?? []) {
 			if (!item.url || !matchesDomainFilters(item.url, domainFilters)) continue;
 			results.push({
-				title: item.title || item.url,
+				title: stripHtml(item.title || "") || item.url,
 				url: item.url,
-				snippet: item.description || "",
+				snippet: stripHtml(item.description || ""),
 			});
 			if (results.length >= numResults) break;
 		}
