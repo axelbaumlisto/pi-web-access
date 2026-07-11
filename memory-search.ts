@@ -66,6 +66,51 @@ function tokenize(q: string): string[] {
 		.filter((t) => t.length >= 2);
 }
 
+/** Escape a literal string for safe use inside a regex (rg -e, git -G). */
+function escapeRe(s: string): string {
+	return s.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+}
+
+// Redact obvious secrets before a snippet reaches the model (review #1.3). This
+// tool searches recall memories + git diffs, which are exactly where API keys
+// and passwords live. Best-effort — not a substitute for not committing secrets.
+const SECRET_PATTERNS: RegExp[] = [
+	/\bsk-[A-Za-z0-9_-]{16,}/g, // OpenAI/proxy-style keys (sk-proxy-..., sk-...)
+	/\bAIza[0-9A-Za-z_-]{20,}/g, // Google API keys
+	/\bgh[pousr]_[A-Za-z0-9]{20,}/g, // GitHub tokens
+	/\bxox[baprs]-[A-Za-z0-9-]{10,}/g, // Slack tokens
+	/-----BEGIN [A-Z ]*PRIVATE KEY-----/g,
+	/\b(password|passwd|pwd|secret|token|api[_-]?key)\s*[:=]\s*\S+/gi,
+];
+function redactSecrets(text: string): string {
+	let out = text;
+	for (const re of SECRET_PATTERNS) out = out.replace(re, "[REDACTED]");
+	return out;
+}
+
+/**
+ * Parse a session/event timestamp into unix-ms. pi writes message events with
+ * ISO-8601 strings ('2026-07-10T16:40:23.774Z'); some events use numeric ms.
+ * Returns `fallback` (file mtime) when unparseable. (B1: Number(ISO) is NaN, so
+ * the old `Number(ts) || mtime` silently used mtime for every chat hit.)
+ */
+function parseTimestamp(raw: unknown, fallback: number): number {
+	if (typeof raw === "number" && Number.isFinite(raw)) {
+		return raw > 1e12 ? raw : raw * 1000; // seconds → ms
+	}
+	if (typeof raw === "string") {
+		const n = Number(raw);
+		if (Number.isFinite(n) && raw.trim() !== "") return n > 1e12 ? n : n * 1000;
+		const parsed = Date.parse(raw);
+		if (Number.isFinite(parsed)) return parsed;
+	}
+	return fallback;
+}
+
+// Timeout for every external command so a hung rg/git/sqlite can't block the
+// event loop (edge-case review #1.2). Partial/killed output degrades to [].
+const EXEC_TIMEOUT_MS = 20_000;
+
 /**
  * Keyword-overlap score for `text` against query `tokens`. Counts occurrences
  * (capped per token) so a doc mentioning the query many times ranks higher,
@@ -98,8 +143,11 @@ function recencyBoost(timestamp: number, now: number): number {
 	return 0.2 + 0.8 / (1 + ageDays / 30);
 }
 
-/** Trim a snippet around the first matched token. */
+/** Trim a snippet around the first matched token, then redact secrets. */
 function makeSnippet(text: string, tokens: string[], width = 240): string {
+	return redactSecrets(makeSnippetRaw(text, tokens, width));
+}
+function makeSnippetRaw(text: string, tokens: string[], width = 240): string {
 	const lower = text.toLowerCase();
 	let pos = -1;
 	for (const t of tokens) {
@@ -126,6 +174,19 @@ function sessionFolderForCwd(cwd: string): string {
 
 function currentProject(cwd: string): string {
 	return basename(cwd) || "unknown";
+}
+
+/**
+ * Best-effort project label from a session folder slug. The slug replaced every
+ * '/' AND pre-existing '-' with '-', so it's ambiguous; we take everything after
+ * the last '-work-' segment when present (handles hyphenated repo names like
+ * 'pi-web-access'), else the last segment (B5).
+ */
+function projectFromFolder(folder: string): string {
+	const core = folder.replace(/^--/, "").replace(/--$/, "");
+	const m = core.match(/(?:^|-)work-(.+)$/);
+	if (m) return m[1];
+	return core.split("-").pop() || core;
 }
 
 // ── source: sessions ─────────────────────────────────────────────────────────
@@ -172,7 +233,7 @@ function searchSessions(
 	// Use ripgrep to find matching LINES fast (scans 8GB in ~1.5s vs ~40s in JS).
 	// We OR the tokens as a fixed-string alternation, case-insensitive, and get
 	// back `file:linetext`. Then JSON.parse only the matched lines.
-	const pattern = tokens.map((t) => t.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")).join("|");
+	const pattern = tokens.map(escapeRe).join("|");
 	let out = "";
 	try {
 		out = execFileSync(
@@ -188,19 +249,19 @@ function searchSessions(
 				"1000000",
 				"-e",
 				pattern,
+				"--",
 				...searchDirs,
 			],
-			{ encoding: "utf-8", maxBuffer: 256 * 1024 * 1024 },
+			{ encoding: "utf-8", maxBuffer: 256 * 1024 * 1024, timeout: EXEC_TIMEOUT_MS },
 		);
 	} catch (e) {
-		// rg exits 1 when no matches — that's not an error.
+		// rg exits 1 when no matches — that's not an error. On any other non-zero
+		// exit (e.g. 2 = permission-denied subdir) rg still PRINTED the matches it
+		// found, so keep partial stdout instead of discarding it (B2 — match docs).
 		const status = (e as { status?: number }).status;
 		if (status === 1) return [];
-		if (status !== 0 && status !== undefined && status !== 1) {
-			// rg missing or crashed → fall back to empty (docs/memory still work).
-			return [];
-		}
 		out = String((e as { stdout?: Buffer | string }).stdout ?? "");
+		if (!out) return [];
 	}
 
 	const mtimeCache = new Map<string, number>();
@@ -234,12 +295,12 @@ function searchSessions(
 		if (!msg) continue;
 		const s = keywordScore(msg.text, tokens);
 		if (s <= 0) continue;
-		const ts = Number((evt as Record<string, unknown>).timestamp) || mtime;
+		const ts = parseTimestamp((evt as Record<string, unknown>).timestamp, mtime);
 		if (sinceMs !== undefined && ts < now - sinceMs) continue;
 
 		const rel = full.startsWith(SESSIONS_ROOT) ? full.slice(SESSIONS_ROOT.length + 1) : full;
 		const folder = rel.split("/")[0] ?? "";
-		const project = folder.replace(/^--/, "").replace(/--$/, "").split("-").pop() || folder;
+		const project = projectFromFolder(folder);
 		hits.push({
 			source: "sessions",
 			label: msg.role,
@@ -271,12 +332,14 @@ function searchRecall(
 		scope === "current"
 			? `is_active=1 AND (project_id='${proj.replace(/'/g, "''")}' OR scope='universal')`
 			: `is_active=1`;
-	const sql = `SELECT type, COALESCE(project_id,''), scope, timestamp, value FROM memories WHERE ${where};`;
+	// Alias COALESCE so the -json column key is a stable 'project_id' (D4).
+	const sql = `SELECT type, COALESCE(project_id,'') AS project_id, scope, timestamp, value FROM memories WHERE ${where};`;
 	let out = "";
 	try {
 		out = execFileSync("sqlite3", ["-json", RECALL_DB, sql], {
 			encoding: "utf-8",
 			maxBuffer: 64 * 1024 * 1024,
+			timeout: EXEC_TIMEOUT_MS,
 		});
 	} catch {
 		return [];
@@ -290,7 +353,7 @@ function searchRecall(
 	const hits: MemoryHit[] = [];
 	for (const r of rows) {
 		const type = String(r.type ?? "memory");
-		const project = String(r["COALESCE(project_id,'')"] ?? r.project_id ?? "") || "universal";
+		const project = String(r.project_id ?? "") || "universal";
 		const scopeVal = String(r.scope ?? "");
 		const tsRaw = Number(r.timestamp) || 0;
 		// recall timestamps are unix ms already
@@ -334,13 +397,13 @@ function searchDocs(
 
 	// ripgrep finds the matching .md FILES fast (respects .gitignore, skips
 	// node_modules/.git by default). We then read+score only those files.
-	const pattern = tokens.map((t) => t.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")).join("|");
+	const pattern = tokens.map(escapeRe).join("|");
 	let out = "";
 	try {
 		out = execFileSync(
 			"rg",
-			["-l", "-i", "--glob", "*.md", "-e", pattern, ...roots],
-			{ encoding: "utf-8", maxBuffer: 32 * 1024 * 1024 },
+			["-l", "-i", "--glob", "*.md", "-e", pattern, "--", ...roots],
+			{ encoding: "utf-8", maxBuffer: 32 * 1024 * 1024, timeout: EXEC_TIMEOUT_MS },
 		);
 	} catch (e) {
 		const status = (e as { status?: number }).status;
@@ -389,25 +452,32 @@ const US = "\x1f"; // unit separator for --format parsing
 // Filler / recency / meta words that carry no search signal for git — if only
 // these remain, we switch to time-window mode (list all commits in the window).
 const GIT_STOPWORDS = new Set<string>([
-	// ru
-	"поищи", "найди", "поиск", "история", "истории", "гит", "гите", "коммит", "коммитов",
+	// ru — search/imperative verbs
+	"поищи", "найди", "поиск", "покажи", "выведи", "дай", "список", "посмотри",
+	"глянь", "погляди", "покажите", "вывести",
+	// ru — git/time nouns
+	"история", "истории", "гит", "гите", "коммит", "коммитов",
 	"коммиты", "дифф", "дифы", "диффы", "за", "последний", "последнюю", "последние",
-	"месяц", "месяца", "неделя", "неделю", "неделе", "день", "вчера", "сегодня", "все", "всех",
-	"прошлый", "прошлом", "прошлой", "этот", "этотм", "этой", "этом",
+	"месяц", "месяца", "неделя", "неделю", "неделе", "день", "дней", "вчера", "сегодня",
+	"все", "всех", "прошлый", "прошлом", "прошлой", "этот", "этой", "этом", "назад",
 	// en
-	"search", "find", "git", "history", "commit", "commits", "diff", "diffs",
-	"last", "past", "this", "month", "week", "day", "yesterday", "today", "all", "the", "in", "for",
+	"search", "find", "show", "list", "give", "display", "git", "history", "commit", "commits",
+	"diff", "diffs", "log", "last", "past", "this", "month", "week", "day", "yesterday", "today",
+	"all", "the", "in", "for", "me", "of",
 ]);
 const GIT_LOG_FMT = `%H${US}%at${US}%an${US}%s${US}%b`;
 // How many top commit hits get their FULL diff expanded (capped per commit).
 const GIT_EXPAND_TOP = 3;
 const GIT_DIFF_MAX_LINES = 200;
+// Max commits returned by a git time-window sweep ("all commits this month").
+const GIT_WINDOW_MAX = 200;
 
 function gitOut(repo: string, args: string[]): string {
 	try {
 		return execFileSync("git", ["-C", repo, ...args], {
 			encoding: "utf-8",
 			maxBuffer: 64 * 1024 * 1024,
+			timeout: EXEC_TIMEOUT_MS,
 		});
 	} catch (e) {
 		return String((e as { stdout?: Buffer | string }).stdout ?? "");
@@ -452,6 +522,10 @@ function searchGit(
 	// keyword filtering.
 	const contentTokens = tokens.filter((t) => !GIT_STOPWORDS.has(t));
 	const windowMode = contentTokens.length === 0 && sinceMs !== undefined;
+	// No keywords AND no time window → a git search has no meaningful target, and
+	// running it would do a full `git log --all` + empty pickaxe over every repo
+	// (edge-case review #1.1). Bail instead.
+	if (contentTokens.length === 0 && !windowMode) return [];
 
 	const hits: MemoryHit[] = [];
 	for (const repo of repos) {
@@ -520,18 +594,21 @@ function searchGit(
 		}
 	}
 	hits.sort((a, b) => b.score - a.score);
-	const top = hits.slice(0, perSourceCap);
-	// Expand full diffs: a few for keyword search, more for a time-window sweep
-	// ("all diffs this month").
-	const expandCount = windowMode ? Math.min(top.length, perSourceCap) : GIT_EXPAND_TOP;
+	// Window mode promises "ALL commits in the range", so raise the cap well above
+	// the generic per-source limit (G3). Keyword mode keeps the normal cap.
+	const cap = windowMode ? Math.max(perSourceCap, GIT_WINDOW_MAX) : perSourceCap;
+	const top = hits.slice(0, cap);
+	// Expand full diffs: a few for keyword search, all returned for a window sweep.
+	const expandCount = windowMode ? top.length : GIT_EXPAND_TOP;
 	for (let i = 0; i < expandCount && i < top.length; i++) {
 		const h = top[i] as MemoryHit & { _repo?: string; _hash?: string };
 		if (!h._repo || !h._hash) continue;
 		const diff = gitOut(h._repo, ["show", "--stat", "--patch", "--format=%s%n%b", h._hash]);
 		const lines = diff.split("\n");
-		h.snippet =
+		h.snippet = redactSecrets(
 			lines.slice(0, GIT_DIFF_MAX_LINES).join("\n") +
-			(lines.length > GIT_DIFF_MAX_LINES ? `\n… (+${lines.length - GIT_DIFF_MAX_LINES} more lines)` : "");
+				(lines.length > GIT_DIFF_MAX_LINES ? `\n… (+${lines.length - GIT_DIFF_MAX_LINES} more lines)` : ""),
+		);
 	}
 	return top;
 }
@@ -563,11 +640,16 @@ export function searchMemory(query: string, opts: MemorySearchOptions = {}): Mem
 		hits = hits.concat(searchRecall(tokens, scope, cwd, opts.sinceMs, now, perSourceCap));
 	if (sources.includes("docs") && tokens.length > 0)
 		hits = hits.concat(searchDocs(tokens, scope, cwd, opts.sinceMs, now, perSourceCap));
+	// git time-window sweeps should return ALL commits in the range, so don't
+	// clip them to the generic `limit`; other sources stay capped.
+	const gitWindow =
+		sources.includes("git") && opts.sinceMs !== undefined &&
+		tokens.filter((t) => !GIT_STOPWORDS.has(t)).length === 0;
 	if (sources.includes("git"))
 		hits = hits.concat(searchGit(query, tokens, scope, cwd, opts.sinceMs, now, perSourceCap));
 
 	hits.sort((a, b) => b.score - a.score);
-	return hits.slice(0, limit);
+	return hits.slice(0, gitWindow ? Math.max(limit, GIT_WINDOW_MAX) : limit);
 }
 
 /**
@@ -585,10 +667,17 @@ export function wantsDocs(query: string): boolean {
  * коммитов', 'commit history'.
  */
 export function wantsGit(query: string): boolean {
-	// \b doesn't work around Cyrillic; match гит/диф as substrings but keep the
-	// Latin "git" bounded so words like "digit"/"legit" don't trigger.
+	// \b doesn't work around Cyrillic; bound the Latin stems so 'different'/
+	// 'commitment'/'difficult' don't false-trigger (review T1), and require the
+	// fuller Cyrillic stems ('коммит'/'дифф') so 'digit'/'агитация' don't match.
 	const q = query.toLowerCase();
-	return /(\bgit\b|гит|коммит|commit|диф|\bdiff|commit history|git log)/.test(q);
+	// Unicode-aware word boundary for the Cyrillic 'гит' (JS \b is ASCII-only, so
+	// \bгит\b never matches). Use lookarounds against any letter/digit.
+	const gitRu = /(?<![\p{L}\p{N}])гит(?![\p{L}\p{N}])/u; // 'гит' as a whole word
+	return (
+		gitRu.test(q) ||
+		/(\bgit\b|гитовы|коммит|\bcommit\b|commits\b|дифф|\bdiff\b|diffs\b|commit history|git log)/.test(q)
+	);
 }
 
 /** Parse a natural-language recency hint into a lookback window (ms). */
@@ -596,7 +685,7 @@ export function parseRecency(query: string): number | undefined {
 	// Note: \b word boundaries don't work with Cyrillic, so match on substrings.
 	const q = query.toLowerCase();
 	if (/(прошл\S* недел|last week|past week)/.test(q)) return 14 * 86_400_000;
-	if (/(эт\S* недел|this week)/.test(q)) return 7 * 86_400_000;
+	if (/(эт\S* недел|this week|за недел|за прошл\S* недел)/.test(q)) return 7 * 86_400_000;
 	if (/(прошл\S* месяц|last month)/.test(q)) return 60 * 86_400_000;
 	if (/(последн\S* месяц|за месяц|past month)/.test(q)) return 31 * 86_400_000;
 	if (/(вчера|yesterday)/.test(q)) return 48 * 3600_000;

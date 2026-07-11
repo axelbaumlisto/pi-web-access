@@ -2073,10 +2073,18 @@ export default function (pi: ExtensionAPI) {
 			// sessions+memory and add docs only if the query asks for documentation.
 			let sources = params.sources as MemorySource[] | undefined;
 			if (!sources) {
-				// git is a full replacement intent ("search git history"); docs augments.
-				if (wantsGit(query)) sources = ["git"];
-				else if (wantsDocs(query)) sources = ["sessions", "memory", "docs"];
-				else sources = ["sessions", "memory"];
+				// Default = chat + memory. docs/git are ADDITIVE opt-ins detected from
+				// the query, so a false-positive trigger never drops the base sources.
+				// Exception: an explicit git-history request with a time window is a
+				// git-only intent ("все диффы за месяц").
+				const g = wantsGit(query);
+				if (g && parseRecency(query) !== undefined) {
+					sources = ["git"];
+				} else {
+					sources = ["sessions", "memory"];
+					if (wantsDocs(query)) sources.push("docs");
+					if (g) sources.push("git");
+				}
 			}
 			const limit = typeof params.limit === "number" ? params.limit : 15;
 			const cwd = ctx?.cwd ?? process.cwd();

@@ -199,10 +199,12 @@ export function providerUrl(provider: SearchProviderId): string {
  * Resolve a provider's API key. Priority:
  *   1. per-provider env    (e.g. EXA_API_KEY)
  *   2. per-provider config  (e.g. exaApiKey)
- *   3. shared proxy key — ONLY when this provider is actually routed through
- *      the unified proxy (has proxyPath AND a proxy base is configured). This
- *      prevents sending the proxy key to a provider's real API (e.g. Tavily /
- *      Parallel, which the gateway does not front).
+ *   3. shared proxy key — ONLY when this provider's endpoint ACTUALLY resolved
+ *      to the unified proxy base. Gating on the resolved URL (not merely
+ *      "proxyPath + base configured") prevents leaking the proxy key to a
+ *      per-provider override host: if the user sets exaBaseUrl to a custom
+ *      third-party host while a proxyBaseUrl is also configured, the URL wins
+ *      case 1/2 (override) and the shared key must NOT be sent there (B3).
  * Returns null when none is set.
  */
 export function providerApiKey(provider: SearchProviderId): string | null {
@@ -211,6 +213,10 @@ export function providerApiKey(provider: SearchProviderId): string | null {
 	if (typeof envKey === "string" && envKey.trim().length > 0) return envKey.trim();
 	const cfgKey = loadRawConfig()[ep.keyConfigKey];
 	if (typeof cfgKey === "string" && cfgKey.trim().length > 0) return cfgKey.trim();
-	if (ep.proxyPath && proxyBaseUrl() !== null) return proxyApiKey();
+	// Shared key only if the resolved endpoint really is the proxy base.
+	const base = proxyBaseUrl();
+	if (base !== null && resolveProviderEndpoint(provider).url.startsWith(base)) {
+		return proxyApiKey();
+	}
 	return null;
 }
