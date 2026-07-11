@@ -124,6 +124,15 @@ export const PROVIDER_ENDPOINTS: Record<SearchProviderId, ProviderEndpoint> = {
 	},
 };
 
+/** True when two URLs share the same parsed origin (scheme+host+port). */
+function sameOrigin(a: string, b: string): boolean {
+	try {
+		return new URL(a).origin === new URL(b).origin;
+	} catch {
+		return false;
+	}
+}
+
 export function normalizeBaseUrl(value: unknown): string | null {
 	if (typeof value !== "string") return null;
 	const normalized = value.trim().replace(/\/+$/, "");
@@ -131,6 +140,11 @@ export function normalizeBaseUrl(value: unknown): string | null {
 }
 
 let cachedConfig: Record<string, unknown> | null = null;
+
+/** Drop the cached web-search.json so the next call re-reads it (key rotation). */
+export function resetEndpointCache(): void {
+	cachedConfig = null;
+}
 
 function loadRawConfig(): Record<string, unknown> {
 	if (cachedConfig) return cachedConfig;
@@ -199,24 +213,25 @@ export function providerUrl(provider: SearchProviderId): string {
  * Resolve a provider's API key. Priority:
  *   1. per-provider env    (e.g. EXA_API_KEY)
  *   2. per-provider config  (e.g. exaApiKey)
- *   3. shared proxy key — ONLY when this provider's endpoint ACTUALLY resolved
- *      to the unified proxy base. Gating on the resolved URL (not merely
- *      "proxyPath + base configured") prevents leaking the proxy key to a
- *      per-provider override host: if the user sets exaBaseUrl to a custom
- *      third-party host while a proxyBaseUrl is also configured, the URL wins
- *      case 1/2 (override) and the shared key must NOT be sent there (B3).
- * Returns null when none is set.
+ * Destination-first: if the endpoint resolved to the unified proxy (same
+ * parsed origin), the shared proxy key is returned — a personal per-provider
+ * key must not leak to the gateway. Otherwise: per-provider env > per-provider
+ * config. The shared key is never sent to a non-proxy host (origin compare,
+ * not startsWith — airpx.cc.evil.com must not pass). Returns null if none set.
  */
 export function providerApiKey(provider: SearchProviderId): string | null {
 	const ep = PROVIDER_ENDPOINTS[provider];
+	// Resolve the DESTINATION first, then pick the key that belongs to it.
+	// If the endpoint resolved to the unified proxy, the shared proxy key is the
+	// ONLY correct credential — a personal per-provider key (e.g. an ambient
+	// OPENAI_API_KEY) must NOT be transmitted to the proxy gateway.
+	const base = proxyBaseUrl();
+	const resolvedToProxy =
+		base !== null && sameOrigin(resolveProviderEndpoint(provider).url, base);
+	if (resolvedToProxy) return proxyApiKey();
 	const envKey = process.env[ep.keyEnv];
 	if (typeof envKey === "string" && envKey.trim().length > 0) return envKey.trim();
 	const cfgKey = loadRawConfig()[ep.keyConfigKey];
 	if (typeof cfgKey === "string" && cfgKey.trim().length > 0) return cfgKey.trim();
-	// Shared key only if the resolved endpoint really is the proxy base.
-	const base = proxyBaseUrl();
-	if (base !== null && resolveProviderEndpoint(provider).url.startsWith(base)) {
-		return proxyApiKey();
-	}
 	return null;
 }
