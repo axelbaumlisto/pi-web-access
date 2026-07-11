@@ -4,13 +4,38 @@ import type { ExtractedContent } from "./extract.ts";
 import type { SearchOptions, SearchResponse } from "./perplexity.ts";
 import { getWebSearchConfigPath } from "./utils.ts";
 
-const EXA_ANSWER_URL = "https://api.exa.ai/answer";
-const EXA_SEARCH_URL = "https://api.exa.ai/search";
-const EXA_MCP_URL = "https://mcp.exa.ai/mcp";
+const EXA_DEFAULT_BASE = "https://api.exa.ai";
+const EXA_DEFAULT_MCP_URL = "https://mcp.exa.ai/mcp";
+
+function normalizeBaseUrl(value: unknown): string | null {
+	if (typeof value !== "string") return null;
+	const normalized = value.trim().replace(/\/+$/, "");
+	return normalized.length > 0 ? normalized : null;
+}
+
+// Base override: env EXA_BASE_URL > config exaBaseUrl > api.exa.ai.
+// Lets you route Exa search through a proxy (e.g. a pooled-key gateway).
+function getExaBase(): string {
+	return (
+		normalizeBaseUrl(process.env.EXA_BASE_URL) ??
+		normalizeBaseUrl(loadConfig().exaBaseUrl) ??
+		EXA_DEFAULT_BASE
+	);
+}
+const EXA_ANSWER_URL = () => `${getExaBase()}/answer`;
+const EXA_SEARCH_URL = () => `${getExaBase()}/search`;
+// MCP lives on a different host by default; when a base override is set we route
+// /mcp under it too, otherwise fall back to the canonical mcp.exa.ai endpoint.
+const EXA_MCP_URL = () => {
+	const override =
+		normalizeBaseUrl(process.env.EXA_BASE_URL) ?? normalizeBaseUrl(loadConfig().exaBaseUrl);
+	return override ? `${override}/mcp` : EXA_DEFAULT_MCP_URL;
+};
 const CONFIG_PATH = getWebSearchConfigPath();
 
 interface WebSearchConfig {
 	exaApiKey?: unknown;
+	exaBaseUrl?: unknown;
 }
 
 interface ExaAnswerResponse {
@@ -165,7 +190,7 @@ export async function callExaMcp(
 	args: Record<string, unknown>,
 	signal?: AbortSignal,
 ): Promise<string> {
-	const response = await fetch(EXA_MCP_URL, {
+	const response = await fetch(EXA_MCP_URL(), {
 		method: "POST",
 		headers: {
 			"Content-Type": "application/json",
@@ -377,7 +402,7 @@ export async function searchWithExa(query: string, options: ExaSearchOptions = {
 
 	try {
 		if (!useSearch) {
-			const response = await fetch(EXA_ANSWER_URL, {
+			const response = await fetch(EXA_ANSWER_URL(), {
 				method: "POST",
 				headers: {
 					"x-api-key": apiKey,
@@ -405,7 +430,7 @@ export async function searchWithExa(query: string, options: ExaSearchOptions = {
 
 		const startDate = options.recencyFilter ? recencyToStartDate(options.recencyFilter) : null;
 		const domainFilters = mapDomainFilter(options.domainFilter);
-		const response = await fetch(EXA_SEARCH_URL, {
+		const response = await fetch(EXA_SEARCH_URL(), {
 			method: "POST",
 			headers: {
 				"x-api-key": apiKey,

@@ -3,12 +3,30 @@ import { activityMonitor } from "./activity.ts";
 import type { SearchOptions, SearchResult, SearchResponse } from "./perplexity.ts";
 import { getWebSearchConfigPath } from "./utils.ts";
 
-const BRAVE_API_URL = "https://api.search.brave.com/res/v1/web/search";
+const BRAVE_DEFAULT_URL = "https://api.search.brave.com/res/v1/web/search";
+
+function normalizeBaseUrl(value: unknown): string | null {
+	if (typeof value !== "string") return null;
+	const normalized = value.trim().replace(/\/+$/, "");
+	return normalized.length > 0 ? normalized : null;
+}
+
+// Search endpoint override: env BRAVE_BASE_URL > config braveBaseUrl > Brave API.
+// The override is the FULL search URL (query params are appended), so it can
+// point at a proxy that fronts a pooled Brave key.
+function getBraveUrl(): string {
+	return (
+		normalizeBaseUrl(process.env.BRAVE_BASE_URL) ??
+		normalizeBaseUrl(loadConfig().braveBaseUrl) ??
+		BRAVE_DEFAULT_URL
+	);
+}
 const CONFIG_PATH = getWebSearchConfigPath();
 const SEARCH_TIMEOUT_MS = 30_000;
 
 interface WebSearchConfig {
 	braveApiKey?: unknown;
+	braveBaseUrl?: unknown;
 }
 
 interface NormalizedDomainFilters {
@@ -156,7 +174,7 @@ export async function searchWithBrave(
 	}
 
 	try {
-		const response = await fetch(`${BRAVE_API_URL}?${params.toString()}`, {
+		const response = await fetch(`${getBraveUrl()}?${params.toString()}`, {
 			method: "GET",
 			headers: {
 				"X-Subscription-Token": apiKey,
