@@ -59,11 +59,32 @@ const PI_AGENT_ROOT = join(homedir(), ".pi", "agent");
 
 // ── query + scoring ─────────────────────────────────────────────────────────
 
+// Filler words that carry no search signal in ANY source. Without this,
+// question-form queries ('what did we decide about X', 'что мы решили про X')
+// rank filler-dense boilerplate above documents that only contain X (round-2
+// product#2). Kept small — only unambiguous fillers.
+const QUERY_STOPWORDS = new Set<string>([
+	// en
+	"what", "did", "we", "the", "a", "an", "about", "how", "was", "were", "is",
+	"are", "do", "does", "our", "my", "me", "you", "it", "to", "of", "in", "on",
+	"and", "or", "that", "this", "there", "decide", "decided", "discuss",
+	"discussed", "say", "said", "tell", "remember",
+	// ru
+	"что", "мы", "про", "как", "был", "была", "было", "были", "это", "там", "тут",
+	"наш", "наша", "наше", "мой", "мне", "ты", "он", "она", "оно", "они", "или",
+	"решили", "решали", "обсуждали", "говорили", "сказал", "помнишь", "помню",
+	"вспомни", "поищи", "найди", "покажи", "переписке", "памяти", "истории",
+]);
+
 function tokenize(q: string): string[] {
-	return q
+	const all = q
 		.toLowerCase()
 		.split(/[^\p{L}\p{N}_]+/u)
 		.filter((t) => t.length >= 2);
+	// Drop fillers, but never down to an empty list — a pure-filler query (rare
+	// outside git window mode) keeps its tokens rather than matching nothing.
+	const content = all.filter((t) => !QUERY_STOPWORDS.has(t));
+	return content.length > 0 ? content : all;
 }
 
 /** Escape a literal string for safe use inside a regex (rg -e, git -G). */
@@ -658,6 +679,13 @@ export function searchMemory(query: string, opts: MemorySearchOptions = {}): Mem
 	// can appear verbatim in 5+ files and eat the whole result budget (round-2
 	// product#1: 15 slots = 3 distinct texts). Key on normalized snippet text;
 	// keep the highest-scored (first after sort) copy.
+	// Score floor (round-2 product#3): weak substring coincidences must not
+	// masquerade as confident results. Drop hits below 20% of the top score
+	// (skip in git window mode — there score is pure recency by design).
+	if (!gitWindow && hits.length > 0) {
+		const floor = hits[0].score * 0.2;
+		hits = hits.filter((h) => h.score >= floor);
+	}
 	const seen = new Set<string>();
 	const deduped: MemoryHit[] = [];
 	for (const h of hits) {
