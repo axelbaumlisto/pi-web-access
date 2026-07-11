@@ -8,6 +8,7 @@ import { clearCloneCache } from "./github-extract.ts";
 import { search, type SearchProvider, type ResolvedSearchProvider } from "./gemini-search.ts";
 import type { SearchResult } from "./perplexity.ts";
 import { formatSeconds, getWebSearchConfigDir, getWebSearchConfigPath } from "./utils.ts";
+import { searchMemory, parseRecency, wantsDocs, formatHits, type MemoryScope, type MemorySource } from "./memory-search.ts";
 import {
 	clearResults,
 	deleteResult,
@@ -2034,6 +2035,79 @@ export default function (pi: ExtensionAPI) {
 			const textContent = result.content.find((c) => c.type === "text")?.text || "";
 			const preview = textContent.length > 500 ? textContent.slice(0, 500) + "..." : textContent;
 			return new Text(statusLine + "\n" + theme.fg("dim", preview), 0, 0);
+		},
+	});
+
+	pi.registerTool({
+		name: "memory_search",
+		label: "Memory Search",
+		description:
+			"Search your OWN history instead of the web: past pi chat sessions (transcripts), stored claude-recall memories, and project markdown docs. Use when the user refers to earlier work — 'как мы делали это вчера', 'search our chat', 'what did we decide about X', 'поищи в переписке/в памяти', 'last week we...'. Ranks by keyword relevance × recency and returns snippets tagged with source (chat/memory/doc), date, and project. Defaults to the CURRENT project; set scope='all' (or when the user says 'across all projects / на этом компе') to search every project on this machine.",
+		promptSnippet:
+			"Use to recall prior work from chat history, saved memories, and docs (not the web). Default scope is the current project; use scope='all' for every project.",
+		parameters: Type.Object({
+			query: Type.String({ description: "What to look for in your history (keywords or a phrase)." }),
+			scope: Type.Optional(
+				StringEnum(["current", "all"], {
+					description: "'current' (default) = this project only; 'all' = every project on this machine.",
+				}),
+			),
+			sources: Type.Optional(
+				Type.Array(StringEnum(["sessions", "memory", "docs"]), {
+					description: "Which sources to search. Default = sessions + memory (chat transcripts + claude-recall). Include 'docs' (markdown) ONLY when the user asks to search documentation ('поищи в документации', 'search the docs', 'in markdown').",
+				}),
+			),
+			limit: Type.Optional(Type.Number({ description: "Max results (default 15)." })),
+		}),
+
+		async execute(_callId, params, _signal, _onUpdate, ctx) {
+			const query = typeof params.query === "string" ? params.query.trim() : "";
+			if (!query) {
+				return {
+					content: [{ type: "text", text: "Error: empty query." }],
+					details: { error: "empty query" },
+				};
+			}
+			const scope = (params.scope as MemoryScope) ?? "current";
+			// Docs are opt-in: honor an explicit sources list, otherwise default to
+			// sessions+memory and add docs only if the query asks for documentation.
+			let sources = params.sources as MemorySource[] | undefined;
+			if (!sources) {
+				sources = wantsDocs(query) ? ["sessions", "memory", "docs"] : ["sessions", "memory"];
+			}
+			const limit = typeof params.limit === "number" ? params.limit : 15;
+			const cwd = ctx?.cwd ?? process.cwd();
+			const sinceMs = parseRecency(query);
+
+			let hits;
+			try {
+				hits = searchMemory(query, { scope, sources, limit, cwd, sinceMs });
+			} catch (err) {
+				const msg = err instanceof Error ? err.message : String(err);
+				return {
+					content: [{ type: "text", text: `Memory search failed: ${msg}` }],
+					details: { error: msg },
+				};
+			}
+
+			return {
+				content: [{ type: "text", text: formatHits(hits, query) }],
+				details: {
+					query,
+					scope,
+					sources,
+					sinceMs: sinceMs ?? null,
+					count: hits.length,
+					hits: hits.map((h) => ({
+						source: h.source,
+						label: h.label,
+						project: h.project,
+						timestamp: h.timestamp,
+						location: h.location,
+						score: Math.round(h.score * 100) / 100,
+					})),
+				},
+			};
 		},
 	});
 
