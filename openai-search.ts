@@ -3,7 +3,7 @@ import type { ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { activityMonitor } from "./activity.ts";
 import type { SearchOptions, SearchResponse, SearchResult } from "./perplexity.ts";
 import { getWebSearchConfigPath } from "./utils.ts";
-import { providerApiKey, providerUrl } from "./provider-endpoints.ts";
+import { PROVIDER_ENDPOINTS, providerApiKey, providerUrl } from "./provider-endpoints.ts";
 
 // Standard Responses endpoint override lives in provider-endpoints.ts
 // (env OPENAI_RESPONSES_URL > config openaiResponsesUrl > default). The codex
@@ -27,6 +27,7 @@ interface OpenAIAuth {
 	apiKey: string;
 	model: string;
 	headers: Record<string, string>;
+	responsesUrl: string;
 }
 
 interface NormalizedDomainFilters {
@@ -119,8 +120,26 @@ function extractAccountId(token: string): string | undefined {
 	return typeof id === "string" && id.trim().length > 0 ? id.trim() : undefined;
 }
 
+const OPENAI_AUTH_ORIGINS = new Set([
+	new URL(PROVIDER_ENDPOINTS.openai.default).origin,
+	new URL(CODEX_RESPONSES_URL).origin,
+]);
+
+function isOpenAIAuthOrigin(url: string): boolean {
+	try {
+		return OPENAI_AUTH_ORIGINS.has(new URL(url).origin);
+	} catch {
+		return false;
+	}
+}
+
 export async function resolveOpenAIAuth(ctx?: ExtensionContext): Promise<OpenAIAuth | undefined> {
-	if (ctx) {
+	const responsesUrl = OPENAI_RESPONSES_URL();
+
+	// Model-registry credentials are personal OpenAI/Codex credentials. Only
+	// consult the registry when that credential will go to an OpenAI-owned
+	// origin; proxy/override destinations must use their destination-bound key.
+	if (ctx && isOpenAIAuthOrigin(responsesUrl)) {
 		const { getModel } = await import("@earendil-works/pi-ai/compat");
 		for (const candidate of AUTH_MODEL_CANDIDATES) {
 			for (const modelId of candidate.models) {
@@ -134,6 +153,7 @@ export async function resolveOpenAIAuth(ctx?: ExtensionContext): Promise<OpenAIA
 							apiKey: resolved.apiKey,
 							model: modelId,
 							headers: resolved.headers ?? {},
+							responsesUrl,
 						};
 					}
 				} catch {
@@ -144,7 +164,7 @@ export async function resolveOpenAIAuth(ctx?: ExtensionContext): Promise<OpenAIA
 
 	const apiKey = providerApiKey("openai");
 	return apiKey
-		? { provider: "openai", apiKey, model: "gpt-5.4", headers: {} }
+		? { provider: "openai", apiKey, model: "gpt-5.4", headers: {}, responsesUrl }
 		: undefined;
 }
 
@@ -345,7 +365,8 @@ export async function searchWithOpenAI(
 		"Content-Type": "application/json",
 		"OpenAI-Beta": "responses=experimental",
 	};
-	const useCodexEndpoint = auth.provider === "openai-codex" || isCodexJwt(auth.apiKey);
+	const useCodexEndpoint = isOpenAIAuthOrigin(auth.responsesUrl)
+		&& (auth.provider === "openai-codex" || isCodexJwt(auth.apiKey));
 	if (useCodexEndpoint) {
 		const accountId = extractAccountId(auth.apiKey);
 		if (accountId) headers["chatgpt-account-id"] = accountId;
@@ -365,7 +386,7 @@ export async function searchWithOpenAI(
 	};
 
 	try {
-		const response = await fetch(useCodexEndpoint ? CODEX_RESPONSES_URL : OPENAI_RESPONSES_URL(), {
+		const response = await fetch(useCodexEndpoint ? CODEX_RESPONSES_URL : auth.responsesUrl, {
 			method: "POST",
 			headers,
 			body: JSON.stringify(body),
