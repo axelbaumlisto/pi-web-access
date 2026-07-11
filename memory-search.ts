@@ -20,7 +20,7 @@
 import { existsSync, readdirSync, readFileSync, statSync } from "node:fs";
 import { homedir } from "node:os";
 import { basename, join } from "node:path";
-import { execFileSync } from "node:child_process";
+import { execFile, execFileSync } from "node:child_process";
 
 export type MemoryScope = "current" | "all";
 export type MemorySource = "sessions" | "memory" | "docs" | "git";
@@ -59,6 +59,8 @@ export interface MemorySearchOptions {
 	limit?: number;
 	/** cwd to resolve the current project from. */
 	cwd?: string;
+	/** Abort signal — cancels in-flight rg/git/sqlite child processes. */
+	signal?: AbortSignal;
 }
 
 const SESSIONS_ROOT = join(homedir(), ".pi", "agent", "sessions");
@@ -140,6 +142,44 @@ function parseTimestamp(raw: unknown, fallback: number): number {
 // Timeout for every external command so a hung rg/git/sqlite can't block the
 // event loop (edge-case review #1.2). Partial/killed output degrades to [].
 const EXEC_TIMEOUT_MS = 20_000;
+
+interface ExecResult {
+	stdout: string;
+	/** Process exit code; undefined when the process failed to spawn/was killed. */
+	status: number | undefined;
+	/** True when the process was killed (timeout/abort) or failed to spawn. */
+	broken: boolean;
+}
+
+/**
+ * Async exec (round-2 arch#1/perf#1): execFileSync froze the pi event loop for
+ * 8–24s measured. execFile keeps the loop free, lets sources run in parallel,
+ * and honors the tool's AbortSignal so the user can cancel a runaway search.
+ * Never throws — partial stdout is preserved with `broken` set.
+ */
+function execFileAsync(
+	cmd: string,
+	args: string[],
+	maxBuffer: number,
+	signal?: AbortSignal,
+): Promise<ExecResult> {
+	return new Promise((resolve) => {
+		execFile(
+			cmd,
+			args,
+			{ encoding: "utf-8", maxBuffer, timeout: EXEC_TIMEOUT_MS, signal },
+			(err, stdout) => {
+				if (!err) {
+					resolve({ stdout: stdout ?? "", status: 0, broken: false });
+					return;
+				}
+				const e = err as NodeJS.ErrnoException & { code?: number | string; killed?: boolean };
+				const status = typeof e.code === "number" ? e.code : undefined;
+				resolve({ stdout: stdout ?? "", status, broken: status === undefined });
+			},
+		);
+	});
+}
 
 /**
  * Keyword-overlap score for `text` against query `tokens`. Counts occurrences
@@ -245,7 +285,7 @@ function extractMessageText(evt: unknown): { role: string; text: string } | null
 	return { role, text };
 }
 
-function searchSessions(
+async function searchSessions(
 	tokens: string[],
 	scope: MemoryScope,
 	cwd: string,
@@ -253,7 +293,8 @@ function searchSessions(
 	now: number,
 	perSourceCap: number,
 	status: Partial<Record<MemorySource, SourceStatus>>,
-): MemoryHit[] {
+	signal?: AbortSignal,
+): Promise<MemoryHit[]> {
 	status.sessions = "ok";
 	if (!existsSync(SESSIONS_ROOT)) {
 		status.sessions = "skipped";
@@ -269,33 +310,31 @@ function searchSessions(
 	// We OR the tokens as a fixed-string alternation, case-insensitive, and get
 	// back `file:linetext`. Then JSON.parse only the matched lines.
 	const pattern = tokens.map(escapeRe).join("|");
-	let out = "";
-	try {
-		out = execFileSync(
-			"rg",
-			[
-				"-i",
-				"--no-heading",
-				"--no-line-number",
-				"--with-filename",
-				"--glob",
-				"*.jsonl",
-				"--max-columns",
-				"1000000",
-				"-e",
-				pattern,
-				"--",
-				...searchDirs,
-			],
-			{ encoding: "utf-8", maxBuffer: 256 * 1024 * 1024, timeout: EXEC_TIMEOUT_MS },
-		);
-	} catch (e) {
-		// rg exits 1 when no matches — that's not an error. On any other non-zero
-		// exit (e.g. 2 = permission-denied subdir) rg still PRINTED the matches it
-		// found, so keep partial stdout instead of discarding it (B2 — match docs).
-		const st = (e as { status?: number }).status;
-		if (st === 1) return [];
-		out = String((e as { stdout?: Buffer | string }).stdout ?? "");
+	const res = await execFileAsync(
+		"rg",
+		[
+			"-i",
+			"--no-heading",
+			"--no-line-number",
+			"--with-filename",
+			"--glob",
+			"*.jsonl",
+			"--max-columns",
+			"1000000",
+			"-e",
+			pattern,
+			"--",
+			...searchDirs,
+		],
+		256 * 1024 * 1024,
+		signal,
+	);
+	// rg exits 1 when no matches — that's not an error. On any other non-zero
+	// exit (e.g. 2 = permission-denied subdir) rg still PRINTED the matches it
+	// found, so keep partial stdout instead of discarding it (B2 — match docs).
+	if (res.status === 1) return [];
+	const out = res.stdout;
+	if (res.status !== 0) {
 		if (!out) {
 			// ENOENT (rg missing) / timeout with nothing printed — source is broken,
 			// not empty. Surfacing this distinguishes 'no matches' from 'no scan'.
@@ -359,7 +398,7 @@ function searchSessions(
 
 // ── source: claude-recall memories ───────────────────────────────────────────
 
-function searchRecall(
+async function searchRecall(
 	tokens: string[],
 	scope: MemoryScope,
 	cwd: string,
@@ -367,7 +406,8 @@ function searchRecall(
 	now: number,
 	perSourceCap: number,
 	status: Partial<Record<MemorySource, SourceStatus>>,
-): MemoryHit[] {
+	signal?: AbortSignal,
+): Promise<MemoryHit[]> {
 	status.memory = "ok";
 	if (!existsSync(RECALL_DB)) {
 		status.memory = "skipped";
@@ -381,21 +421,15 @@ function searchRecall(
 			: `is_active=1`;
 	// Alias COALESCE so the -json column key is a stable 'project_id' (D4).
 	const sql = `SELECT type, COALESCE(project_id,'') AS project_id, scope, timestamp, value FROM memories WHERE ${where};`;
-	let out = "";
-	try {
-		out = execFileSync("sqlite3", ["-json", RECALL_DB, sql], {
-			encoding: "utf-8",
-			maxBuffer: 64 * 1024 * 1024,
-			timeout: EXEC_TIMEOUT_MS,
-		});
-	} catch {
+	const res = await execFileAsync("sqlite3", ["-json", RECALL_DB, sql], 64 * 1024 * 1024, signal);
+	if (res.status !== 0) {
 		// sqlite3 missing, DB locked, or timed out — broken, not empty (perf#3).
 		status.memory = "failed";
 		return [];
 	}
 	let rows: Array<Record<string, unknown>>;
 	try {
-		rows = JSON.parse(out || "[]");
+		rows = JSON.parse(res.stdout || "[]");
 	} catch {
 		status.memory = "failed";
 		return [];
@@ -434,7 +468,7 @@ function searchRecall(
 
 // ── source: markdown docs ─────────────────────────────────────────────────────
 
-function searchDocs(
+async function searchDocs(
 	tokens: string[],
 	scope: MemoryScope,
 	cwd: string,
@@ -442,7 +476,8 @@ function searchDocs(
 	now: number,
 	perSourceCap: number,
 	status: Partial<Record<MemorySource, SourceStatus>>,
-): MemoryHit[] {
+	signal?: AbortSignal,
+): Promise<MemoryHit[]> {
 	status.docs = "ok";
 	const roots = (scope === "current" ? [cwd] : [WORK_ROOT, PI_AGENT_ROOT]).filter((r) => existsSync(r));
 	if (roots.length === 0) {
@@ -453,17 +488,15 @@ function searchDocs(
 	// ripgrep finds the matching .md FILES fast (respects .gitignore, skips
 	// node_modules/.git by default). We then read+score only those files.
 	const pattern = tokens.map(escapeRe).join("|");
-	let out = "";
-	try {
-		out = execFileSync(
-			"rg",
-			["-l", "-i", "--glob", "*.md", "-e", pattern, "--", ...roots],
-			{ encoding: "utf-8", maxBuffer: 32 * 1024 * 1024, timeout: EXEC_TIMEOUT_MS },
-		);
-	} catch (e) {
-		const st = (e as { status?: number }).status;
-		if (st === 1) return [];
-		out = String((e as { stdout?: Buffer | string }).stdout ?? "");
+	const res = await execFileAsync(
+		"rg",
+		["-l", "-i", "--glob", "*.md", "-e", pattern, "--", ...roots],
+		32 * 1024 * 1024,
+		signal,
+	);
+	if (res.status === 1) return [];
+	const out = res.stdout;
+	if (res.status !== 0) {
 		if (!out) {
 			status.docs = "failed";
 			return [];
@@ -547,6 +580,11 @@ function gitOut(repo: string, args: string[]): string {
 	}
 }
 
+async function gitOutAsync(repo: string, args: string[], signal?: AbortSignal): Promise<string> {
+	const res = await execFileAsync("git", ["-C", repo, ...args], 64 * 1024 * 1024, signal);
+	return res.stdout;
+}
+
 /** Repos to search: the cwd's repo (current) or every git repo under ~/work (all). */
 function gitRepos(scope: MemoryScope, cwd: string): string[] {
 	if (scope === "current") {
@@ -566,7 +604,7 @@ function gitRepos(scope: MemoryScope, cwd: string): string[] {
 	return repos;
 }
 
-function searchGit(
+async function searchGit(
 	query: string,
 	tokens: string[],
 	scope: MemoryScope,
@@ -575,7 +613,8 @@ function searchGit(
 	now: number,
 	perSourceCap: number,
 	status: Partial<Record<MemorySource, SourceStatus>>,
-): MemoryHit[] {
+	signal?: AbortSignal,
+): Promise<MemoryHit[]> {
 	status.git = "ok";
 	const repos = gitRepos(scope, cwd);
 	if (repos.length === 0) {
@@ -601,7 +640,7 @@ function searchGit(
 		const seen = new Set<string>();
 
 		if (windowMode) {
-			const raw = gitOut(repo, ["log", ...since, `--format=${GIT_LOG_FMT}${US}%x00`]);
+			const raw = await gitOutAsync(repo, ["log", ...since, `--format=${GIT_LOG_FMT}${US}%x00`], signal);
 			for (const rec of raw.split("\x00")) {
 				const r = rec.trim();
 				if (!r) continue;
@@ -634,7 +673,7 @@ function searchGit(
 				`--format=${GIT_LOG_FMT}${US}%x00`],
 		];
 		for (let pass = 0; pass < passes.length; pass++) {
-			const raw = gitOut(repo, passes[pass]);
+			const raw = await gitOutAsync(repo, passes[pass], signal);
 			for (const rec of raw.split("\x00")) {
 				const r = rec.trim();
 				if (!r) continue;
@@ -672,7 +711,7 @@ function searchGit(
 	for (let i = 0; i < expandCount && i < top.length; i++) {
 		const h = top[i] as MemoryHit & { _repo?: string; _hash?: string };
 		if (!h._repo || !h._hash) continue;
-		const diff = gitOut(h._repo, ["show", "--stat", "--patch", "--format=%s%n%b", h._hash]);
+		const diff = await gitOutAsync(h._repo, ["show", "--stat", "--patch", "--format=%s%n%b", h._hash], signal);
 		const lines = diff.split("\n");
 		h.snippet = redactSecrets(
 			lines.slice(0, GIT_DIFF_MAX_LINES).join("\n") +
@@ -684,7 +723,10 @@ function searchGit(
 
 // ── orchestrator ──────────────────────────────────────────────────────────────
 
-export function searchMemory(query: string, opts: MemorySearchOptions = {}): MemorySearchResult {
+export async function searchMemory(
+	query: string,
+	opts: MemorySearchOptions = {},
+): Promise<MemorySearchResult> {
 	const sourceStatus: Partial<Record<MemorySource, SourceStatus>> = {};
 	const tokens = tokenize(query);
 	const scope = opts.scope ?? "current";
@@ -703,21 +745,25 @@ export function searchMemory(query: string, opts: MemorySearchOptions = {}): Mem
 		tokens.every((t) => GIT_STOPWORDS.has(t));
 	if (tokens.length === 0 && !gitWindowOnly) return { hits: [], sourceStatus };
 
-	let hits: MemoryHit[] = [];
+	// Run sources in PARALLEL (round-2 arch#1/perf#1): async execFile keeps the
+	// event loop free and roughly halves multi-source latency.
+	const sig = opts.signal;
+	const jobs: Promise<MemoryHit[]>[] = [];
 	if (sources.includes("sessions") && tokens.length > 0)
-		hits = hits.concat(searchSessions(tokens, scope, cwd, opts.sinceMs, now, perSourceCap, sourceStatus));
+		jobs.push(searchSessions(tokens, scope, cwd, opts.sinceMs, now, perSourceCap, sourceStatus, sig));
 	if (sources.includes("memory") && tokens.length > 0)
-		hits = hits.concat(searchRecall(tokens, scope, cwd, opts.sinceMs, now, perSourceCap, sourceStatus));
+		jobs.push(searchRecall(tokens, scope, cwd, opts.sinceMs, now, perSourceCap, sourceStatus, sig));
 	if (sources.includes("docs") && tokens.length > 0)
-		hits = hits.concat(searchDocs(tokens, scope, cwd, opts.sinceMs, now, perSourceCap, sourceStatus));
+		jobs.push(searchDocs(tokens, scope, cwd, opts.sinceMs, now, perSourceCap, sourceStatus, sig));
 	// git time-window sweeps should return ALL commits in the range, so don't
 	// clip them to the generic `limit`; other sources stay capped.
 	const gitWindow =
 		sources.includes("git") && opts.sinceMs !== undefined &&
 		tokens.filter((t) => !GIT_STOPWORDS.has(t)).length === 0;
 	if (sources.includes("git"))
-		hits = hits.concat(searchGit(query, tokens, scope, cwd, opts.sinceMs, now, perSourceCap, sourceStatus));
+		jobs.push(searchGit(query, tokens, scope, cwd, opts.sinceMs, now, perSourceCap, sourceStatus, sig));
 
+	let hits: MemoryHit[] = (await Promise.all(jobs)).flat();
 	hits.sort((a, b) => b.score - a.score);
 	// Dedup: pi copies history into forked/subagent session files, so one message
 	// can appear verbatim in 5+ files and eat the whole result budget (round-2

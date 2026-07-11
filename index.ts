@@ -2060,7 +2060,7 @@ export default function (pi: ExtensionAPI) {
 			limit: Type.Optional(Type.Number({ description: "Max results (default 15)." })),
 		}),
 
-		async execute(_callId, params, _signal, _onUpdate, ctx) {
+		async execute(_callId, params, signal, _onUpdate, ctx) {
 			const query = typeof params.query === "string" ? params.query.trim() : "";
 			if (!query) {
 				return {
@@ -2093,7 +2093,7 @@ export default function (pi: ExtensionAPI) {
 			let hits;
 			let sourceStatus;
 			try {
-				const res = searchMemory(query, { scope, sources, limit, cwd, sinceMs });
+				const res = await searchMemory(query, { scope, sources, limit, cwd, sinceMs, signal });
 				hits = res.hits;
 				sourceStatus = res.sourceStatus;
 			} catch (err) {
