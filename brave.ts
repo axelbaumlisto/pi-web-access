@@ -2,25 +2,11 @@ import { existsSync, readFileSync } from "node:fs";
 import { activityMonitor } from "./activity.ts";
 import type { SearchOptions, SearchResult, SearchResponse } from "./perplexity.ts";
 import { getWebSearchConfigPath } from "./utils.ts";
+import { providerUrl } from "./provider-endpoints.ts";
 
-const BRAVE_DEFAULT_URL = "https://api.search.brave.com/res/v1/web/search";
-
-function normalizeBaseUrl(value: unknown): string | null {
-	if (typeof value !== "string") return null;
-	const normalized = value.trim().replace(/\/+$/, "");
-	return normalized.length > 0 ? normalized : null;
-}
-
-// Search endpoint override: env BRAVE_BASE_URL > config braveBaseUrl > Brave API.
-// The override is the FULL search URL (query params are appended), so it can
-// point at a proxy that fronts a pooled Brave key.
-function getBraveUrl(): string {
-	return (
-		normalizeBaseUrl(process.env.BRAVE_BASE_URL) ??
-		normalizeBaseUrl(loadConfig().braveBaseUrl) ??
-		BRAVE_DEFAULT_URL
-	);
-}
+// Search endpoint override lives in provider-endpoints.ts (env > config >
+// default). The value is the FULL search URL; query params are appended.
+const getBraveUrl = () => providerUrl("brave");
 const CONFIG_PATH = getWebSearchConfigPath();
 const SEARCH_TIMEOUT_MS = 30_000;
 

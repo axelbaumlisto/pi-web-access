@@ -2,26 +2,13 @@ import { existsSync, readFileSync } from "node:fs";
 import { activityMonitor } from "./activity.ts";
 import type { ExtractedContent } from "./extract.ts";
 import { getWebSearchConfigPath } from "./utils.ts";
+import { providerUrl } from "./provider-endpoints.ts";
 
-const PERPLEXITY_DEFAULT_URL = "https://api.perplexity.ai/chat/completions";
-
-function normalizeBaseUrl(value: unknown): string | null {
-	if (typeof value !== "string") return null;
-	const normalized = value.trim().replace(/\/+$/, "");
-	return normalized.length > 0 ? normalized : null;
-}
-
-// Endpoint override: env PERPLEXITY_BASE_URL > config perplexityBaseUrl > API.
-// The override is the FULL chat/completions URL, so it can front a proxy that
+// Endpoint override lives in provider-endpoints.ts (env > config > default).
+// The value is the FULL chat/completions URL, so it can front a proxy that
 // injects a pooled Perplexity key (our airpx proxy passes choices+citations
 // through verbatim).
-function getPerplexityUrl(): string {
-	return (
-		normalizeBaseUrl(process.env.PERPLEXITY_BASE_URL) ??
-		normalizeBaseUrl(loadConfig().perplexityBaseUrl) ??
-		PERPLEXITY_DEFAULT_URL
-	);
-}
+const getPerplexityUrl = () => providerUrl("perplexity");
 const CONFIG_PATH = getWebSearchConfigPath();
 
 const RATE_LIMIT = {

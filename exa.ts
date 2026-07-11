@@ -3,33 +3,18 @@ import { activityMonitor } from "./activity.ts";
 import type { ExtractedContent } from "./extract.ts";
 import type { SearchOptions, SearchResponse } from "./perplexity.ts";
 import { getWebSearchConfigPath } from "./utils.ts";
+import { providerUrl, resolveProviderEndpoint } from "./provider-endpoints.ts";
 
-const EXA_DEFAULT_BASE = "https://api.exa.ai";
 const EXA_DEFAULT_MCP_URL = "https://mcp.exa.ai/mcp";
 
-function normalizeBaseUrl(value: unknown): string | null {
-	if (typeof value !== "string") return null;
-	const normalized = value.trim().replace(/\/+$/, "");
-	return normalized.length > 0 ? normalized : null;
-}
-
-// Base override: env EXA_BASE_URL > config exaBaseUrl > api.exa.ai.
-// Lets you route Exa search through a proxy (e.g. a pooled-key gateway).
-function getExaBase(): string {
-	return (
-		normalizeBaseUrl(process.env.EXA_BASE_URL) ??
-		normalizeBaseUrl(loadConfig().exaBaseUrl) ??
-		EXA_DEFAULT_BASE
-	);
-}
-const EXA_ANSWER_URL = () => `${getExaBase()}/answer`;
-const EXA_SEARCH_URL = () => `${getExaBase()}/search`;
-// MCP lives on a different host by default; when a base override is set we route
-// /mcp under it too, otherwise fall back to the canonical mcp.exa.ai endpoint.
+// Base/URL overrides come from provider-endpoints.ts (env > config > default).
+const EXA_ANSWER_URL = () => `${providerUrl("exa")}/answer`;
+const EXA_SEARCH_URL = () => `${providerUrl("exa")}/search`;
+// MCP lives on a different host by default; only route /mcp under the base when
+// an override is explicitly set, otherwise use the canonical mcp.exa.ai host.
 const EXA_MCP_URL = () => {
-	const override =
-		normalizeBaseUrl(process.env.EXA_BASE_URL) ?? normalizeBaseUrl(loadConfig().exaBaseUrl);
-	return override ? `${override}/mcp` : EXA_DEFAULT_MCP_URL;
+	const { url, overridden } = resolveProviderEndpoint("exa");
+	return overridden ? `${url}/mcp` : EXA_DEFAULT_MCP_URL;
 };
 const CONFIG_PATH = getWebSearchConfigPath();
 
