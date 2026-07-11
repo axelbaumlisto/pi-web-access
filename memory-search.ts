@@ -654,7 +654,19 @@ export function searchMemory(query: string, opts: MemorySearchOptions = {}): Mem
 		hits = hits.concat(searchGit(query, tokens, scope, cwd, opts.sinceMs, now, perSourceCap));
 
 	hits.sort((a, b) => b.score - a.score);
-	return hits.slice(0, gitWindow ? Math.max(limit, GIT_WINDOW_MAX) : limit);
+	// Dedup: pi copies history into forked/subagent session files, so one message
+	// can appear verbatim in 5+ files and eat the whole result budget (round-2
+	// product#1: 15 slots = 3 distinct texts). Key on normalized snippet text;
+	// keep the highest-scored (first after sort) copy.
+	const seen = new Set<string>();
+	const deduped: MemoryHit[] = [];
+	for (const h of hits) {
+		const key = h.source + "\x00" + h.snippet.replace(/\s+/g, " ").trim().toLowerCase();
+		if (seen.has(key)) continue;
+		seen.add(key);
+		deduped.push(h);
+	}
+	return deduped.slice(0, gitWindow ? Math.max(limit, GIT_WINDOW_MAX) : limit);
 }
 
 /**
