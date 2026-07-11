@@ -1,4 +1,3 @@
-import { existsSync, readFileSync } from "node:fs";
 import { activityMonitor } from "./activity.ts";
 import type { ExtractedContent } from "./extract.ts";
 import { getWebSearchConfigPath } from "./utils.ts";
@@ -35,36 +34,6 @@ export interface SearchOptions {
 	recencyFilter?: "day" | "week" | "month" | "year";
 	domainFilter?: string[];
 	signal?: AbortSignal;
-}
-
-interface WebSearchConfig {
-	perplexityApiKey?: unknown;
-	perplexityBaseUrl?: unknown;
-}
-
-let cachedConfig: WebSearchConfig | null = null;
-
-function loadConfig(): WebSearchConfig {
-	if (cachedConfig) return cachedConfig;
-	if (!existsSync(CONFIG_PATH)) {
-		cachedConfig = {};
-		return cachedConfig;
-	}
-
-	const content = readFileSync(CONFIG_PATH, "utf-8");
-	try {
-		cachedConfig = JSON.parse(content) as WebSearchConfig;
-		return cachedConfig;
-	} catch (err) {
-		const message = err instanceof Error ? err.message : String(err);
-		throw new Error(`Failed to parse ${CONFIG_PATH}: ${message}`);
-	}
-}
-
-function normalizeApiKey(value: unknown): string | null {
-	if (typeof value !== "string") return null;
-	const normalized = value.trim();
-	return normalized.length > 0 ? normalized : null;
 }
 
 function getApiKey(): string {
@@ -104,8 +73,7 @@ function validateDomainFilter(domains: string[]): string[] {
 }
 
 export function isPerplexityAvailable(): boolean {
-	const config = loadConfig();
-	return !!(normalizeApiKey(process.env.PERPLEXITY_API_KEY) ?? normalizeApiKey(config.perplexityApiKey));
+	return providerApiKey("perplexity") !== null;
 }
 
 export async function searchWithPerplexity(query: string, options: SearchOptions = {}): Promise<SearchResponse> {
@@ -121,8 +89,6 @@ export async function searchWithPerplexity(query: string, options: SearchOptions
 	});
 
 	const apiKey = getApiKey();
-	const numResults = Math.min(options.numResults ?? 5, 20);
-
 	const requestBody: Record<string, unknown> = {
 		model: "sonar",
 		messages: [{ role: "user", content: query }],
@@ -150,7 +116,10 @@ export async function searchWithPerplexity(query: string, options: SearchOptions
 				"Content-Type": "application/json",
 			},
 			body: JSON.stringify(requestBody),
-			signal: options.signal,
+			signal: AbortSignal.any([
+				AbortSignal.timeout(30000),
+				...(options.signal ? [options.signal] : []),
+			]),
 		});
 	} catch (err) {
 		const message = err instanceof Error ? err.message : String(err);
@@ -181,7 +150,7 @@ export async function searchWithPerplexity(query: string, options: SearchOptions
 	const citations = Array.isArray(data.citations) ? data.citations : [];
 
 	const results: SearchResult[] = [];
-	for (let i = 0; i < Math.min(citations.length, numResults); i++) {
+	for (let i = 0; i < citations.length; i++) {
 		const citation = citations[i];
 		if (typeof citation === "string") {
 			results.push({ title: `Source ${i + 1}`, url: citation, snippet: "" });
