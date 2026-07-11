@@ -41,6 +41,15 @@ export interface MemoryHit {
 	score: number;
 }
 
+/** Health of one source after a search (perf#3: silent partials are dishonest). */
+export type SourceStatus = "ok" | "partial" | "failed" | "skipped";
+
+export interface MemorySearchResult {
+	hits: MemoryHit[];
+	/** Per-source health: partial = truncated/killed scan, failed = tool missing/crashed. */
+	sourceStatus: Partial<Record<MemorySource, SourceStatus>>;
+}
+
 export interface MemorySearchOptions {
 	scope?: MemoryScope;
 	sources?: MemorySource[];
@@ -243,8 +252,13 @@ function searchSessions(
 	sinceMs: number | undefined,
 	now: number,
 	perSourceCap: number,
+	status: Partial<Record<MemorySource, SourceStatus>>,
 ): MemoryHit[] {
-	if (!existsSync(SESSIONS_ROOT)) return [];
+	status.sessions = "ok";
+	if (!existsSync(SESSIONS_ROOT)) {
+		status.sessions = "skipped";
+		return [];
+	}
 	const searchDirs =
 		scope === "current"
 			? [join(SESSIONS_ROOT, sessionFolderForCwd(cwd))].filter((d) => existsSync(d))
@@ -279,10 +293,17 @@ function searchSessions(
 		// rg exits 1 when no matches — that's not an error. On any other non-zero
 		// exit (e.g. 2 = permission-denied subdir) rg still PRINTED the matches it
 		// found, so keep partial stdout instead of discarding it (B2 — match docs).
-		const status = (e as { status?: number }).status;
-		if (status === 1) return [];
+		const st = (e as { status?: number }).status;
+		if (st === 1) return [];
 		out = String((e as { stdout?: Buffer | string }).stdout ?? "");
-		if (!out) return [];
+		if (!out) {
+			// ENOENT (rg missing) / timeout with nothing printed — source is broken,
+			// not empty. Surfacing this distinguishes 'no matches' from 'no scan'.
+			status.sessions = "failed";
+			return [];
+		}
+		// Partial stdout survived (exit 2 / timeout / ENOBUFS kill) — label it.
+		status.sessions = "partial";
 	}
 
 	const mtimeCache = new Map<string, number>();
@@ -345,8 +366,13 @@ function searchRecall(
 	sinceMs: number | undefined,
 	now: number,
 	perSourceCap: number,
+	status: Partial<Record<MemorySource, SourceStatus>>,
 ): MemoryHit[] {
-	if (!existsSync(RECALL_DB)) return [];
+	status.memory = "ok";
+	if (!existsSync(RECALL_DB)) {
+		status.memory = "skipped";
+		return [];
+	}
 	const proj = currentProject(cwd);
 	// Pull active memories (optionally scoped) as TSV; parse value JSON for text.
 	const where =
@@ -363,12 +389,15 @@ function searchRecall(
 			timeout: EXEC_TIMEOUT_MS,
 		});
 	} catch {
+		// sqlite3 missing, DB locked, or timed out — broken, not empty (perf#3).
+		status.memory = "failed";
 		return [];
 	}
 	let rows: Array<Record<string, unknown>>;
 	try {
 		rows = JSON.parse(out || "[]");
 	} catch {
+		status.memory = "failed";
 		return [];
 	}
 	const hits: MemoryHit[] = [];
@@ -412,9 +441,14 @@ function searchDocs(
 	sinceMs: number | undefined,
 	now: number,
 	perSourceCap: number,
+	status: Partial<Record<MemorySource, SourceStatus>>,
 ): MemoryHit[] {
+	status.docs = "ok";
 	const roots = (scope === "current" ? [cwd] : [WORK_ROOT, PI_AGENT_ROOT]).filter((r) => existsSync(r));
-	if (roots.length === 0) return [];
+	if (roots.length === 0) {
+		status.docs = "skipped";
+		return [];
+	}
 
 	// ripgrep finds the matching .md FILES fast (respects .gitignore, skips
 	// node_modules/.git by default). We then read+score only those files.
@@ -427,10 +461,14 @@ function searchDocs(
 			{ encoding: "utf-8", maxBuffer: 32 * 1024 * 1024, timeout: EXEC_TIMEOUT_MS },
 		);
 	} catch (e) {
-		const status = (e as { status?: number }).status;
-		if (status === 1) return [];
+		const st = (e as { status?: number }).status;
+		if (st === 1) return [];
 		out = String((e as { stdout?: Buffer | string }).stdout ?? "");
-		if (!out) return [];
+		if (!out) {
+			status.docs = "failed";
+			return [];
+		}
+		status.docs = "partial";
 	}
 
 	const hits: MemoryHit[] = [];
@@ -536,9 +574,14 @@ function searchGit(
 	sinceMs: number | undefined,
 	now: number,
 	perSourceCap: number,
+	status: Partial<Record<MemorySource, SourceStatus>>,
 ): MemoryHit[] {
+	status.git = "ok";
 	const repos = gitRepos(scope, cwd);
-	if (repos.length === 0) return [];
+	if (repos.length === 0) {
+		status.git = "skipped";
+		return [];
+	}
 	const since = sinceMs !== undefined ? [`--since=${new Date(now - sinceMs).toISOString()}`] : [];
 
 	// TIME-WINDOW mode: when the query has no real keywords left after stripping
@@ -641,7 +684,8 @@ function searchGit(
 
 // ── orchestrator ──────────────────────────────────────────────────────────────
 
-export function searchMemory(query: string, opts: MemorySearchOptions = {}): MemoryHit[] {
+export function searchMemory(query: string, opts: MemorySearchOptions = {}): MemorySearchResult {
+	const sourceStatus: Partial<Record<MemorySource, SourceStatus>> = {};
 	const tokens = tokenize(query);
 	const scope = opts.scope ?? "current";
 	// Default = "memory" in the user's sense: chat transcripts + recall memories.
@@ -657,22 +701,22 @@ export function searchMemory(query: string, opts: MemorySearchOptions = {}): Mem
 	const gitWindowOnly =
 		sources.includes("git") && opts.sinceMs !== undefined &&
 		tokens.every((t) => GIT_STOPWORDS.has(t));
-	if (tokens.length === 0 && !gitWindowOnly) return [];
+	if (tokens.length === 0 && !gitWindowOnly) return { hits: [], sourceStatus };
 
 	let hits: MemoryHit[] = [];
 	if (sources.includes("sessions") && tokens.length > 0)
-		hits = hits.concat(searchSessions(tokens, scope, cwd, opts.sinceMs, now, perSourceCap));
+		hits = hits.concat(searchSessions(tokens, scope, cwd, opts.sinceMs, now, perSourceCap, sourceStatus));
 	if (sources.includes("memory") && tokens.length > 0)
-		hits = hits.concat(searchRecall(tokens, scope, cwd, opts.sinceMs, now, perSourceCap));
+		hits = hits.concat(searchRecall(tokens, scope, cwd, opts.sinceMs, now, perSourceCap, sourceStatus));
 	if (sources.includes("docs") && tokens.length > 0)
-		hits = hits.concat(searchDocs(tokens, scope, cwd, opts.sinceMs, now, perSourceCap));
+		hits = hits.concat(searchDocs(tokens, scope, cwd, opts.sinceMs, now, perSourceCap, sourceStatus));
 	// git time-window sweeps should return ALL commits in the range, so don't
 	// clip them to the generic `limit`; other sources stay capped.
 	const gitWindow =
 		sources.includes("git") && opts.sinceMs !== undefined &&
 		tokens.filter((t) => !GIT_STOPWORDS.has(t)).length === 0;
 	if (sources.includes("git"))
-		hits = hits.concat(searchGit(query, tokens, scope, cwd, opts.sinceMs, now, perSourceCap));
+		hits = hits.concat(searchGit(query, tokens, scope, cwd, opts.sinceMs, now, perSourceCap, sourceStatus));
 
 	hits.sort((a, b) => b.score - a.score);
 	// Dedup: pi copies history into forked/subagent session files, so one message
@@ -694,7 +738,10 @@ export function searchMemory(query: string, opts: MemorySearchOptions = {}): Mem
 		seen.add(key);
 		deduped.push(h);
 	}
-	return deduped.slice(0, gitWindow ? Math.max(limit, GIT_WINDOW_MAX) : limit);
+	return {
+		hits: deduped.slice(0, gitWindow ? Math.max(limit, GIT_WINDOW_MAX) : limit),
+		sourceStatus,
+	};
 }
 
 /**
@@ -743,9 +790,23 @@ export function parseRecency(query: string): number | undefined {
 const FORMAT_BYTE_BUDGET = 64 * 1024;
 
 /** Render hits as a compact text block for the tool result. */
-export function formatHits(hits: MemoryHit[], query: string): string {
-	if (hits.length === 0) return `No matches in your history for "${query}".`;
-	const lines: string[] = [`Found ${hits.length} match(es) for "${query}":`, ""];
+export function formatHits(
+	hits: MemoryHit[],
+	query: string,
+	sourceStatus?: Partial<Record<MemorySource, SourceStatus>>,
+): string {
+	// Honesty note first (perf#3): a broken/truncated source must not
+	// masquerade as 'no matches' or a complete answer.
+	const notes: string[] = [];
+	for (const [src, st] of Object.entries(sourceStatus ?? {})) {
+		if (st === "failed") notes.push(`⚠ source '${src}' FAILED (tool missing/crashed) — its results are absent`);
+		else if (st === "partial") notes.push(`⚠ source '${src}' scan was TRUNCATED — results may be incomplete`);
+	}
+	if (hits.length === 0) {
+		const base = `No matches in your history for "${query}".`;
+		return notes.length > 0 ? `${notes.join("\n")}\n${base}` : base;
+	}
+	const lines: string[] = [`Found ${hits.length} match(es) for "${query}":`, ...notes, ""];
 	const tagOf = (s: MemorySource): string =>
 		s === "sessions" ? "chat" : s === "memory" ? "memory" : s === "docs" ? "doc" : "git";
 	let used = 0;

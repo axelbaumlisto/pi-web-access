@@ -2091,8 +2091,11 @@ export default function (pi: ExtensionAPI) {
 			const sinceMs = parseRecency(query);
 
 			let hits;
+			let sourceStatus;
 			try {
-				hits = searchMemory(query, { scope, sources, limit, cwd, sinceMs });
+				const res = searchMemory(query, { scope, sources, limit, cwd, sinceMs });
+				hits = res.hits;
+				sourceStatus = res.sourceStatus;
 			} catch (err) {
 				const msg = err instanceof Error ? err.message : String(err);
 				return {
@@ -2102,11 +2105,12 @@ export default function (pi: ExtensionAPI) {
 			}
 
 			return {
-				content: [{ type: "text", text: formatHits(hits, query) }],
+				content: [{ type: "text", text: formatHits(hits, query, sourceStatus) }],
 				details: {
 					query,
 					scope,
 					sources,
+					sourceStatus,
 					sinceMs: sinceMs ?? null,
 					count: hits.length,
 					hits: hits.map((h) => ({
