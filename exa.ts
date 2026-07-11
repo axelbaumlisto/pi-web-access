@@ -4,6 +4,7 @@ import type { ExtractedContent } from "./extract.ts";
 import type { SearchOptions, SearchResponse } from "./perplexity.ts";
 import { getWebSearchConfigPath } from "./utils.ts";
 import { providerApiKey, providerUrl, resolveProviderEndpoint } from "./provider-endpoints.ts";
+import { redactError } from "./redact.ts";
 
 const EXA_DEFAULT_MCP_URL = "https://mcp.exa.ai/mcp";
 
@@ -196,7 +197,7 @@ export async function callExaMcp(
 
 	if (!response.ok) {
 		const errorText = await response.text();
-		throw new Error(`Exa MCP error ${response.status}: ${errorText.slice(0, 300)}`);
+		throw new Error(`Exa MCP error ${response.status}: ${redactError(errorText)}`);
 	}
 
 	const body = await response.text();
@@ -233,14 +234,14 @@ export async function callExaMcp(
 	if (parsed.error) {
 		const code = typeof parsed.error.code === "number" ? ` ${parsed.error.code}` : "";
 		const message = parsed.error.message || "Unknown error";
-		throw new Error(`Exa MCP error${code}: ${message}`);
+		throw new Error(`Exa MCP error${code}: ${redactError(message)}`);
 	}
 
 	if (parsed.result?.isError) {
 		const message = parsed.result.content
 			?.find(item => item.type === "text" && typeof item.text === "string")
 			?.text?.trim();
-		throw new Error(message || "Exa MCP returned an error");
+		throw new Error(message ? redactError(message) : "Exa MCP returned an error");
 	}
 
 	const text = parsed.result?.content
@@ -403,10 +404,16 @@ export async function searchWithExa(query: string, options: ExaSearchOptions = {
 
 			if (!response.ok) {
 				const errorText = await response.text();
-				throw new Error(`Exa API error ${response.status}: ${errorText.slice(0, 300)}`);
+				throw new Error(`Exa API error ${response.status}: ${redactError(errorText)}`);
 			}
 
-			const data = await response.json() as ExaAnswerResponse;
+			let data: ExaAnswerResponse;
+			try {
+				data = await response.json() as ExaAnswerResponse;
+			} catch (err) {
+				const message = err instanceof Error ? err.message : String(err);
+				throw new Error(`Exa API returned invalid JSON: ${redactError(message)}`);
+			}
 			activityMonitor.logComplete(activityId, response.status);
 			return {
 				answer: data.answer || "",
@@ -438,10 +445,16 @@ export async function searchWithExa(query: string, options: ExaSearchOptions = {
 
 		if (!response.ok) {
 			const errorText = await response.text();
-			throw new Error(`Exa API error ${response.status}: ${errorText.slice(0, 300)}`);
+			throw new Error(`Exa API error ${response.status}: ${redactError(errorText)}`);
 		}
 
-		const data = await response.json() as ExaSearchResponse;
+		let data: ExaSearchResponse;
+		try {
+			data = await response.json() as ExaSearchResponse;
+		} catch (err) {
+			const message = err instanceof Error ? err.message : String(err);
+			throw new Error(`Exa API returned invalid JSON: ${redactError(message)}`);
+		}
 		activityMonitor.logComplete(activityId, response.status);
 
 		const mapped: SearchResponse = {

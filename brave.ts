@@ -3,6 +3,7 @@ import { activityMonitor } from "./activity.ts";
 import type { SearchOptions, SearchResult, SearchResponse } from "./perplexity.ts";
 import { getWebSearchConfigPath } from "./utils.ts";
 import { providerApiKey, providerUrl } from "./provider-endpoints.ts";
+import { redactError } from "./redact.ts";
 
 // Search endpoint override lives in provider-endpoints.ts (env > config >
 // default). The value is the FULL search URL; query params are appended.
@@ -175,12 +176,20 @@ export async function searchWithBrave(
 		if (!response.ok) {
 			activityMonitor.logError(activityId, `HTTP ${response.status}`);
 			const errorText = await response.text();
-			throw new Error(`Brave Search API error ${response.status}: ${errorText.slice(0, 300)}`);
+			throw new Error(`Brave Search API error ${response.status}: ${redactError(errorText)}`);
 		}
 
-		const data = await response.json() as {
+		let data: {
 			web?: { results?: Array<{ title?: string; url?: string; description?: string }> };
 		};
+		try {
+			data = await response.json() as {
+				web?: { results?: Array<{ title?: string; url?: string; description?: string }> };
+			};
+		} catch (err) {
+			const message = err instanceof Error ? err.message : String(err);
+			throw new Error(`Brave Search API returned invalid JSON: ${redactError(message)}`);
+		}
 		activityMonitor.logComplete(activityId, response.status);
 
 		const results: SearchResult[] = [];

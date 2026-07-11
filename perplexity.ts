@@ -2,6 +2,7 @@ import { activityMonitor } from "./activity.ts";
 import type { ExtractedContent } from "./extract.ts";
 import { getWebSearchConfigPath } from "./utils.ts";
 import { providerApiKey, providerUrl } from "./provider-endpoints.ts";
+import { redactError } from "./redact.ts";
 
 // Endpoint override lives in provider-endpoints.ts (env > config > default).
 // The value is the FULL chat/completions URL, so it can front a proxy that
@@ -134,7 +135,7 @@ export async function searchWithPerplexity(query: string, options: SearchOptions
 	if (!response.ok) {
 		activityMonitor.logComplete(activityId, response.status);
 		const errorText = await response.text();
-		throw new Error(`Perplexity API error ${response.status}: ${errorText}`);
+		throw new Error(`Perplexity API error ${response.status}: ${redactError(errorText)}`);
 	}
 
 	let data: Record<string, unknown>;
@@ -143,7 +144,7 @@ export async function searchWithPerplexity(query: string, options: SearchOptions
 	} catch (err) {
 		activityMonitor.logComplete(activityId, response.status);
 		const message = err instanceof Error ? err.message : String(err);
-		throw new Error(`Perplexity API returned invalid JSON: ${message}`);
+		throw new Error(`Perplexity API returned invalid JSON: ${redactError(message)}`);
 	}
 
 	const answer = (data.choices as Array<{ message?: { content?: string } }>)?.[0]?.message?.content || "";
