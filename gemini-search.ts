@@ -118,6 +118,11 @@ async function searchWithGemini(
 	return null;
 }
 
+/** A provider response with neither a synthesized answer nor any source. */
+function isEmptyResponse(r: SearchResponse): boolean {
+	return (!r.results || r.results.length === 0) && !r.answer?.trim();
+}
+
 export async function search(query: string, options: FullSearchOptions = {}): Promise<AttributedSearchResponse> {
 	const config = getSearchConfig();
 	const provider = options.provider ?? config.searchProvider;
@@ -175,12 +180,32 @@ export async function search(query: string, options: FullSearchOptions = {}): Pr
 	}
 
 	const fallbackErrors: string[] = [];
+	// product#4/#5: in AUTO mode a provider that returns HTTP 200 with an EMPTY
+	// result (no answer, no sources) must NOT stop the chain — keep falling
+	// through to the next provider. The last empty response is retained so a
+	// genuinely empty web (all providers empty) still returns something rather
+	// than throwing. Explicit-provider mode above is intentionally strict and
+	// unchanged.
+	let lastEmpty: AttributedSearchResponse | undefined;
+	const takeAuto = (
+		result: SearchResponse | null | undefined,
+		name: ResolvedSearchProvider,
+	): AttributedSearchResponse | undefined => {
+		if (!result) return undefined;
+		const attributed = { ...result, provider: name };
+		if (isEmptyResponse(result)) {
+			lastEmpty = attributed;
+			fallbackErrors.push(`${name}: empty result`);
+			return undefined;
+		}
+		return attributed;
+	};
 
 	if (shouldTryOpenAIInAuto(options)) {
 		try {
 			if (await isOpenAISearchAvailable(options.extensionContext)) {
-				const result = await searchWithOpenAI(query, options, options.extensionContext);
-				return { ...result, provider: "openai" };
+				const hit = takeAuto(await searchWithOpenAI(query, options, options.extensionContext), "openai");
+				if (hit) return hit;
 			}
 		} catch (err) {
 			if (isAbortError(err)) throw err;
@@ -190,8 +215,8 @@ export async function search(query: string, options: FullSearchOptions = {}): Pr
 
 	if (provider !== "exa" && isExaAvailable()) {
 		try {
-			const result = await searchWithExa(query, options);
-			if (result) return { ...result, provider: "exa" };
+			const hit = takeAuto(await searchWithExa(query, options), "exa");
+			if (hit) return hit;
 		} catch (err) {
 			if (isAbortError(err)) throw err;
 			fallbackErrors.push(`Exa: ${errorMessage(err)}`);
@@ -200,8 +225,8 @@ export async function search(query: string, options: FullSearchOptions = {}): Pr
 
 	if (isBraveAvailable()) {
 		try {
-			const result = await searchWithBrave(query, options);
-			return { ...result, provider: "brave" };
+			const hit = takeAuto(await searchWithBrave(query, options), "brave");
+			if (hit) return hit;
 		} catch (err) {
 			if (isAbortError(err)) throw err;
 			fallbackErrors.push(`Brave: ${errorMessage(err)}`);
@@ -210,8 +235,8 @@ export async function search(query: string, options: FullSearchOptions = {}): Pr
 
 	if (isParallelAvailable()) {
 		try {
-			const result = await searchWithParallel(query, options);
-			return { ...result, provider: "parallel" };
+			const hit = takeAuto(await searchWithParallel(query, options), "parallel");
+			if (hit) return hit;
 		} catch (err) {
 			if (isAbortError(err)) throw err;
 			fallbackErrors.push(`Parallel: ${errorMessage(err)}`);
@@ -220,8 +245,8 @@ export async function search(query: string, options: FullSearchOptions = {}): Pr
 
 	if (isTavilyAvailable()) {
 		try {
-			const result = await searchWithTavily(query, options);
-			return { ...result, provider: "tavily" };
+			const hit = takeAuto(await searchWithTavily(query, options), "tavily");
+			if (hit) return hit;
 		} catch (err) {
 			if (isAbortError(err)) throw err;
 			fallbackErrors.push(`Tavily: ${errorMessage(err)}`);
@@ -230,8 +255,8 @@ export async function search(query: string, options: FullSearchOptions = {}): Pr
 
 	if (isPerplexityAvailable()) {
 		try {
-			const result = await searchWithPerplexity(query, options);
-			return { ...result, provider: "perplexity" };
+			const hit = takeAuto(await searchWithPerplexity(query, options), "perplexity");
+			if (hit) return hit;
 		} catch (err) {
 			if (isAbortError(err)) throw err;
 			fallbackErrors.push(`Perplexity: ${errorMessage(err)}`);
@@ -239,12 +264,17 @@ export async function search(query: string, options: FullSearchOptions = {}): Pr
 	}
 
 	try {
-		const geminiResult = await searchWithGemini(query, options, false);
-		if (geminiResult) return { ...geminiResult, provider: "gemini" };
+		const hit = takeAuto(await searchWithGemini(query, options, false), "gemini");
+		if (hit) return hit;
 	} catch (err) {
 		if (isAbortError(err)) throw err;
 		fallbackErrors.push(`Gemini: ${errorMessage(err)}`);
 	}
+
+	// All available providers returned empty (but none errored fatally) — return
+	// the last empty response rather than throwing, so the caller gets an honest
+	// "no results" from a real provider instead of an error.
+	if (lastEmpty) return lastEmpty;
 
 	if (fallbackErrors.length > 0) {
 		throw new Error(`Auto provider search failed:\n  - ${fallbackErrors.join("\n  - ")}`);
