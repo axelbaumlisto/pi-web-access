@@ -268,7 +268,7 @@ async function searchWithGeminiApi(query: string, options: SearchOptions = {}): 
 	try {
 		const model = getSearchConfig().searchModel ?? DEFAULT_MODEL;
 		const body = {
-			contents: [{ role: "user", parts: [{ text: query }] }],
+			contents: [{ role: "user", parts: [{ text: appendSearchConstraints(query, options) }] }],
 			tools: [{ google_search: {} }],
 		};
 
@@ -294,7 +294,12 @@ async function searchWithGeminiApi(query: string, options: SearchOptions = {}): 
 			?.map(p => p.text).filter(Boolean).join("\n") ?? "";
 
 		const metadata = data.candidates?.[0]?.groundingMetadata;
-		const results = await resolveGroundingChunks(metadata?.groundingChunks, options.signal);
+		const resolvedResults = await resolveGroundingChunks(metadata?.groundingChunks, options.signal);
+		const uniqueResults = dedupeResultsByUrl(resolvedResults);
+		// Cap ONLY when the caller supplies a valid explicit count; otherwise return
+		// every unique chunk (preserving the original no-default-cap behavior).
+		const cap = normalizeResultCount(options.numResults);
+		const results = cap === null ? uniqueResults : uniqueResults.slice(0, cap);
 
 		if (!answer && results.length === 0) return null;
 		return { answer, results };
@@ -338,9 +343,7 @@ async function searchWithGeminiWeb(query: string, options: SearchOptions = {}): 
 	}
 }
 
-function buildSearchPrompt(query: string, options: SearchOptions): string {
-	let prompt = `Search the web and answer the following question. Include source URLs for your claims.\nFormat your response as:\n1. A direct answer to the question\n2. Cited sources as markdown links\n\nQuestion: ${query}`;
-
+function appendSearchConstraints(prompt: string, options: SearchOptions): string {
 	if (options.recencyFilter) {
 		const labels: Record<string, string> = {
 			day: "past 24 hours",
@@ -361,17 +364,38 @@ function buildSearchPrompt(query: string, options: SearchOptions): string {
 	return prompt;
 }
 
+function buildSearchPrompt(query: string, options: SearchOptions): string {
+	const prompt = `Search the web and answer the following question. Include source URLs for your claims.\nFormat your response as:\n1. A direct answer to the question\n2. Cited sources as markdown links\n\nQuestion: ${query}`;
+	return appendSearchConstraints(prompt, options);
+}
+
+// Public numResults contract: integer 1..20. Anything absent/invalid means
+// "no cap" — return all unique chunks.
+const MAX_NUM_RESULTS = 20;
+
+function normalizeResultCount(numResults: number | undefined): number | null {
+	if (typeof numResults !== "number" || !Number.isFinite(numResults)) return null;
+	const count = Math.floor(numResults);
+	if (count < 1) return null;
+	return Math.min(count, MAX_NUM_RESULTS);
+}
+
+function dedupeResultsByUrl(results: SearchResult[]): SearchResult[] {
+	const seen = new Set<string>();
+	return results.filter((result) => {
+		if (seen.has(result.url)) return false;
+		seen.add(result.url);
+		return true;
+	});
+}
+
 function extractSourceUrls(markdown: string): SearchResult[] {
 	const results: SearchResult[] = [];
-	const seen = new Set<string>();
 	const linkRegex = /\[([^\]]+)\]\((https?:\/\/[^)]+)\)/g;
 	for (const match of markdown.matchAll(linkRegex)) {
-		const url = match[2];
-		if (seen.has(url)) continue;
-		seen.add(url);
-		results.push({ title: match[1], url, snippet: "" });
+		results.push({ title: match[1], url: match[2], snippet: "" });
 	}
-	return results;
+	return dedupeResultsByUrl(results);
 }
 
 async function resolveGroundingChunks(
