@@ -3,7 +3,7 @@ import type { ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { activityMonitor } from "./activity.ts";
 import type { SearchOptions, SearchResponse, SearchResult } from "./perplexity.ts";
 import { getWebSearchConfigPath } from "./utils.ts";
-import { providerUrl } from "./provider-endpoints.ts";
+import { providerApiKey, providerUrl } from "./provider-endpoints.ts";
 
 // Standard Responses endpoint override lives in provider-endpoints.ts
 // (env OPENAI_RESPONSES_URL > config openaiResponsesUrl > default). The codex
@@ -142,7 +142,7 @@ export async function resolveOpenAIAuth(ctx?: ExtensionContext): Promise<OpenAIA
 		}
 	}
 
-	const apiKey = normalizeApiKey(process.env.OPENAI_API_KEY) ?? normalizeApiKey(loadConfig().openaiApiKey);
+	const apiKey = providerApiKey("openai");
 	return apiKey
 		? { provider: "openai", apiKey, model: "gpt-5.4", headers: {} }
 		: undefined;

@@ -2,7 +2,7 @@ import { existsSync, readFileSync } from "node:fs";
 import { activityMonitor } from "./activity.ts";
 import type { SearchOptions, SearchResult, SearchResponse } from "./perplexity.ts";
 import { getWebSearchConfigPath } from "./utils.ts";
-import { providerUrl } from "./provider-endpoints.ts";
+import { providerApiKey, providerUrl } from "./provider-endpoints.ts";
 
 // Search endpoint override lives in provider-endpoints.ts (env > config >
 // default). The value is the FULL search URL; query params are appended.
@@ -46,7 +46,7 @@ function normalizeApiKey(value: unknown): string | null {
 }
 
 function getApiKey(): string | null {
-	return normalizeApiKey(process.env.BRAVE_API_KEY) ?? normalizeApiKey(loadConfig().braveApiKey);
+	return providerApiKey("brave");
 }
 
 function normalizeCount(value: number | undefined): number {

@@ -2,7 +2,7 @@ import { existsSync, readFileSync } from "node:fs";
 import { activityMonitor } from "./activity.ts";
 import type { ExtractedContent } from "./extract.ts";
 import { getWebSearchConfigPath } from "./utils.ts";
-import { providerUrl } from "./provider-endpoints.ts";
+import { providerApiKey, providerUrl } from "./provider-endpoints.ts";
 
 // Endpoint override lives in provider-endpoints.ts (env > config > default).
 // The value is the FULL chat/completions URL, so it can front a proxy that
@@ -68,8 +68,7 @@ function normalizeApiKey(value: unknown): string | null {
 }
 
 function getApiKey(): string {
-	const config = loadConfig();
-	const key = normalizeApiKey(process.env.PERPLEXITY_API_KEY) ?? normalizeApiKey(config.perplexityApiKey);
+	const key = providerApiKey("perplexity");
 	if (!key) {
 		throw new Error(
 			"Perplexity API key not found. Either:\n" +

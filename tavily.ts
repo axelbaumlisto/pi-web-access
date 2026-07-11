@@ -3,7 +3,7 @@ import { activityMonitor } from "./activity.ts";
 import type { ExtractedContent } from "./extract.ts";
 import type { SearchOptions, SearchResponse } from "./perplexity.ts";
 import { getWebSearchConfigPath } from "./utils.ts";
-import { providerUrl } from "./provider-endpoints.ts";
+import { providerApiKey, providerUrl } from "./provider-endpoints.ts";
 
 // Endpoint override lives in provider-endpoints.ts (env > config > default).
 const TAVILY_API_URL = () => providerUrl("tavily");
@@ -56,7 +56,7 @@ function normalizeApiKey(value: unknown): string | null {
 }
 
 function getApiKey(): string | null {
-	return normalizeApiKey(process.env.TAVILY_API_KEY) ?? normalizeApiKey(loadConfig().tavilyApiKey);
+	return providerApiKey("tavily");
 }
 
 function requireApiKey(): string {

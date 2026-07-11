@@ -3,7 +3,7 @@ import { activityMonitor } from "./activity.ts";
 import type { ExtractedContent } from "./extract.ts";
 import type { SearchOptions, SearchResponse } from "./perplexity.ts";
 import { getWebSearchConfigPath } from "./utils.ts";
-import { providerUrl, resolveProviderEndpoint } from "./provider-endpoints.ts";
+import { providerApiKey, providerUrl, resolveProviderEndpoint } from "./provider-endpoints.ts";
 
 const EXA_DEFAULT_MCP_URL = "https://mcp.exa.ai/mcp";
 
@@ -85,7 +85,8 @@ function normalizeApiKey(value: unknown): string | null {
 }
 
 function getApiKey(): string | null {
-	return normalizeApiKey(process.env.EXA_API_KEY) ?? normalizeApiKey(loadConfig().exaApiKey);
+	// per-provider EXA_API_KEY/exaApiKey, else the shared proxy key (when proxied).
+	return providerApiKey("exa");
 }
 
 function requestSignal(signal?: AbortSignal): AbortSignal {
