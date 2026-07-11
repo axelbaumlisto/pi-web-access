@@ -50,7 +50,12 @@ function normalizeBaseUrl(value: unknown): string | null {
 }
 
 function isCloudflareGateway(): boolean {
-	return getApiHost().includes("gateway.ai.cloudflare.com");
+	try {
+		const hostname = new URL(getApiHost()).hostname;
+		return hostname === "gateway.ai.cloudflare.com" || hostname.endsWith(".gateway.ai.cloudflare.com");
+	} catch {
+		return false;
+	}
 }
 
 function isDirectGoogleHost(): boolean {

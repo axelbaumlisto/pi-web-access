@@ -10,6 +10,7 @@ import { isOpenAISearchAvailable, searchWithOpenAI } from "./openai-search.ts";
 import { isParallelAvailable, searchWithParallel } from "./parallel.ts";
 import { isTavilyAvailable, searchWithTavily } from "./tavily.ts";
 import { getWebSearchConfigPath } from "./utils.ts";
+import { validateRemoteUrl } from "./ssrf-protection.ts";
 
 export type SearchProvider = "auto" | "openai" | "brave" | "parallel" | "tavily" | "perplexity" | "gemini" | "exa";
 export type ResolvedSearchProvider = Exclude<SearchProvider, "auto">;
@@ -398,6 +399,22 @@ function extractSourceUrls(markdown: string): SearchResult[] {
 	return dedupeResultsByUrl(results);
 }
 
+const GROUNDING_REDIRECT_HOST = "vertexaisearch.cloud.google.com";
+const GROUNDING_REDIRECT_PATH = "/grounding-api-redirect";
+
+function parseGroundingRedirectUrl(rawUrl: string): URL | null {
+	try {
+		const url = new URL(rawUrl);
+		return url.protocol === "https:" &&
+			url.hostname === GROUNDING_REDIRECT_HOST &&
+			(url.pathname === GROUNDING_REDIRECT_PATH || url.pathname.startsWith(GROUNDING_REDIRECT_PATH + "/"))
+			? url
+			: null;
+	} catch {
+		return null;
+	}
+}
+
 async function resolveGroundingChunks(
 	chunks: GroundingChunk[] | undefined,
 	signal?: AbortSignal,
@@ -410,9 +427,12 @@ async function resolveGroundingChunks(
 		const title = chunk.web.title || "";
 		let url = chunk.web.uri || "";
 
-		if (url.includes("vertexaisearch.cloud.google.com/grounding-api-redirect")) {
-			const resolved = await resolveRedirect(url, signal);
-			if (resolved) url = resolved;
+		if (url.includes(GROUNDING_REDIRECT_PATH.slice(1))) {
+			const redirectUrl = parseGroundingRedirectUrl(url);
+			if (!redirectUrl) continue;
+			const resolved = await resolveRedirect(redirectUrl, signal);
+			if (!resolved) continue;
+			url = resolved;
 		}
 
 		if (url) results.push({ title, url, snippet: "" });
@@ -420,7 +440,7 @@ async function resolveGroundingChunks(
 	return results;
 }
 
-async function resolveRedirect(proxyUrl: string, signal?: AbortSignal): Promise<string | null> {
+async function resolveRedirect(proxyUrl: URL, signal?: AbortSignal): Promise<string | null> {
 	try {
 		const res = await fetch(proxyUrl, {
 			method: "HEAD",
@@ -430,7 +450,11 @@ async function resolveRedirect(proxyUrl: string, signal?: AbortSignal): Promise<
 				...(signal ? [signal] : []),
 			]),
 		});
-		return res.headers.get("location") || null;
+		const location = res.headers.get("location");
+		if (!location) return null;
+		const resolved = new URL(location, proxyUrl);
+		if (resolved.protocol !== "https:") return null;
+		return (await validateRemoteUrl(resolved)).toString();
 	} catch {
 		return null;
 	}
