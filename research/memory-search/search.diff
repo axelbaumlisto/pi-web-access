@@ -1,0 +1,1121 @@
+diff --git a/brave.ts b/brave.ts
+index 6345b7c..0295c4e 100644
+--- a/brave.ts
++++ b/brave.ts
+@@ -2,13 +2,17 @@ import { existsSync, readFileSync } from "node:fs";
+ import { activityMonitor } from "./activity.ts";
+ import type { SearchOptions, SearchResult, SearchResponse } from "./perplexity.ts";
+ import { getWebSearchConfigPath } from "./utils.ts";
++import { providerApiKey, providerUrl } from "./provider-endpoints.ts";
+ 
+-const BRAVE_API_URL = "https://api.search.brave.com/res/v1/web/search";
++// Search endpoint override lives in provider-endpoints.ts (env > config >
++// default). The value is the FULL search URL; query params are appended.
++const getBraveUrl = () => providerUrl("brave");
+ const CONFIG_PATH = getWebSearchConfigPath();
+ const SEARCH_TIMEOUT_MS = 30_000;
+ 
+ interface WebSearchConfig {
+ 	braveApiKey?: unknown;
++	braveBaseUrl?: unknown;
+ }
+ 
+ interface NormalizedDomainFilters {
+@@ -42,7 +46,7 @@ function normalizeApiKey(value: unknown): string | null {
+ }
+ 
+ function getApiKey(): string | null {
+-	return normalizeApiKey(process.env.BRAVE_API_KEY) ?? normalizeApiKey(loadConfig().braveApiKey);
++	return providerApiKey("brave");
+ }
+ 
+ function normalizeCount(value: number | undefined): number {
+@@ -156,7 +160,7 @@ export async function searchWithBrave(
+ 	}
+ 
+ 	try {
+-		const response = await fetch(`${BRAVE_API_URL}?${params.toString()}`, {
++		const response = await fetch(`${getBraveUrl()}?${params.toString()}`, {
+ 			method: "GET",
+ 			headers: {
+ 				"X-Subscription-Token": apiKey,
+diff --git a/exa.ts b/exa.ts
+index fdfec26..d06ec66 100644
+--- a/exa.ts
++++ b/exa.ts
+@@ -3,14 +3,24 @@ import { activityMonitor } from "./activity.ts";
+ import type { ExtractedContent } from "./extract.ts";
+ import type { SearchOptions, SearchResponse } from "./perplexity.ts";
+ import { getWebSearchConfigPath } from "./utils.ts";
+-
+-const EXA_ANSWER_URL = "https://api.exa.ai/answer";
+-const EXA_SEARCH_URL = "https://api.exa.ai/search";
+-const EXA_MCP_URL = "https://mcp.exa.ai/mcp";
++import { providerApiKey, providerUrl, resolveProviderEndpoint } from "./provider-endpoints.ts";
++
++const EXA_DEFAULT_MCP_URL = "https://mcp.exa.ai/mcp";
++
++// Base/URL overrides come from provider-endpoints.ts (env > config > default).
++const EXA_ANSWER_URL = () => `${providerUrl("exa")}/answer`;
++const EXA_SEARCH_URL = () => `${providerUrl("exa")}/search`;
++// MCP lives on a different host by default; only route /mcp under the base when
++// an override is explicitly set, otherwise use the canonical mcp.exa.ai host.
++const EXA_MCP_URL = () => {
++	const { url, overridden } = resolveProviderEndpoint("exa");
++	return overridden ? `${url}/mcp` : EXA_DEFAULT_MCP_URL;
++};
+ const CONFIG_PATH = getWebSearchConfigPath();
+ 
+ interface WebSearchConfig {
+ 	exaApiKey?: unknown;
++	exaBaseUrl?: unknown;
+ }
+ 
+ interface ExaAnswerResponse {
+@@ -75,7 +85,8 @@ function normalizeApiKey(value: unknown): string | null {
+ }
+ 
+ function getApiKey(): string | null {
+-	return normalizeApiKey(process.env.EXA_API_KEY) ?? normalizeApiKey(loadConfig().exaApiKey);
++	// per-provider EXA_API_KEY/exaApiKey, else the shared proxy key (when proxied).
++	return providerApiKey("exa");
+ }
+ 
+ function requestSignal(signal?: AbortSignal): AbortSignal {
+@@ -165,7 +176,7 @@ export async function callExaMcp(
+ 	args: Record<string, unknown>,
+ 	signal?: AbortSignal,
+ ): Promise<string> {
+-	const response = await fetch(EXA_MCP_URL, {
++	const response = await fetch(EXA_MCP_URL(), {
+ 		method: "POST",
+ 		headers: {
+ 			"Content-Type": "application/json",
+@@ -377,7 +388,7 @@ export async function searchWithExa(query: string, options: ExaSearchOptions = {
+ 
+ 	try {
+ 		if (!useSearch) {
+-			const response = await fetch(EXA_ANSWER_URL, {
++			const response = await fetch(EXA_ANSWER_URL(), {
+ 				method: "POST",
+ 				headers: {
+ 					"x-api-key": apiKey,
+@@ -405,7 +416,7 @@ export async function searchWithExa(query: string, options: ExaSearchOptions = {
+ 
+ 		const startDate = options.recencyFilter ? recencyToStartDate(options.recencyFilter) : null;
+ 		const domainFilters = mapDomainFilter(options.domainFilter);
+-		const response = await fetch(EXA_SEARCH_URL, {
++		const response = await fetch(EXA_SEARCH_URL(), {
+ 			method: "POST",
+ 			headers: {
+ 				"x-api-key": apiKey,
+diff --git a/memory-search.ts b/memory-search.ts
+new file mode 100644
+index 0000000..bd39f26
+--- /dev/null
++++ b/memory-search.ts
+@@ -0,0 +1,630 @@
++/**
++ * memory_search — search your own history instead of the web.
++ *
++ * Three sources, searched on the fly (no index yet — that comes later):
++ *   1. pi sessions   — ~/.pi/agent/sessions/<project>/*.jsonl  (chat transcripts)
++ *   2. claude-recall — ~/.claude-recall/claude-recall.db        (stored memories)
++ *   3. markdown docs — *.md under the project (and ~/.pi/agent for scope=all)
++ *
++ * Scope:
++ *   - "current" (default): the current project only. Sessions are the folder
++ *     whose de-slugged path matches cwd; recall is project_id === basename(cwd)
++ *     (plus universal memories); md docs are under cwd.
++ *   - "all": every project on this machine. Sessions = all folders; recall =
++ *     all rows; md docs = ~/work + ~/.pi/agent.
++ *
++ * Ranking is deliberately simple for now: keyword-overlap score × recency
++ * boost. FTS5/BM25 is a later upgrade.
++ */
++
++import { existsSync, readdirSync, readFileSync, statSync } from "node:fs";
++import { homedir } from "node:os";
++import { basename, join } from "node:path";
++import { execFileSync } from "node:child_process";
++
++export type MemoryScope = "current" | "all";
++export type MemorySource = "sessions" | "memory" | "docs" | "git";
++
++export interface MemoryHit {
++	source: MemorySource;
++	/** Short human label: session role / memory type / doc path. */
++	label: string;
++	/** The matched text snippet (already trimmed around the match). */
++	snippet: string;
++	/** Where it came from (session file, memory key, or doc path). */
++	location: string;
++	/** Project this belongs to (basename), or "universal". */
++	project: string;
++	/** Unix ms of the item (session event ts, memory ts, or file mtime). */
++	timestamp: number;
++	/** Final rank score (higher = better). */
++	score: number;
++}
++
++export interface MemorySearchOptions {
++	scope?: MemoryScope;
++	sources?: MemorySource[];
++	/** Only items newer than this many ms ago (e.g. "yesterday" → ~48h). */
++	sinceMs?: number;
++	/** Max hits to return. */
++	limit?: number;
++	/** cwd to resolve the current project from. */
++	cwd?: string;
++}
++
++const SESSIONS_ROOT = join(homedir(), ".pi", "agent", "sessions");
++const RECALL_DB = join(homedir(), ".claude-recall", "claude-recall.db");
++const WORK_ROOT = join(homedir(), "work");
++const PI_AGENT_ROOT = join(homedir(), ".pi", "agent");
++
++// ── query + scoring ─────────────────────────────────────────────────────────
++
++function tokenize(q: string): string[] {
++	return q
++		.toLowerCase()
++		.split(/[^\p{L}\p{N}_]+/u)
++		.filter((t) => t.length >= 2);
++}
++
++/**
++ * Keyword-overlap score for `text` against query `tokens`. Counts occurrences
++ * (capped per token) so a doc mentioning the query many times ranks higher,
++ * but one spammy token can't dominate.
++ */
++function keywordScore(text: string, tokens: string[]): number {
++	if (tokens.length === 0) return 0;
++	const lower = text.toLowerCase();
++	let score = 0;
++	let matched = 0;
++	for (const t of tokens) {
++		let idx = lower.indexOf(t);
++		if (idx === -1) continue;
++		matched++;
++		let count = 0;
++		while (idx !== -1 && count < 5) {
++			count++;
++			idx = lower.indexOf(t, idx + t.length);
++		}
++		score += count;
++	}
++	if (matched === 0) return 0;
++	// reward covering more distinct query tokens
++	return score * (matched / tokens.length);
++}
++
++/** Recency multiplier: 1.0 now → ~0.5 at 30 days → asymptote 0.2. */
++function recencyBoost(timestamp: number, now: number): number {
++	const ageDays = Math.max(0, (now - timestamp) / 86_400_000);
++	return 0.2 + 0.8 / (1 + ageDays / 30);
++}
++
++/** Trim a snippet around the first matched token. */
++function makeSnippet(text: string, tokens: string[], width = 240): string {
++	const lower = text.toLowerCase();
++	let pos = -1;
++	for (const t of tokens) {
++		const i = lower.indexOf(t);
++		if (i !== -1 && (pos === -1 || i < pos)) pos = i;
++	}
++	const collapsed = text.replace(/\s+/g, " ").trim();
++	if (pos === -1) return collapsed.slice(0, width);
++	// recompute pos on the collapsed string
++	const cpos = collapsed.toLowerCase().indexOf(tokens.find((t) => lower.includes(t)) ?? "");
++	const start = Math.max(0, (cpos === -1 ? 0 : cpos) - width / 3);
++	const end = Math.min(collapsed.length, start + width);
++	return (start > 0 ? "…" : "") + collapsed.slice(start, end) + (end < collapsed.length ? "…" : "");
++}
++
++// ── project resolution ──────────────────────────────────────────────────────
++
++/** Slugified session-folder name for a given absolute path (pi's scheme). */
++function sessionFolderForCwd(cwd: string): string {
++	// pi slugs the absolute path: leading/every "/" → "-", wrapped in "--…--".
++	const slug = cwd.replace(/\//g, "-");
++	return `--${slug.replace(/^-+/, "").replace(/-+$/, "")}--`;
++}
++
++function currentProject(cwd: string): string {
++	return basename(cwd) || "unknown";
++}
++
++// ── source: sessions ─────────────────────────────────────────────────────────
++
++function extractMessageText(evt: unknown): { role: string; text: string } | null {
++	if (typeof evt !== "object" || evt === null) return null;
++	const e = evt as Record<string, unknown>;
++	if (e.type !== "message") return null;
++	const m = e.message as Record<string, unknown> | undefined;
++	if (!m) return null;
++	const role = String(m.role ?? "?");
++	const content = m.content;
++	let text = "";
++	if (typeof content === "string") {
++		text = content;
++	} else if (Array.isArray(content)) {
++		for (const block of content) {
++			if (block && typeof block === "object" && (block as Record<string, unknown>).type === "text") {
++				text += `${String((block as Record<string, unknown>).text ?? "")} `;
++			}
++		}
++	}
++	text = text.trim();
++	// Skip empty / tool-only turns and giant tool dumps we don't want to surface.
++	if (!text || role === "toolResult") return null;
++	return { role, text };
++}
++
++function searchSessions(
++	tokens: string[],
++	scope: MemoryScope,
++	cwd: string,
++	sinceMs: number | undefined,
++	now: number,
++	perSourceCap: number,
++): MemoryHit[] {
++	if (!existsSync(SESSIONS_ROOT)) return [];
++	const searchDirs =
++		scope === "current"
++			? [join(SESSIONS_ROOT, sessionFolderForCwd(cwd))].filter((d) => existsSync(d))
++			: [SESSIONS_ROOT];
++	if (searchDirs.length === 0) return [];
++
++	// Use ripgrep to find matching LINES fast (scans 8GB in ~1.5s vs ~40s in JS).
++	// We OR the tokens as a fixed-string alternation, case-insensitive, and get
++	// back `file:linetext`. Then JSON.parse only the matched lines.
++	const pattern = tokens.map((t) => t.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")).join("|");
++	let out = "";
++	try {
++		out = execFileSync(
++			"rg",
++			[
++				"-i",
++				"--no-heading",
++				"--no-line-number",
++				"--with-filename",
++				"--glob",
++				"*.jsonl",
++				"--max-columns",
++				"1000000",
++				"-e",
++				pattern,
++				...searchDirs,
++			],
++			{ encoding: "utf-8", maxBuffer: 256 * 1024 * 1024 },
++		);
++	} catch (e) {
++		// rg exits 1 when no matches — that's not an error.
++		const status = (e as { status?: number }).status;
++		if (status === 1) return [];
++		if (status !== 0 && status !== undefined && status !== 1) {
++			// rg missing or crashed → fall back to empty (docs/memory still work).
++			return [];
++		}
++		out = String((e as { stdout?: Buffer | string }).stdout ?? "");
++	}
++
++	const mtimeCache = new Map<string, number>();
++	const hits: MemoryHit[] = [];
++	for (const row of out.split("\n")) {
++		if (!row) continue;
++		// rg output is `path:linecontent`; the path ends at the first `.jsonl:`.
++		const sep = row.indexOf(".jsonl:");
++		if (sep === -1) continue;
++		const full = row.slice(0, sep + 6);
++		const line = row.slice(sep + 7);
++		if (!line) continue;
++
++		let mtime = mtimeCache.get(full);
++		if (mtime === undefined) {
++			try {
++				mtime = statSync(full).mtimeMs;
++			} catch {
++				mtime = 0;
++			}
++			mtimeCache.set(full, mtime);
++		}
++
++		let evt: unknown;
++		try {
++			evt = JSON.parse(line);
++		} catch {
++			continue;
++		}
++		const msg = extractMessageText(evt);
++		if (!msg) continue;
++		const s = keywordScore(msg.text, tokens);
++		if (s <= 0) continue;
++		const ts = Number((evt as Record<string, unknown>).timestamp) || mtime;
++		if (sinceMs !== undefined && ts < now - sinceMs) continue;
++
++		const rel = full.startsWith(SESSIONS_ROOT) ? full.slice(SESSIONS_ROOT.length + 1) : full;
++		const folder = rel.split("/")[0] ?? "";
++		const project = folder.replace(/^--/, "").replace(/--$/, "").split("-").pop() || folder;
++		hits.push({
++			source: "sessions",
++			label: msg.role,
++			snippet: makeSnippet(msg.text, tokens),
++			location: rel,
++			project,
++			timestamp: ts,
++			score: s * recencyBoost(ts, now),
++		});
++	}
++	hits.sort((a, b) => b.score - a.score);
++	return hits.slice(0, perSourceCap);
++}
++
++// ── source: claude-recall memories ───────────────────────────────────────────
++
++function searchRecall(
++	tokens: string[],
++	scope: MemoryScope,
++	cwd: string,
++	sinceMs: number | undefined,
++	now: number,
++	perSourceCap: number,
++): MemoryHit[] {
++	if (!existsSync(RECALL_DB)) return [];
++	const proj = currentProject(cwd);
++	// Pull active memories (optionally scoped) as TSV; parse value JSON for text.
++	const where =
++		scope === "current"
++			? `is_active=1 AND (project_id='${proj.replace(/'/g, "''")}' OR scope='universal')`
++			: `is_active=1`;
++	const sql = `SELECT type, COALESCE(project_id,''), scope, timestamp, value FROM memories WHERE ${where};`;
++	let out = "";
++	try {
++		out = execFileSync("sqlite3", ["-json", RECALL_DB, sql], {
++			encoding: "utf-8",
++			maxBuffer: 64 * 1024 * 1024,
++		});
++	} catch {
++		return [];
++	}
++	let rows: Array<Record<string, unknown>>;
++	try {
++		rows = JSON.parse(out || "[]");
++	} catch {
++		return [];
++	}
++	const hits: MemoryHit[] = [];
++	for (const r of rows) {
++		const type = String(r.type ?? "memory");
++		const project = String(r["COALESCE(project_id,'')"] ?? r.project_id ?? "") || "universal";
++		const scopeVal = String(r.scope ?? "");
++		const tsRaw = Number(r.timestamp) || 0;
++		// recall timestamps are unix ms already
++		const ts = tsRaw > 1e12 ? tsRaw : tsRaw * 1000;
++		if (sinceMs !== undefined && ts < now - sinceMs) continue;
++		let text = String(r.value ?? "");
++		try {
++			const v = JSON.parse(text);
++			if (v && typeof v === "object" && typeof v.content === "string") text = v.content;
++		} catch {
++			// value wasn't JSON — use raw
++		}
++		const s = keywordScore(text, tokens);
++		if (s <= 0) continue;
++		hits.push({
++			source: "memory",
++			label: type,
++			snippet: makeSnippet(text, tokens),
++			location: `recall:${type}`,
++			project: scopeVal === "universal" ? "universal" : project,
++			timestamp: ts,
++			score: s * recencyBoost(ts, now) * 1.15, // slight boost: memories are curated
++		});
++	}
++	hits.sort((a, b) => b.score - a.score);
++	return hits.slice(0, perSourceCap);
++}
++
++// ── source: markdown docs ─────────────────────────────────────────────────────
++
++function searchDocs(
++	tokens: string[],
++	scope: MemoryScope,
++	cwd: string,
++	sinceMs: number | undefined,
++	now: number,
++	perSourceCap: number,
++): MemoryHit[] {
++	const roots = (scope === "current" ? [cwd] : [WORK_ROOT, PI_AGENT_ROOT]).filter((r) => existsSync(r));
++	if (roots.length === 0) return [];
++
++	// ripgrep finds the matching .md FILES fast (respects .gitignore, skips
++	// node_modules/.git by default). We then read+score only those files.
++	const pattern = tokens.map((t) => t.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")).join("|");
++	let out = "";
++	try {
++		out = execFileSync(
++			"rg",
++			["-l", "-i", "--glob", "*.md", "-e", pattern, ...roots],
++			{ encoding: "utf-8", maxBuffer: 32 * 1024 * 1024 },
++		);
++	} catch (e) {
++		const status = (e as { status?: number }).status;
++		if (status === 1) return [];
++		out = String((e as { stdout?: Buffer | string }).stdout ?? "");
++		if (!out) return [];
++	}
++
++	const hits: MemoryHit[] = [];
++	for (const full of out.split("\n")) {
++		if (!full) continue;
++		let st: ReturnType<typeof statSync>;
++		try {
++			st = statSync(full);
++		} catch {
++			continue;
++		}
++		const ts = st.mtimeMs;
++		if (sinceMs !== undefined && ts < now - sinceMs) continue;
++		let raw: string;
++		try {
++			raw = readFileSync(full, "utf-8");
++		} catch {
++			continue;
++		}
++		const s = keywordScore(raw, tokens);
++		if (s <= 0) continue;
++		hits.push({
++			source: "docs",
++			label: "md",
++			snippet: makeSnippet(raw, tokens),
++			location: full.replace(homedir(), "~"),
++			project:
++				scope === "current" ? basename(cwd) : (full.split("/work/")[1]?.split("/")[0] ?? "doc"),
++			timestamp: ts,
++			score: s * recencyBoost(ts, now),
++		});
++	}
++	hits.sort((a, b) => b.score - a.score);
++	return hits.slice(0, perSourceCap);
++}
++
++// ── source: git commit history ────────────────────────────────────────────────
++
++const US = "\x1f"; // unit separator for --format parsing
++// Filler / recency / meta words that carry no search signal for git — if only
++// these remain, we switch to time-window mode (list all commits in the window).
++const GIT_STOPWORDS = new Set<string>([
++	// ru
++	"поищи", "найди", "поиск", "история", "истории", "гит", "гите", "коммит", "коммитов",
++	"коммиты", "дифф", "дифы", "диффы", "за", "последний", "последнюю", "последние",
++	"месяц", "месяца", "неделя", "неделю", "неделе", "день", "вчера", "сегодня", "все", "всех",
++	"прошлый", "прошлом", "прошлой", "этот", "этотм", "этой", "этом",
++	// en
++	"search", "find", "git", "history", "commit", "commits", "diff", "diffs",
++	"last", "past", "this", "month", "week", "day", "yesterday", "today", "all", "the", "in", "for",
++]);
++const GIT_LOG_FMT = `%H${US}%at${US}%an${US}%s${US}%b`;
++// How many top commit hits get their FULL diff expanded (capped per commit).
++const GIT_EXPAND_TOP = 3;
++const GIT_DIFF_MAX_LINES = 200;
++
++function gitOut(repo: string, args: string[]): string {
++	try {
++		return execFileSync("git", ["-C", repo, ...args], {
++			encoding: "utf-8",
++			maxBuffer: 64 * 1024 * 1024,
++		});
++	} catch (e) {
++		return String((e as { stdout?: Buffer | string }).stdout ?? "");
++	}
++}
++
++/** Repos to search: the cwd's repo (current) or every git repo under ~/work (all). */
++function gitRepos(scope: MemoryScope, cwd: string): string[] {
++	if (scope === "current") {
++		const top = gitOut(cwd, ["rev-parse", "--show-toplevel"]).trim();
++		return top ? [top] : [];
++	}
++	if (!existsSync(WORK_ROOT)) return [];
++	const repos: string[] = [];
++	try {
++		for (const name of readdirSync(WORK_ROOT)) {
++			const dir = join(WORK_ROOT, name);
++			if (existsSync(join(dir, ".git"))) repos.push(dir);
++		}
++	} catch {
++		// ignore
++	}
++	return repos;
++}
++
++function searchGit(
++	query: string,
++	tokens: string[],
++	scope: MemoryScope,
++	cwd: string,
++	sinceMs: number | undefined,
++	now: number,
++	perSourceCap: number,
++): MemoryHit[] {
++	const repos = gitRepos(scope, cwd);
++	if (repos.length === 0) return [];
++	const since = sinceMs !== undefined ? [`--since=${new Date(now - sinceMs).toISOString()}`] : [];
++
++	// TIME-WINDOW mode: when the query has no real keywords left after stripping
++	// the recency phrase (e.g. "поищи в гит истории за последний месяц"), just list
++	// ALL commits in the window (newest first) and expand their diffs — no
++	// keyword filtering.
++	const contentTokens = tokens.filter((t) => !GIT_STOPWORDS.has(t));
++	const windowMode = contentTokens.length === 0 && sinceMs !== undefined;
++
++	const hits: MemoryHit[] = [];
++	for (const repo of repos) {
++		const project = basename(repo);
++		const seen = new Set<string>();
++
++		if (windowMode) {
++			const raw = gitOut(repo, ["log", ...since, `--format=${GIT_LOG_FMT}${US}%x00`]);
++			for (const rec of raw.split("\x00")) {
++				const r = rec.trim();
++				if (!r) continue;
++				const [hash, at, , subject] = r.split(US);
++				if (!hash || seen.has(hash)) continue;
++				seen.add(hash);
++				const ts = (Number(at) || 0) * 1000;
++				hits.push({
++					source: "git",
++					label: "commit",
++					snippet: subject.slice(0, 240),
++					location: `${project}@${hash.slice(0, 9)}`,
++					project,
++					timestamp: ts || now,
++					// rank purely by recency in window mode
++					score: recencyBoost(ts || now, now),
++					...({ _repo: repo, _hash: hash } as object),
++				});
++			}
++			continue;
++		}
++
++		// Two passes: commit MESSAGES (--grep, all tokens OR'd, case-insensitive)
++		// and diff CONTENT (pickaxe -G on the joined phrase). Merge, dedupe.
++		const grepArgs = contentTokens.flatMap((t) => ["--grep", t]);
++		const passes: string[][] = [
++			["log", "-i", "--all", "--regexp-ignore-case", ...grepArgs, ...since,
++				`--format=${GIT_LOG_FMT}${US}%x00`],
++			["log", "-i", "--all", `-G${contentTokens.join("|")}`, ...since,
++				`--format=${GIT_LOG_FMT}${US}%x00`],
++		];
++		for (let pass = 0; pass < passes.length; pass++) {
++			const raw = gitOut(repo, passes[pass]);
++			for (const rec of raw.split("\x00")) {
++				const r = rec.trim();
++				if (!r) continue;
++				const [hash, at, , subject, body = ""] = r.split(US);
++				if (!hash || seen.has(hash)) continue;
++				seen.add(hash);
++				const ts = (Number(at) || 0) * 1000;
++				const msg = `${subject}\n${body}`.trim();
++				// pass 0 scores on the message; pass 1 (diff match) gets a base score
++				// since the hit is in code, not the message.
++				const msgScore = keywordScore(msg, contentTokens);
++				const s = pass === 0 ? Math.max(msgScore, 1) : Math.max(msgScore, 2);
++				hits.push({
++					source: "git",
++					label: pass === 0 ? "commit" : "commit·diff",
++					snippet: subject.slice(0, 240),
++					location: `${project}@${hash.slice(0, 9)}`,
++					project,
++					timestamp: ts || now,
++					score: s * recencyBoost(ts || now, now) * 1.05,
++					// stash repo+hash for on-demand diff expansion
++					...( { _repo: repo, _hash: hash } as object),
++				});
++			}
++		}
++	}
++	hits.sort((a, b) => b.score - a.score);
++	const top = hits.slice(0, perSourceCap);
++	// Expand full diffs: a few for keyword search, more for a time-window sweep
++	// ("all diffs this month").
++	const expandCount = windowMode ? Math.min(top.length, perSourceCap) : GIT_EXPAND_TOP;
++	for (let i = 0; i < expandCount && i < top.length; i++) {
++		const h = top[i] as MemoryHit & { _repo?: string; _hash?: string };
++		if (!h._repo || !h._hash) continue;
++		const diff = gitOut(h._repo, ["show", "--stat", "--patch", "--format=%s%n%b", h._hash]);
++		const lines = diff.split("\n");
++		h.snippet =
++			lines.slice(0, GIT_DIFF_MAX_LINES).join("\n") +
++			(lines.length > GIT_DIFF_MAX_LINES ? `\n… (+${lines.length - GIT_DIFF_MAX_LINES} more lines)` : "");
++	}
++	return top;
++}
++
++// ── orchestrator ──────────────────────────────────────────────────────────────
++
++export function searchMemory(query: string, opts: MemorySearchOptions = {}): MemoryHit[] {
++	const tokens = tokenize(query);
++	const scope = opts.scope ?? "current";
++	// Default = "memory" in the user's sense: chat transcripts + recall memories.
++	// Markdown docs and git history are opt-in (only when the caller asks).
++	const sources = opts.sources ?? ["sessions", "memory"];
++	const cwd = opts.cwd ?? process.cwd();
++	const limit = opts.limit ?? 15;
++	const now = Date.now();
++	const perSourceCap = Math.max(limit, 10);
++
++	// git in time-window mode works with zero content tokens ("all diffs this
++	// month"); every other source needs at least one keyword.
++	const gitWindowOnly =
++		sources.includes("git") && opts.sinceMs !== undefined &&
++		tokens.every((t) => GIT_STOPWORDS.has(t));
++	if (tokens.length === 0 && !gitWindowOnly) return [];
++
++	let hits: MemoryHit[] = [];
++	if (sources.includes("sessions") && tokens.length > 0)
++		hits = hits.concat(searchSessions(tokens, scope, cwd, opts.sinceMs, now, perSourceCap));
++	if (sources.includes("memory") && tokens.length > 0)
++		hits = hits.concat(searchRecall(tokens, scope, cwd, opts.sinceMs, now, perSourceCap));
++	if (sources.includes("docs") && tokens.length > 0)
++		hits = hits.concat(searchDocs(tokens, scope, cwd, opts.sinceMs, now, perSourceCap));
++	if (sources.includes("git"))
++		hits = hits.concat(searchGit(query, tokens, scope, cwd, opts.sinceMs, now, perSourceCap));
++
++	hits.sort((a, b) => b.score - a.score);
++	return hits.slice(0, limit);
++}
++
++/**
++ * Detect whether the query explicitly asks to include markdown documentation.
++ * By default memory_search covers only chat + recall memories; docs are opt-in.
++ */
++export function wantsDocs(query: string): boolean {
++	const q = query.toLowerCase();
++	return /(документац|в доках|доках|\bdocs?\b|documentation|\bmarkdown\b|\b\.md\b|md-файл|md файл)/.test(q);
++}
++
++/**
++ * Detect whether the query asks to search git commit history / diffs.
++ * Opt-in like docs. Matches 'гит/git', 'коммит(ы)', 'дифф(ы)/diff', 'история
++ * коммитов', 'commit history'.
++ */
++export function wantsGit(query: string): boolean {
++	// \b doesn't work around Cyrillic; match гит/диф as substrings but keep the
++	// Latin "git" bounded so words like "digit"/"legit" don't trigger.
++	const q = query.toLowerCase();
++	return /(\bgit\b|гит|коммит|commit|диф|\bdiff|commit history|git log)/.test(q);
++}
++
++/** Parse a natural-language recency hint into a lookback window (ms). */
++export function parseRecency(query: string): number | undefined {
++	// Note: \b word boundaries don't work with Cyrillic, so match on substrings.
++	const q = query.toLowerCase();
++	if (/(прошл\S* недел|last week|past week)/.test(q)) return 14 * 86_400_000;
++	if (/(эт\S* недел|this week)/.test(q)) return 7 * 86_400_000;
++	if (/(прошл\S* месяц|last month)/.test(q)) return 60 * 86_400_000;
++	if (/(последн\S* месяц|за месяц|past month)/.test(q)) return 31 * 86_400_000;
++	if (/(вчера|yesterday)/.test(q)) return 48 * 3600_000;
++	if (/(сегодня|today)/.test(q)) return 24 * 3600_000;
++	return undefined;
++}
++
++/** Render hits as a compact text block for the tool result. */
++export function formatHits(hits: MemoryHit[], query: string): string {
++	if (hits.length === 0) return `No matches in your history for "${query}".`;
++	const lines: string[] = [`Found ${hits.length} match(es) for "${query}":`, ""];
++	const tagOf = (s: MemorySource): string =>
++		s === "sessions" ? "chat" : s === "memory" ? "memory" : s === "docs" ? "doc" : "git";
++	for (const h of hits) {
++		const d = new Date(h.timestamp);
++		const date = Number.isFinite(h.timestamp) && h.timestamp > 0 ? d.toISOString().slice(0, 10) : "?";
++		lines.push(`[${tagOf(h.source)} ${date}] ${h.label} · ${h.project}`);
++		if (h.source === "git" && h.snippet.includes("\n")) {
++			// expanded diff — render inside a fenced block, not indented
++			lines.push(`  ↳ ${h.location}`);
++			lines.push("```diff");
++			lines.push(h.snippet);
++			lines.push("```");
++		} else {
++			lines.push(`  ${h.snippet}`);
++			lines.push(`  ↳ ${h.location}`);
++		}
++		lines.push("");
++	}
++	return lines.join("\n");
++}
+diff --git a/openai-search.ts b/openai-search.ts
+index 66a68e2..2c64db9 100644
+--- a/openai-search.ts
++++ b/openai-search.ts
+@@ -3,8 +3,12 @@ import type { ExtensionContext } from "@earendil-works/pi-coding-agent";
+ import { activityMonitor } from "./activity.ts";
+ import type { SearchOptions, SearchResponse, SearchResult } from "./perplexity.ts";
+ import { getWebSearchConfigPath } from "./utils.ts";
++import { providerApiKey, providerUrl } from "./provider-endpoints.ts";
+ 
+-const OPENAI_RESPONSES_URL = "https://api.openai.com/v1/responses";
++// Standard Responses endpoint override lives in provider-endpoints.ts
++// (env OPENAI_RESPONSES_URL > config openaiResponsesUrl > default). The codex
++// endpoint (chatgpt.com backend) stays hardcoded — separate OAuth/codex flow.
++const OPENAI_RESPONSES_URL = () => providerUrl("openai");
+ const CODEX_RESPONSES_URL = "https://chatgpt.com/backend-api/codex/responses";
+ const CONFIG_PATH = getWebSearchConfigPath();
+ const SEARCH_TIMEOUT_MS = 60_000;
+@@ -138,7 +142,7 @@ export async function resolveOpenAIAuth(ctx?: ExtensionContext): Promise<OpenAIA
+ 		}
+ 	}
+ 
+-	const apiKey = normalizeApiKey(process.env.OPENAI_API_KEY) ?? normalizeApiKey(loadConfig().openaiApiKey);
++	const apiKey = providerApiKey("openai");
+ 	return apiKey
+ 		? { provider: "openai", apiKey, model: "gpt-5.4", headers: {} }
+ 		: undefined;
+@@ -361,7 +365,7 @@ export async function searchWithOpenAI(
+ 	};
+ 
+ 	try {
+-		const response = await fetch(useCodexEndpoint ? CODEX_RESPONSES_URL : OPENAI_RESPONSES_URL, {
++		const response = await fetch(useCodexEndpoint ? CODEX_RESPONSES_URL : OPENAI_RESPONSES_URL(), {
+ 			method: "POST",
+ 			headers,
+ 			body: JSON.stringify(body),
+diff --git a/parallel.ts b/parallel.ts
+index d009673..53d3b30 100644
+--- a/parallel.ts
++++ b/parallel.ts
+@@ -3,9 +3,12 @@ import { activityMonitor } from "./activity.ts";
+ import type { ExtractedContent, ExtractOptions } from "./extract.ts";
+ import type { SearchOptions, SearchResponse } from "./perplexity.ts";
+ import { getWebSearchConfigPath } from "./utils.ts";
++import { providerUrl } from "./provider-endpoints.ts";
+ 
+-const PARALLEL_SEARCH_URL = "https://api.parallel.ai/v1/search";
+-const PARALLEL_EXTRACT_URL = "https://api.parallel.ai/v1/extract";
++// Base override lives in provider-endpoints.ts (env > config > default);
++// /v1/search and /v1/extract are appended to it.
++const PARALLEL_SEARCH_URL = () => `${providerUrl("parallel")}/v1/search`;
++const PARALLEL_EXTRACT_URL = () => `${providerUrl("parallel")}/v1/extract`;
+ const CONFIG_PATH = getWebSearchConfigPath();
+ const MIN_PARALLEL_API_KEY_LENGTH = 8;
+ const MIN_USEFUL_CONTENT = 500;
+@@ -285,14 +288,14 @@ async function fetchAndMapExtractResult(
+ 	body: Record<string, unknown>,
+ 	signal?: AbortSignal,
+ ): Promise<{ mapped: ExtractedContent | null; result: V1ExtractResult | undefined }> {
+-	const data = await parallelFetch(PARALLEL_EXTRACT_URL, body, signal);
++	const data = await parallelFetch(PARALLEL_EXTRACT_URL(), body, signal);
+ 	if (hasExtractUrlError(data.errors, url)) return { mapped: null, result: undefined };
+ 	const result = findExtractResult(data.results as V1ExtractResult[] | undefined, url);
+ 	return { mapped: mapExtractResult(result), result };
+ }
+ 
+ export async function searchWithParallel(query: string, options: ParallelSearchOptions = {}): Promise<SearchResponse> {
+-	const data = await parallelFetch(PARALLEL_SEARCH_URL, buildSearchRequestBody(query, options), options.signal);
++	const data = await parallelFetch(PARALLEL_SEARCH_URL(), buildSearchRequestBody(query, options), options.signal);
+ 	const results = data.results as V1WebSearchResult[] | undefined;
+ 	const response: SearchResponse = {
+ 		answer: buildAnswerFromExcerpts(results),
+diff --git a/perplexity.ts b/perplexity.ts
+index a4dfec8..c131a84 100644
+--- a/perplexity.ts
++++ b/perplexity.ts
+@@ -2,8 +2,13 @@ import { existsSync, readFileSync } from "node:fs";
+ import { activityMonitor } from "./activity.ts";
+ import type { ExtractedContent } from "./extract.ts";
+ import { getWebSearchConfigPath } from "./utils.ts";
++import { providerApiKey, providerUrl } from "./provider-endpoints.ts";
+ 
+-const PERPLEXITY_API_URL = "https://api.perplexity.ai/chat/completions";
++// Endpoint override lives in provider-endpoints.ts (env > config > default).
++// The value is the FULL chat/completions URL, so it can front a proxy that
++// injects a pooled Perplexity key (our airpx proxy passes choices+citations
++// through verbatim).
++const getPerplexityUrl = () => providerUrl("perplexity");
+ const CONFIG_PATH = getWebSearchConfigPath();
+ 
+ const RATE_LIMIT = {
+@@ -34,6 +39,7 @@ export interface SearchOptions {
+ 
+ interface WebSearchConfig {
+ 	perplexityApiKey?: unknown;
++	perplexityBaseUrl?: unknown;
+ }
+ 
+ let cachedConfig: WebSearchConfig | null = null;
+@@ -62,8 +68,7 @@ function normalizeApiKey(value: unknown): string | null {
+ }
+ 
+ function getApiKey(): string {
+-	const config = loadConfig();
+-	const key = normalizeApiKey(process.env.PERPLEXITY_API_KEY) ?? normalizeApiKey(config.perplexityApiKey);
++	const key = providerApiKey("perplexity");
+ 	if (!key) {
+ 		throw new Error(
+ 			"Perplexity API key not found. Either:\n" +
+@@ -138,7 +143,7 @@ export async function searchWithPerplexity(query: string, options: SearchOptions
+ 
+ 	let response: Response;
+ 	try {
+-		response = await fetch(PERPLEXITY_API_URL, {
++		response = await fetch(getPerplexityUrl(), {
+ 			method: "POST",
+ 			headers: {
+ 				Authorization: `Bearer ${apiKey}`,
+diff --git a/provider-endpoints.ts b/provider-endpoints.ts
+new file mode 100644
+index 0000000..a6644d6
+--- /dev/null
++++ b/provider-endpoints.ts
+@@ -0,0 +1,216 @@
++/**
++ * Central registry of search-provider base URLs + override resolution.
++ *
++ * Every provider's endpoint can be overridden (e.g. to route through a proxy
++ * that fronts a pooled API key) via, in priority order:
++ *   1. environment variable  (e.g. EXA_BASE_URL)
++ *   2. web-search.json config field  (e.g. exaBaseUrl)
++ *   3. the hardcoded default
++ *
++ * This mirrors the pattern gemini-api.ts already used for
++ * GOOGLE_GEMINI_BASE_URL / geminiBaseUrl, but keeps the exa/brave/perplexity
++ * (etc.) endpoints in ONE place instead of copy-pasting normalizeBaseUrl + a
++ * getter into each provider module.
++ *
++ * UNIFIED PROXY MODE
++ * ------------------
++ * When every provider is fronted by the SAME gateway (e.g. a self-hosted proxy
++ * that injects a pooled key), setting one base host + one key is enough:
++ *   env  WEB_SEARCH_PROXY_URL  / config proxyBaseUrl   (e.g. https://airpx.cc)
++ *   env  WEB_SEARCH_PROXY_KEY  / config proxyApiKey     (e.g. sk-proxy-...)
++ * Each provider's endpoint is then derived as `${proxyBase}${proxyPath}` and
++ * its API key falls back to the shared proxy key — so you don't repeat the
++ * per-provider *BaseUrl / *ApiKey fields. Per-provider overrides still win.
++ */
++
++import { existsSync, readFileSync } from "node:fs";
++import { getWebSearchConfigPath } from "./utils.ts";
++
++export type SearchProviderId =
++	| "exa"
++	| "brave"
++	| "perplexity"
++	| "tavily"
++	| "parallel"
++	| "openai";
++
++// gemini is intentionally NOT here: gemini-api.ts keeps its own resolver
++// (getApiHost) because it also detects Cloudflare AI Gateway routing and
++// applies API_VERSION — logic that doesn't fit the simple base/URL swap here.
++// OpenAI's codex endpoint (chatgpt.com backend) is likewise left hardcoded in
++// openai-search.ts: it's a separate OAuth/codex flow, not a plain key swap.
++
++interface ProviderEndpoint {
++	/** Default base/URL when no override is set. */
++	default: string;
++	/** Environment variable that overrides it. */
++	env: string;
++	/** web-search.json field that overrides it. */
++	configKey: string;
++	/**
++	 * Path under the unified proxy base that serves this provider. When set and
++	 * a proxy base is configured (WEB_SEARCH_PROXY_URL / proxyBaseUrl), the
++	 * endpoint becomes `${proxyBase}${proxyPath}`. Omit for providers the proxy
++	 * does not front (they keep their own default / per-provider override).
++	 */
++	proxyPath?: string;
++	/** Per-provider API-key env var (for the shared-key fallback resolver). */
++	keyEnv: string;
++	/** Per-provider API-key config field. */
++	keyConfigKey: string;
++}
++
++// Unified-proxy config keys (single base + single key for all providers).
++const PROXY_BASE_ENV = "WEB_SEARCH_PROXY_URL";
++const PROXY_BASE_CONFIG = "proxyBaseUrl";
++const PROXY_KEY_ENV = "WEB_SEARCH_PROXY_KEY";
++const PROXY_KEY_CONFIG = "proxyApiKey";
++
++/**
++ * Default endpoints. For exa this is the API *base* (paths like /search,
++ * /answer, /mcp are appended by the caller); for brave/perplexity it is the
++ * FULL endpoint URL (query params / body are added by the caller).
++ */
++export const PROVIDER_ENDPOINTS: Record<SearchProviderId, ProviderEndpoint> = {
++	exa: {
++		default: "https://api.exa.ai",
++		env: "EXA_BASE_URL",
++		configKey: "exaBaseUrl",
++		proxyPath: "/v1/exa",
++		keyEnv: "EXA_API_KEY",
++		keyConfigKey: "exaApiKey",
++	},
++	brave: {
++		default: "https://api.search.brave.com/res/v1/web/search",
++		env: "BRAVE_BASE_URL",
++		configKey: "braveBaseUrl",
++		proxyPath: "/v1/brave/search",
++		keyEnv: "BRAVE_API_KEY",
++		keyConfigKey: "braveApiKey",
++	},
++	perplexity: {
++		default: "https://api.perplexity.ai/chat/completions",
++		env: "PERPLEXITY_BASE_URL",
++		configKey: "perplexityBaseUrl",
++		proxyPath: "/v1/chat/completions",
++		keyEnv: "PERPLEXITY_API_KEY",
++		keyConfigKey: "perplexityApiKey",
++	},
++	tavily: {
++		default: "https://api.tavily.com/search",
++		env: "TAVILY_BASE_URL",
++		configKey: "tavilyBaseUrl",
++		// no proxyPath: the gateway does not front Tavily.
++		keyEnv: "TAVILY_API_KEY",
++		keyConfigKey: "tavilyApiKey",
++	},
++	// parallel is a *base* (paths /v1/search and /v1/extract are appended).
++	parallel: {
++		default: "https://api.parallel.ai",
++		env: "PARALLEL_BASE_URL",
++		configKey: "parallelBaseUrl",
++		// no proxyPath: the gateway does not front Parallel.
++		keyEnv: "PARALLEL_API_KEY",
++		keyConfigKey: "parallelApiKey",
++	},
++	// openai's standard Responses endpoint (the codex endpoint stays hardcoded).
++	openai: {
++		default: "https://api.openai.com/v1/responses",
++		env: "OPENAI_RESPONSES_URL",
++		configKey: "openaiResponsesUrl",
++		proxyPath: "/v1/responses",
++		keyEnv: "OPENAI_API_KEY",
++		keyConfigKey: "openaiApiKey",
++	},
++};
++
++export function normalizeBaseUrl(value: unknown): string | null {
++	if (typeof value !== "string") return null;
++	const normalized = value.trim().replace(/\/+$/, "");
++	return normalized.length > 0 ? normalized : null;
++}
++
++let cachedConfig: Record<string, unknown> | null = null;
++
++function loadRawConfig(): Record<string, unknown> {
++	if (cachedConfig) return cachedConfig;
++	const path = getWebSearchConfigPath();
++	if (!existsSync(path)) {
++		cachedConfig = {};
++		return cachedConfig;
++	}
++	try {
++		cachedConfig = JSON.parse(readFileSync(path, "utf-8")) as Record<string, unknown>;
++	} catch {
++		cachedConfig = {};
++	}
++	return cachedConfig;
++}
++
++/** The unified proxy base host, if configured (env > config). */
++export function proxyBaseUrl(): string | null {
++	return (
++		normalizeBaseUrl(process.env[PROXY_BASE_ENV]) ??
++		normalizeBaseUrl(loadRawConfig()[PROXY_BASE_CONFIG])
++	);
++}
++
++/** The shared proxy API key, if configured (env > config). */
++export function proxyApiKey(): string | null {
++	const envVal = process.env[PROXY_KEY_ENV];
++	if (typeof envVal === "string" && envVal.trim().length > 0) return envVal.trim();
++	const cfgVal = loadRawConfig()[PROXY_KEY_CONFIG];
++	if (typeof cfgVal === "string" && cfgVal.trim().length > 0) return cfgVal.trim();
++	return null;
++}
++
++/**
++ * Resolve a provider's endpoint. Priority:
++ *   1. per-provider env    (e.g. EXA_BASE_URL)
++ *   2. per-provider config  (e.g. exaBaseUrl)
++ *   3. unified proxy base + provider proxyPath (if both configured)
++ *   4. hardcoded default
++ *
++ * `overridden` is true for cases 1–3 (used by Exa: its MCP endpoint only moves
++ * off mcp.exa.ai when an override is explicitly in effect).
++ */
++export function resolveProviderEndpoint(
++	provider: SearchProviderId,
++): { url: string; overridden: boolean } {
++	const ep = PROVIDER_ENDPOINTS[provider];
++	const perProvider =
++		normalizeBaseUrl(process.env[ep.env]) ?? normalizeBaseUrl(loadRawConfig()[ep.configKey]);
++	if (perProvider !== null) return { url: perProvider, overridden: true };
++
++	const base = proxyBaseUrl();
++	if (base !== null && ep.proxyPath) {
++		return { url: `${base}${ep.proxyPath}`, overridden: true };
++	}
++
++	return { url: ep.default, overridden: false };
++}
++
++/** Convenience: just the resolved URL for a provider. */
++export function providerUrl(provider: SearchProviderId): string {
++	return resolveProviderEndpoint(provider).url;
++}
++
++/**
++ * Resolve a provider's API key. Priority:
++ *   1. per-provider env    (e.g. EXA_API_KEY)
++ *   2. per-provider config  (e.g. exaApiKey)
++ *   3. shared proxy key — ONLY when this provider is actually routed through
++ *      the unified proxy (has proxyPath AND a proxy base is configured). This
++ *      prevents sending the proxy key to a provider's real API (e.g. Tavily /
++ *      Parallel, which the gateway does not front).
++ * Returns null when none is set.
++ */
++export function providerApiKey(provider: SearchProviderId): string | null {
++	const ep = PROVIDER_ENDPOINTS[provider];
++	const envKey = process.env[ep.keyEnv];
++	if (typeof envKey === "string" && envKey.trim().length > 0) return envKey.trim();
++	const cfgKey = loadRawConfig()[ep.keyConfigKey];
++	if (typeof cfgKey === "string" && cfgKey.trim().length > 0) return cfgKey.trim();
++	if (ep.proxyPath && proxyBaseUrl() !== null) return proxyApiKey();
++	return null;
++}
+diff --git a/tavily.ts b/tavily.ts
+index 81c3535..01a034f 100644
+--- a/tavily.ts
++++ b/tavily.ts
+@@ -3,8 +3,10 @@ import { activityMonitor } from "./activity.ts";
+ import type { ExtractedContent } from "./extract.ts";
+ import type { SearchOptions, SearchResponse } from "./perplexity.ts";
+ import { getWebSearchConfigPath } from "./utils.ts";
++import { providerApiKey, providerUrl } from "./provider-endpoints.ts";
+ 
+-const TAVILY_API_URL = "https://api.tavily.com/search";
++// Endpoint override lives in provider-endpoints.ts (env > config > default).
++const TAVILY_API_URL = () => providerUrl("tavily");
+ const CONFIG_PATH = getWebSearchConfigPath();
+ const SEARCH_TIMEOUT_MS = 60_000;
+ 
+@@ -54,7 +56,7 @@ function normalizeApiKey(value: unknown): string | null {
+ }
+ 
+ function getApiKey(): string | null {
+-	return normalizeApiKey(process.env.TAVILY_API_KEY) ?? normalizeApiKey(loadConfig().tavilyApiKey);
++	return providerApiKey("tavily");
+ }
+ 
+ function requireApiKey(): string {
+@@ -162,7 +164,7 @@ export async function searchWithTavily(query: string, options: TavilySearchOptio
+ 	const activityId = activityMonitor.logStart({ type: "api", query });
+ 	let response: Response;
+ 	try {
+-		response = await fetch(TAVILY_API_URL, {
++		response = await fetch(TAVILY_API_URL(), {
+ 			method: "POST",
+ 			headers: {
+ 				"Authorization": `Bearer ${requireApiKey()}`,
