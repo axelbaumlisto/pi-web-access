@@ -471,6 +471,10 @@ const GIT_EXPAND_TOP = 3;
 const GIT_DIFF_MAX_LINES = 200;
 // Max commits returned by a git time-window sweep ("all commits this month").
 const GIT_WINDOW_MAX = 200;
+// In window mode only the newest N commits get expanded diffs; the rest stay
+// one-line subjects. Unbounded expansion measured 1.4MB (~358k tokens) — a
+// context bomb for any model (round-2 perf#2/product#6).
+const GIT_WINDOW_EXPAND = 10;
 
 function gitOut(repo: string, args: string[]): string {
 	try {
@@ -598,8 +602,9 @@ function searchGit(
 	// the generic per-source limit (G3). Keyword mode keeps the normal cap.
 	const cap = windowMode ? Math.max(perSourceCap, GIT_WINDOW_MAX) : perSourceCap;
 	const top = hits.slice(0, cap);
-	// Expand full diffs: a few for keyword search, all returned for a window sweep.
-	const expandCount = windowMode ? top.length : GIT_EXPAND_TOP;
+	// Expand full diffs: a few for keyword search, the newest N for a window
+	// sweep (the rest stay one-line subjects — expanding all 200 measured 1.4MB).
+	const expandCount = windowMode ? Math.min(top.length, GIT_WINDOW_EXPAND) : GIT_EXPAND_TOP;
 	for (let i = 0; i < expandCount && i < top.length; i++) {
 		const h = top[i] as MemoryHit & { _repo?: string; _hash?: string };
 		if (!h._repo || !h._hash) continue;
@@ -693,27 +698,38 @@ export function parseRecency(query: string): number | undefined {
 	return undefined;
 }
 
+// Hard byte budget for the whole formatted tool result. Beyond this, remaining
+// hits are listed as one-liners and then cut with an "omitted" note (perf#2).
+const FORMAT_BYTE_BUDGET = 64 * 1024;
+
 /** Render hits as a compact text block for the tool result. */
 export function formatHits(hits: MemoryHit[], query: string): string {
 	if (hits.length === 0) return `No matches in your history for "${query}".`;
 	const lines: string[] = [`Found ${hits.length} match(es) for "${query}":`, ""];
 	const tagOf = (s: MemorySource): string =>
 		s === "sessions" ? "chat" : s === "memory" ? "memory" : s === "docs" ? "doc" : "git";
+	let used = 0;
+	let omitted = 0;
 	for (const h of hits) {
+		if (used > FORMAT_BYTE_BUDGET) {
+			omitted++;
+			continue;
+		}
 		const d = new Date(h.timestamp);
 		const date = Number.isFinite(h.timestamp) && h.timestamp > 0 ? d.toISOString().slice(0, 10) : "?";
-		lines.push(`[${tagOf(h.source)} ${date}] ${h.label} · ${h.project}`);
+		const chunk: string[] = [`[${tagOf(h.source)} ${date}] ${h.label} · ${h.project}`];
 		if (h.source === "git" && h.snippet.includes("\n")) {
-			// expanded diff — render inside a fenced block, not indented
-			lines.push(`  ↳ ${h.location}`);
-			lines.push("```diff");
-			lines.push(h.snippet);
-			lines.push("```");
+			// expanded diff — 4-backtick fence so ``` inside the diff can't break it
+			chunk.push(`  ↳ ${h.location}`, "````diff", h.snippet, "````");
 		} else {
-			lines.push(`  ${h.snippet}`);
-			lines.push(`  ↳ ${h.location}`);
+			chunk.push(`  ${h.snippet}`, `  ↳ ${h.location}`);
 		}
-		lines.push("");
+		chunk.push("");
+		for (const l of chunk) used += l.length + 1;
+		lines.push(...chunk);
+	}
+	if (omitted > 0) {
+		lines.push(`… ${omitted} more hit(s) omitted (output budget). Narrow the query or ask for a specific item.`);
 	}
 	return lines.join("\n");
 }
