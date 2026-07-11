@@ -8,7 +8,7 @@ import { clearCloneCache } from "./github-extract.ts";
 import { search, type SearchProvider, type ResolvedSearchProvider } from "./gemini-search.ts";
 import type { SearchResult } from "./perplexity.ts";
 import { formatSeconds, getWebSearchConfigDir, getWebSearchConfigPath } from "./utils.ts";
-import { searchMemory, parseRecency, wantsDocs, formatHits, type MemoryScope, type MemorySource } from "./memory-search.ts";
+import { searchMemory, parseRecency, wantsDocs, wantsGit, formatHits, type MemoryScope, type MemorySource } from "./memory-search.ts";
 import {
 	clearResults,
 	deleteResult,
@@ -2053,8 +2053,8 @@ export default function (pi: ExtensionAPI) {
 				}),
 			),
 			sources: Type.Optional(
-				Type.Array(StringEnum(["sessions", "memory", "docs"]), {
-					description: "Which sources to search. Default = sessions + memory (chat transcripts + claude-recall). Include 'docs' (markdown) ONLY when the user asks to search documentation ('поищи в документации', 'search the docs', 'in markdown').",
+				Type.Array(StringEnum(["sessions", "memory", "docs", "git"]), {
+					description: "Which sources to search. Default = sessions + memory (chat transcripts + claude-recall). Include 'docs' (markdown) ONLY when the user asks to search documentation ('поищи в документации', 'search the docs'). Include 'git' (commit messages + diffs, expanded for top hits) ONLY when the user asks about git history ('поищи в гит истории', 'git commits', 'diffs this month' — with a time phrase it lists ALL commits in the window and expands their diffs).",
 				}),
 			),
 			limit: Type.Optional(Type.Number({ description: "Max results (default 15)." })),
@@ -2073,7 +2073,10 @@ export default function (pi: ExtensionAPI) {
 			// sessions+memory and add docs only if the query asks for documentation.
 			let sources = params.sources as MemorySource[] | undefined;
 			if (!sources) {
-				sources = wantsDocs(query) ? ["sessions", "memory", "docs"] : ["sessions", "memory"];
+				// git is a full replacement intent ("search git history"); docs augments.
+				if (wantsGit(query)) sources = ["git"];
+				else if (wantsDocs(query)) sources = ["sessions", "memory", "docs"];
+				else sources = ["sessions", "memory"];
 			}
 			const limit = typeof params.limit === "number" ? params.limit : 15;
 			const cwd = ctx?.cwd ?? process.cwd();

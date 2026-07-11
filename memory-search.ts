@@ -17,13 +17,13 @@
  * boost. FTS5/BM25 is a later upgrade.
  */
 
-import { existsSync, readFileSync, statSync } from "node:fs";
+import { existsSync, readdirSync, readFileSync, statSync } from "node:fs";
 import { homedir } from "node:os";
 import { basename, join } from "node:path";
 import { execFileSync } from "node:child_process";
 
 export type MemoryScope = "current" | "all";
-export type MemorySource = "sessions" | "memory" | "docs";
+export type MemorySource = "sessions" | "memory" | "docs" | "git";
 
 export interface MemoryHit {
 	source: MemorySource;
@@ -383,27 +383,188 @@ function searchDocs(
 	return hits.slice(0, perSourceCap);
 }
 
+// ── source: git commit history ────────────────────────────────────────────────
+
+const US = "\x1f"; // unit separator for --format parsing
+// Filler / recency / meta words that carry no search signal for git — if only
+// these remain, we switch to time-window mode (list all commits in the window).
+const GIT_STOPWORDS = new Set<string>([
+	// ru
+	"поищи", "найди", "поиск", "история", "истории", "гит", "гите", "коммит", "коммитов",
+	"коммиты", "дифф", "дифы", "диффы", "за", "последний", "последнюю", "последние",
+	"месяц", "месяца", "неделя", "неделю", "неделе", "день", "вчера", "сегодня", "все", "всех",
+	"прошлый", "прошлом", "прошлой", "этот", "этотм", "этой", "этом",
+	// en
+	"search", "find", "git", "history", "commit", "commits", "diff", "diffs",
+	"last", "past", "this", "month", "week", "day", "yesterday", "today", "all", "the", "in", "for",
+]);
+const GIT_LOG_FMT = `%H${US}%at${US}%an${US}%s${US}%b`;
+// How many top commit hits get their FULL diff expanded (capped per commit).
+const GIT_EXPAND_TOP = 3;
+const GIT_DIFF_MAX_LINES = 200;
+
+function gitOut(repo: string, args: string[]): string {
+	try {
+		return execFileSync("git", ["-C", repo, ...args], {
+			encoding: "utf-8",
+			maxBuffer: 64 * 1024 * 1024,
+		});
+	} catch (e) {
+		return String((e as { stdout?: Buffer | string }).stdout ?? "");
+	}
+}
+
+/** Repos to search: the cwd's repo (current) or every git repo under ~/work (all). */
+function gitRepos(scope: MemoryScope, cwd: string): string[] {
+	if (scope === "current") {
+		const top = gitOut(cwd, ["rev-parse", "--show-toplevel"]).trim();
+		return top ? [top] : [];
+	}
+	if (!existsSync(WORK_ROOT)) return [];
+	const repos: string[] = [];
+	try {
+		for (const name of readdirSync(WORK_ROOT)) {
+			const dir = join(WORK_ROOT, name);
+			if (existsSync(join(dir, ".git"))) repos.push(dir);
+		}
+	} catch {
+		// ignore
+	}
+	return repos;
+}
+
+function searchGit(
+	query: string,
+	tokens: string[],
+	scope: MemoryScope,
+	cwd: string,
+	sinceMs: number | undefined,
+	now: number,
+	perSourceCap: number,
+): MemoryHit[] {
+	const repos = gitRepos(scope, cwd);
+	if (repos.length === 0) return [];
+	const since = sinceMs !== undefined ? [`--since=${new Date(now - sinceMs).toISOString()}`] : [];
+
+	// TIME-WINDOW mode: when the query has no real keywords left after stripping
+	// the recency phrase (e.g. "поищи в гит истории за последний месяц"), just list
+	// ALL commits in the window (newest first) and expand their diffs — no
+	// keyword filtering.
+	const contentTokens = tokens.filter((t) => !GIT_STOPWORDS.has(t));
+	const windowMode = contentTokens.length === 0 && sinceMs !== undefined;
+
+	const hits: MemoryHit[] = [];
+	for (const repo of repos) {
+		const project = basename(repo);
+		const seen = new Set<string>();
+
+		if (windowMode) {
+			const raw = gitOut(repo, ["log", ...since, `--format=${GIT_LOG_FMT}${US}%x00`]);
+			for (const rec of raw.split("\x00")) {
+				const r = rec.trim();
+				if (!r) continue;
+				const [hash, at, , subject] = r.split(US);
+				if (!hash || seen.has(hash)) continue;
+				seen.add(hash);
+				const ts = (Number(at) || 0) * 1000;
+				hits.push({
+					source: "git",
+					label: "commit",
+					snippet: subject.slice(0, 240),
+					location: `${project}@${hash.slice(0, 9)}`,
+					project,
+					timestamp: ts || now,
+					// rank purely by recency in window mode
+					score: recencyBoost(ts || now, now),
+					...({ _repo: repo, _hash: hash } as object),
+				});
+			}
+			continue;
+		}
+
+		// Two passes: commit MESSAGES (--grep, all tokens OR'd, case-insensitive)
+		// and diff CONTENT (pickaxe -G on the joined phrase). Merge, dedupe.
+		const grepArgs = contentTokens.flatMap((t) => ["--grep", t]);
+		const passes: string[][] = [
+			["log", "-i", "--all", "--regexp-ignore-case", ...grepArgs, ...since,
+				`--format=${GIT_LOG_FMT}${US}%x00`],
+			["log", "-i", "--all", `-G${contentTokens.join("|")}`, ...since,
+				`--format=${GIT_LOG_FMT}${US}%x00`],
+		];
+		for (let pass = 0; pass < passes.length; pass++) {
+			const raw = gitOut(repo, passes[pass]);
+			for (const rec of raw.split("\x00")) {
+				const r = rec.trim();
+				if (!r) continue;
+				const [hash, at, , subject, body = ""] = r.split(US);
+				if (!hash || seen.has(hash)) continue;
+				seen.add(hash);
+				const ts = (Number(at) || 0) * 1000;
+				const msg = `${subject}\n${body}`.trim();
+				// pass 0 scores on the message; pass 1 (diff match) gets a base score
+				// since the hit is in code, not the message.
+				const msgScore = keywordScore(msg, contentTokens);
+				const s = pass === 0 ? Math.max(msgScore, 1) : Math.max(msgScore, 2);
+				hits.push({
+					source: "git",
+					label: pass === 0 ? "commit" : "commit·diff",
+					snippet: subject.slice(0, 240),
+					location: `${project}@${hash.slice(0, 9)}`,
+					project,
+					timestamp: ts || now,
+					score: s * recencyBoost(ts || now, now) * 1.05,
+					// stash repo+hash for on-demand diff expansion
+					...( { _repo: repo, _hash: hash } as object),
+				});
+			}
+		}
+	}
+	hits.sort((a, b) => b.score - a.score);
+	const top = hits.slice(0, perSourceCap);
+	// Expand full diffs: a few for keyword search, more for a time-window sweep
+	// ("all diffs this month").
+	const expandCount = windowMode ? Math.min(top.length, perSourceCap) : GIT_EXPAND_TOP;
+	for (let i = 0; i < expandCount && i < top.length; i++) {
+		const h = top[i] as MemoryHit & { _repo?: string; _hash?: string };
+		if (!h._repo || !h._hash) continue;
+		const diff = gitOut(h._repo, ["show", "--stat", "--patch", "--format=%s%n%b", h._hash]);
+		const lines = diff.split("\n");
+		h.snippet =
+			lines.slice(0, GIT_DIFF_MAX_LINES).join("\n") +
+			(lines.length > GIT_DIFF_MAX_LINES ? `\n… (+${lines.length - GIT_DIFF_MAX_LINES} more lines)` : "");
+	}
+	return top;
+}
+
 // ── orchestrator ──────────────────────────────────────────────────────────────
 
 export function searchMemory(query: string, opts: MemorySearchOptions = {}): MemoryHit[] {
 	const tokens = tokenize(query);
-	if (tokens.length === 0) return [];
 	const scope = opts.scope ?? "current";
 	// Default = "memory" in the user's sense: chat transcripts + recall memories.
-	// Markdown docs are opt-in (only when the caller asks for documentation).
+	// Markdown docs and git history are opt-in (only when the caller asks).
 	const sources = opts.sources ?? ["sessions", "memory"];
 	const cwd = opts.cwd ?? process.cwd();
 	const limit = opts.limit ?? 15;
 	const now = Date.now();
 	const perSourceCap = Math.max(limit, 10);
 
+	// git in time-window mode works with zero content tokens ("all diffs this
+	// month"); every other source needs at least one keyword.
+	const gitWindowOnly =
+		sources.includes("git") && opts.sinceMs !== undefined &&
+		tokens.every((t) => GIT_STOPWORDS.has(t));
+	if (tokens.length === 0 && !gitWindowOnly) return [];
+
 	let hits: MemoryHit[] = [];
-	if (sources.includes("sessions"))
+	if (sources.includes("sessions") && tokens.length > 0)
 		hits = hits.concat(searchSessions(tokens, scope, cwd, opts.sinceMs, now, perSourceCap));
-	if (sources.includes("memory"))
+	if (sources.includes("memory") && tokens.length > 0)
 		hits = hits.concat(searchRecall(tokens, scope, cwd, opts.sinceMs, now, perSourceCap));
-	if (sources.includes("docs"))
+	if (sources.includes("docs") && tokens.length > 0)
 		hits = hits.concat(searchDocs(tokens, scope, cwd, opts.sinceMs, now, perSourceCap));
+	if (sources.includes("git"))
+		hits = hits.concat(searchGit(query, tokens, scope, cwd, opts.sinceMs, now, perSourceCap));
 
 	hits.sort((a, b) => b.score - a.score);
 	return hits.slice(0, limit);
@@ -418,13 +579,26 @@ export function wantsDocs(query: string): boolean {
 	return /(документац|в доках|доках|\bdocs?\b|documentation|\bmarkdown\b|\b\.md\b|md-файл|md файл)/.test(q);
 }
 
+/**
+ * Detect whether the query asks to search git commit history / diffs.
+ * Opt-in like docs. Matches 'гит/git', 'коммит(ы)', 'дифф(ы)/diff', 'история
+ * коммитов', 'commit history'.
+ */
+export function wantsGit(query: string): boolean {
+	// \b doesn't work around Cyrillic; match гит/диф as substrings but keep the
+	// Latin "git" bounded so words like "digit"/"legit" don't trigger.
+	const q = query.toLowerCase();
+	return /(\bgit\b|гит|коммит|commit|диф|\bdiff|commit history|git log)/.test(q);
+}
+
 /** Parse a natural-language recency hint into a lookback window (ms). */
 export function parseRecency(query: string): number | undefined {
 	// Note: \b word boundaries don't work with Cyrillic, so match on substrings.
 	const q = query.toLowerCase();
 	if (/(прошл\S* недел|last week|past week)/.test(q)) return 14 * 86_400_000;
 	if (/(эт\S* недел|this week)/.test(q)) return 7 * 86_400_000;
-	if (/(прошл\w* месяц|last month)/.test(q)) return 60 * 86_400_000;
+	if (/(прошл\S* месяц|last month)/.test(q)) return 60 * 86_400_000;
+	if (/(последн\S* месяц|за месяц|past month)/.test(q)) return 31 * 86_400_000;
 	if (/(вчера|yesterday)/.test(q)) return 48 * 3600_000;
 	if (/(сегодня|today)/.test(q)) return 24 * 3600_000;
 	return undefined;
@@ -434,13 +608,22 @@ export function parseRecency(query: string): number | undefined {
 export function formatHits(hits: MemoryHit[], query: string): string {
 	if (hits.length === 0) return `No matches in your history for "${query}".`;
 	const lines: string[] = [`Found ${hits.length} match(es) for "${query}":`, ""];
+	const tagOf = (s: MemorySource): string =>
+		s === "sessions" ? "chat" : s === "memory" ? "memory" : s === "docs" ? "doc" : "git";
 	for (const h of hits) {
 		const d = new Date(h.timestamp);
 		const date = Number.isFinite(h.timestamp) && h.timestamp > 0 ? d.toISOString().slice(0, 10) : "?";
-		const tag = h.source === "sessions" ? "chat" : h.source === "memory" ? "memory" : "doc";
-		lines.push(`[${tag} ${date}] ${h.label} · ${h.project}`);
-		lines.push(`  ${h.snippet}`);
-		lines.push(`  ↳ ${h.location}`);
+		lines.push(`[${tagOf(h.source)} ${date}] ${h.label} · ${h.project}`);
+		if (h.source === "git" && h.snippet.includes("\n")) {
+			// expanded diff — render inside a fenced block, not indented
+			lines.push(`  ↳ ${h.location}`);
+			lines.push("```diff");
+			lines.push(h.snippet);
+			lines.push("```");
+		} else {
+			lines.push(`  ${h.snippet}`);
+			lines.push(`  ↳ ${h.location}`);
+		}
 		lines.push("");
 	}
 	return lines.join("\n");
