@@ -1,3 +1,22 @@
+/**
+ * pi-ext-int-search — External + internal search for the Pi coding agent.
+ *
+ * Two complementary tools, registered from this extension:
+ *   EXTERNAL  web_search      → the live internet (OpenAI/Exa/Brave/Parallel/
+ *                               Tavily/Perplexity/Gemini) + fetch_content /
+ *                               get_search_content. See gemini-search.ts +
+ *                               the per-provider modules; endpoints/keys resolve
+ *                               through provider-endpoints.ts (per-provider
+ *                               override > unified proxy > default).
+ *   INTERNAL  memory_search    → your OWN history: pi chat sessions, claude-recall
+ *                               memories, project *.md docs, and git history.
+ *                               Local-only (rg/sqlite3/git), no network. See
+ *                               memory-search.ts.
+ *
+ * They never overlap: web_search for the world, memory_search for what you
+ * already did. Lineage: external search derives from nicobailon/pi-web-access;
+ * memory_search + unified-proxy + security hardening are this fork's additions.
+ */
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { Box, Text, truncateToWidth } from "@earendil-works/pi-tui";
 import { Type } from "typebox";

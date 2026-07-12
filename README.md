@@ -2,17 +2,46 @@
   <img src="banner.png" alt="pi-web-access" width="1100">
 </p>
 
-# Pi Web Access
+# pi-ext-int-search
 
-**Web search, content extraction, and video understanding for Pi agent. OpenAI/Codex search, zero-config Exa search, Brave, Parallel, Tavily, optional browser-cookie Gemini Web, or bring your own API keys.**
+**External + internal search for the Pi coding agent.** One package, two complementary tools:
 
-[![npm version](https://img.shields.io/npm/v/pi-web-access?style=for-the-badge)](https://www.npmjs.com/package/pi-web-access)
+- **EXTERNAL — `web_search`**: the live internet across OpenAI/Codex, Exa, Brave, Parallel, Tavily, Perplexity, Gemini (+ URL fetch, GitHub clone, PDF, YouTube/video understanding).
+- **INTERNAL — `memory_search`**: your OWN history — past Pi chat sessions, claude-recall memories, project markdown docs, and git commit history.
+
+[![npm version](https://img.shields.io/npm/v/pi-ext-int-search?style=for-the-badge)](https://www.npmjs.com/package/pi-ext-int-search)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg?style=for-the-badge)](https://opensource.org/licenses/MIT)
 [![Platform](https://img.shields.io/badge/Platform-macOS%20%7C%20Linux%20%7C%20Windows*-blue?style=for-the-badge)]()
 
 https://github.com/user-attachments/assets/cac6a17a-1eeb-4dde-9818-cdf85d8ea98f
 
-## Why Pi Web Access
+## External vs. internal search — the difference
+
+| | EXTERNAL (`web_search`) | INTERNAL (`memory_search`) |
+|---|---|---|
+| **Searches** | the public internet | your own local history |
+| **Sources** | OpenAI, Exa, Brave, Parallel, Tavily, Perplexity, Gemini | pi sessions (JSONL), claude-recall DB, `*.md` docs, git log/diffs |
+| **Use when** | "what's the latest X", docs, news, code on the web | "what did we decide about X", "как мы это делали вчера", "поищи в переписке / в гит истории" |
+| **Network** | yes (provider APIs / a unified proxy) | none — local `ripgrep` + `sqlite3` + `git` only |
+| **Engine** | provider APIs with a fallback chain | on-the-fly `rg`/`sqlite3`/`git` scan, ranked relevance×recency |
+| **Scope** | the web | current project (default) or `scope:"all"` = every project on the machine |
+
+They never overlap: reach for `web_search` for the world, `memory_search` for what *you* already did. `memory_search` makes zero network calls and redacts secrets from snippets before they reach the model.
+
+## Origins & lineage (first sources)
+
+This package is a hardened fork, not original work — credit upstream:
+
+- **Original / base:** [`nicobailon/pi-web-access`](https://github.com/nicobailon/pi-web-access) (MIT) — the external `web_search` + fetch/PDF/YouTube/GitHub feature set. Everything under "external search" derives from it.
+- **Provider-endpoint layout** borrows the central-registry idea from [`code-yeongyu/pi-websearch`](https://github.com/code-yeongyu/pi-websearch) (the independent base of that genealogy).
+- **This fork** ([`axelbaumlisto/pi-web-access`](https://github.com/axelbaumlisto/pi-web-access)) adds the parts that are NOT in upstream:
+  1. **`memory_search`** — the entire internal-search tool (sessions + recall + docs + git).
+  2. **Unified proxy mode** — one base host + one key fronting all providers (`provider-endpoints.ts`).
+  3. **Security hardening** from a multi-round blind review: destination-first key binding (no personal key leaks to a proxy), grounding-redirect SSRF guard, upstream error-body redaction, HTML-sanitized snippets, empty-result auto-fallback, citation preservation.
+
+Upstream commits are preserved in git history; fork changes sit on top.
+
+## Why external search (from upstream)
 
 **Zero Config** — Works out of the box with Exa MCP (no API key needed). If you're signed into Pi with a Codex subscription, OpenAI web search can reuse that auth. Add API keys for OpenAI, Brave, Parallel, Tavily, Exa, Perplexity, or Gemini API for more control, or opt into browser-cookie access for Gemini Web.
 
@@ -25,7 +54,7 @@ https://github.com/user-attachments/assets/cac6a17a-1eeb-4dde-9818-cdf85d8ea98f
 ## Install
 
 ```bash
-pi install npm:pi-web-access
+pi install npm:pi-ext-int-search
 ```
 
 Works immediately with no API keys — Exa MCP provides zero-config search. If Pi has Codex auth from `/login`, OpenAI search can also work without a separate key. For more providers or direct API access, add keys to `~/.pi/web-search.json`:
@@ -130,6 +159,36 @@ get_search_content({ responseId: "abc123", urlIndex: 0 })
 get_search_content({ responseId: "abc123", url: "https://..." })
 get_search_content({ responseId: "abc123", query: "original query" })
 ```
+
+### memory_search (internal search)
+
+Search your OWN history instead of the web — past Pi chat sessions, stored
+claude-recall memories, project markdown docs, and git commit history. No
+network; scans locally with `ripgrep` + `sqlite3` + `git`, ranks by keyword
+relevance × recency, and redacts secrets from snippets before returning them.
+
+```typescript
+memory_search({ query: "what did we decide about bedrock" })
+memory_search({ query: "поищи в переписке gemini grounding" })
+memory_search({ query: "rotation key pool", scope: "all" })          // every project
+memory_search({ query: "retry logic", sources: ["sessions", "memory", "docs"] })
+memory_search({ query: "покажи все коммиты за неделю" })              // git time-window sweep
+```
+
+| Parameter | Description |
+|-----------|-------------|
+| `query` | Keywords or a phrase to find in your history (RU + EN) |
+| `scope` | `current` (default, this project) or `all` (every project on the machine) |
+| `sources` | Any of `sessions`, `memory`, `docs`, `git`. Default = `sessions` + `memory`. `docs`/`git` are also auto-added when the query mentions docs or git |
+| `limit` | Max results (default 15) |
+
+**Sources.** `sessions` = Pi chat transcripts (`~/.pi/agent/sessions/*.jsonl`);
+`memory` = claude-recall DB (`~/.claude-recall/claude-recall.db`); `docs` =
+`*.md` under the project (or `~/work` + `~/.pi/agent` for `scope:"all"`); `git`
+= commit messages + diffs (keyword search expands the top hits; a query with a
+time phrase like "за месяц"/"last week" lists ALL commits in the window). Output
+notes any source that failed or was truncated, so "no matches" is never confused
+with "the scan broke".
 
 ## Capabilities
 

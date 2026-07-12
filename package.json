@@ -1,7 +1,7 @@
 {
-  "name": "pi-web-access",
-  "version": "0.13.0",
-  "description": "Web search, URL fetching, GitHub repo cloning, PDF extraction, YouTube video understanding, and local video analysis for Pi coding agent. Supports OpenAI, Brave, Parallel, Tavily, Exa, Perplexity, and Gemini.",
+  "name": "pi-ext-int-search",
+  "version": "1.0.0",
+  "description": "External + internal search for the Pi coding agent. EXTERNAL: web_search across OpenAI, Brave, Parallel, Tavily, Exa, Perplexity, Gemini (with URL fetch, GitHub clone, PDF, YouTube/video understanding). INTERNAL: memory_search over your own pi chat sessions, claude-recall memories, project docs, and git history.",
   "type": "module",
   "scripts": {
     "test": "node --test"
@@ -12,20 +12,25 @@
     "pi-coding-agent",
     "extension",
     "web-search",
+    "memory-search",
+    "internal-search",
+    "external-search",
     "perplexity",
+    "exa",
+    "gemini",
     "fetch",
     "scraping"
   ],
-  "author": "Nico Bailon",
+  "author": "Nico Bailon (original), axelbaumlisto (ext+int fork)",
   "license": "MIT",
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/nicobailon/pi-web-access.git"
+    "url": "git+https://github.com/axelbaumlisto/pi-web-access.git"
   },
   "bugs": {
-    "url": "https://github.com/nicobailon/pi-web-access/issues"
+    "url": "https://github.com/axelbaumlisto/pi-web-access/issues"
   },
-  "homepage": "https://github.com/nicobailon/pi-web-access#readme",
+  "homepage": "https://github.com/axelbaumlisto/pi-web-access#readme",
   "dependencies": {
     "@mozilla/readability": "^0.6.0",
     "linkedom": "^0.16.0",
@@ -46,6 +51,6 @@
     "skills": [
       "./skills"
     ],
-    "video": "https://github.com/nicobailon/pi-web-access/raw/refs/heads/main/pi-web-fetch-demo.mp4"
+    "video": "https://github.com/axelbaumlisto/pi-web-access/raw/refs/heads/main/pi-web-fetch-demo.mp4"
   }
 }
