@@ -1,7 +1,7 @@
 {
   "name": "pi-ext-int-search",
-  "version": "1.0.0",
-  "description": "External + internal search for the Pi coding agent. EXTERNAL: web_search across OpenAI, Brave, Parallel, Tavily, Exa, Perplexity, Gemini (with URL fetch, GitHub clone, PDF, YouTube/video understanding). INTERNAL: memory_search over your own pi chat sessions, claude-recall memories, project docs, and git history.",
+  "version": "1.0.1",
+  "description": "Hardened fork of nicobailon/pi-web-access with our own settings + added internal search. External + internal search for the Pi coding agent. EXTERNAL: web_search across OpenAI, Brave, Parallel, Tavily, Exa, Perplexity, Gemini (with URL fetch, GitHub clone, PDF, YouTube/video understanding). INTERNAL: memory_search over your own pi chat sessions, claude-recall memories, project docs, and git history.",
   "type": "module",
   "scripts": {
     "test": "node --test"
