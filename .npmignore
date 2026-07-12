@@ -1,0 +1,12 @@
+# Internal review / planning artifacts — not for the published package
+research/
+.pi-subagents/
+.pi/
+
+# Heavy demo asset — referenced by URL in package.json "pi.video", not needed in the tarball
+pi-web-fetch-demo.mp4
+
+# Dev / CI noise
+.github/
+*.log
+.DS_Store
