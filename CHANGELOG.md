@@ -4,6 +4,33 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+## [pi-ext-int-search 1.1.0] - 2026-07-26 (fork release)
+
+Merged upstream `nicobailon/pi-web-access` v0.14.0 (see the 0.14.0 entry below
+for everything inherited: SearXNG/SERPdive/AnySearch providers, Firecrawl
+extraction, `source_check`, `$ENV`/`!command` credential sources, ordered
+search routing, fetch-content domain policy, configurable tool names).
+
+### Fork changes on top of the merge
+- Rewired unified proxy mode onto upstream's async credential resolution: new
+  `providerProxyApiKey()` (destination-first) is checked BEFORE
+  `resolveCredential` in exa/brave/tavily/perplexity/openai, so a personal
+  per-provider key never leaks to the proxy gateway.
+- Gemini destination-first binding preserved: ambient `GEMINI_API_KEY` only
+  counts for direct Google hosts (`getApiKey`, `isGeminiApiAvailable`);
+  `buildKeyParam` kept for key-binding guarantees.
+- `redactError()` (pattern-based secret scrubbing) layered on top of
+  upstream's `redactCredential` in provider error paths.
+- Perplexity: kept the fork's own 30s request timeout and preservation of ALL
+  citations regardless of `numResults` (answers reference sources by index).
+- Auto-mode empty-result fallback extended to the new searxng/serpdive
+  providers: an HTTP-200-but-empty response keeps falling through the chain.
+- Kept `memory_search` (internal search), the bundled `librarian` skill
+  (upstream removed theirs; ours ships in `files[]`), and `pi-ext-int-search`
+  packaging.
+- Made `source_check` tests hermetic (they no longer pick up the developer's
+  real `~/.pi/web-search.json`).
+
 ## [0.14.0] - 2026-07-25
 
 ### Added

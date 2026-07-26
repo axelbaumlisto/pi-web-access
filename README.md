@@ -20,7 +20,7 @@ https://github.com/user-attachments/assets/cac6a17a-1eeb-4dde-9818-cdf85d8ea98f
 | | EXTERNAL (`web_search`) | INTERNAL (`memory_search`) |
 |---|---|---|
 | **Searches** | the public internet | your own local history |
-| **Sources** | OpenAI, Exa, Brave, Parallel, Tavily, Perplexity, Gemini | pi sessions (JSONL), claude-recall DB, `*.md` docs, git log/diffs |
+| **Sources** | OpenAI, Exa, Brave, Parallel, Tavily, SERPdive, AnySearch, SearXNG, Perplexity, Gemini | pi sessions (JSONL), claude-recall DB, `*.md` docs, git log/diffs |
 | **Use when** | "what's the latest X", docs, news, code on the web | "what did we decide about X", "как мы это делали вчера", "поищи в переписке / в гит истории" |
 | **Network** | yes (provider APIs / a unified proxy) | none — local `ripgrep` + `sqlite3` + `git` only |
 | **Engine** | provider APIs with a fallback chain | on-the-fly `rg`/`sqlite3`/`git` scan, ranked relevance×recency |
@@ -401,6 +401,21 @@ All provider API-key fields (`openaiApiKey`, `braveApiKey`, `parallelApiKey`, `t
 ```
 
 This syntax applies to provider credentials only; other configuration fields are not interpolated. `firecrawlApiKey` uses the same credential-source rules, while `firecrawlBaseUrl`, `firecrawlApiVersion`, and `firecrawlFreshScrape` are literal config values.
+
+### Unified proxy mode (fork)
+
+When every provider is fronted by the SAME gateway (e.g. a self-hosted proxy that injects a pooled key), one base host + one key is enough:
+
+```json
+{
+  "proxyBaseUrl": "https://your-proxy.example.com",
+  "proxyApiKey": "sk-proxy-..."
+}
+```
+
+Or via env: `WEB_SEARCH_PROXY_URL` / `WEB_SEARCH_PROXY_KEY`. Each fronted provider's endpoint is derived as `${proxyBase}${proxyPath}` (exa → `/v1/exa`, brave → `/v1/brave/search`, perplexity → `/v1/chat/completions`, openai → `/v1/responses`) and its API key falls back to the shared proxy key. Per-provider `*BaseUrl` / `*ApiKey` overrides still win; tavily/parallel are not fronted and keep their defaults. Gemini routes through `geminiBaseUrl` + `geminiApiKey` (its resolver also handles Cloudflare AI Gateway detection).
+
+**Destination-first key binding.** The credential is chosen AFTER the destination resolves: when an endpoint resolves to the proxy origin, the shared proxy key is the ONLY credential sent — a personal per-provider key (an ambient `OPENAI_API_KEY`, `GEMINI_API_KEY`, a model-registry Codex token, or a `$ENV`/`!command` source) is never transmitted to the gateway. The comparison is a parsed-origin match, not `startsWith`, so `your-proxy.example.com.evil.com` does not pass. Conversely, the shared proxy key is never sent to a non-proxy host.
 
 A command source is not run while the extension loads or registers tools. Each selected provider request runs it again with a five-second timeout, a 16 KiB output limit, a minimized environment, and a one-line non-empty stdout requirement. Command text and stderr are omitted from errors. These commands are trusted local configuration, not a same-user process isolation boundary; use absolute executable paths and protect the config file. `OP_SESSION_*` variables are forwarded to trusted resolver commands so shell-local 1Password sessions can be reused without storing them in config. An explicit source overrides legacy provider environment variables and fails that provider locally rather than falling back with a stale credential. Direct Google Gemini API requests send the resolved key only in the `x-goog-api-key` header, never in the URL.
 
