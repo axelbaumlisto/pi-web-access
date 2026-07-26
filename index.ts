@@ -17,14 +17,14 @@
  * already did. Lineage: external search derives from nicobailon/pi-web-access;
  * memory_search + unified-proxy + security hardening are this fork's additions.
  */
-import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
-import { Box, Text, truncateToWidth } from "@earendil-works/pi-tui";
+import type { AgentToolResult, ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
+import { Box, Text, truncateToWidth, type KeyId } from "@earendil-works/pi-tui";
 import { Type } from "typebox";
-import { StringEnum, complete, type Model } from "@earendil-works/pi-ai/compat";
-import { fetchAllContent, type ExtractedContent } from "./extract.ts";
+import { StringEnum, complete, type Api, type ImageContent, type Model, type TextContent } from "@earendil-works/pi-ai/compat";
+import type { ExtractedContent, ExtractOptions } from "./extract.ts";
 import { normalizeFetchContentParams } from "./fetch-params.ts";
 import { clearCloneCache } from "./github-extract.ts";
-import { search, type SearchProvider, type ResolvedSearchProvider } from "./gemini-search.ts";
+import { getConfiguredSearchRouting, search, type SearchProvider, type ResolvedSearchProvider } from "./gemini-search.ts";
 import type { SearchResult } from "./perplexity.ts";
 import { formatSeconds, getWebSearchConfigDir, getWebSearchConfigPath } from "./utils.ts";
 import { searchMemory, parseRecency, wantsDocs, wantsGit, formatHits, type MemoryScope, type MemorySource } from "./memory-search.ts";
@@ -56,21 +56,48 @@ import { join } from "node:path";
 import { isPerplexityAvailable } from "./perplexity.ts";
 import { isExaAvailable } from "./exa.ts";
 import { isGeminiApiAvailable } from "./gemini-api.ts";
-import { getActiveGoogleEmail, isGeminiWebAvailable } from "./gemini-web.ts";
+import { getActiveGoogleEmail, getGeminiWebAvailabilityDiagnostic, isGeminiWebAvailable } from "./gemini-web.ts";
 import { isBrowserCookieAccessAllowed } from "./gemini-web-config.ts";
 import { isBraveAvailable } from "./brave.ts";
 import { isOpenAISearchAvailable } from "./openai-search.ts";
 import { isParallelAvailable } from "./parallel.ts";
 import { isTavilyAvailable } from "./tavily.ts";
+import { isSerpdiveAvailable } from "./serpdive.ts";
+import { isSearXNGAvailable } from "./searxng.ts";
+import { isAnySearchAvailable } from "./anysearch.ts";
 import { buildSearchErrorPlan, type SearchErrorDetails, type SearchErrorPlan } from "./render-search-error.ts";
 import { loadEnabledModelPatterns, modelMatchesEnabledPatterns } from "./summary-model-scope.ts";
+import {
+	buildResearchArtifact,
+	withClaimAssessment,
+	storeResearchArtifact,
+	getResearchArtifact,
+	type RecencyFilter,
+	type ResearchArtifact,
+} from "./source-check.ts";
+
+type ExtensionTheme = ExtensionContext["ui"]["theme"];
 
 const WEB_SEARCH_CONFIG_PATH = getWebSearchConfigPath();
+
+let extractModulePromise: Promise<typeof import("./extract.ts")> | undefined;
+async function fetchAllContent(
+	urls: string[],
+	signal?: AbortSignal,
+	options?: ExtractOptions,
+): Promise<ExtractedContent[]> {
+	const extractModule = await (extractModulePromise ??= import("./extract.ts"));
+	return extractModule.fetchAllContent(urls, signal, options);
+}
+
+function isAbortError(err: unknown): boolean {
+	return (err instanceof Error ? err.message : String(err)).toLowerCase().includes("abort");
+}
 
 /** Shared collapsed/expanded renderer for an error/cancel plan produced by
  * buildSearchErrorPlan(). Used by every tool renderResult's error branch so
  * Ctrl+O (app.tools.expand) reveals diagnostics instead of a dead-end single line. */
-function renderSearchErrorPlan(plan: SearchErrorPlan, expanded: boolean, theme: { fg: (key: string, s: string) => string; bg: (key: string, s: string) => string }) {
+function renderSearchErrorPlan(plan: SearchErrorPlan, expanded: boolean, theme: ExtensionTheme) {
 	if (expanded) {
 		return new Text(plan.expanded.map((l, i) => i === 0 ? theme.fg("error", l) : theme.fg("toolOutput", l)).join("\n"), 0, 0);
 	}
@@ -86,20 +113,25 @@ function renderSearchErrorPlan(plan: SearchErrorPlan, expanded: boolean, theme: 
 }
 
 interface WebSearchConfig {
+	anysearchApiKey?: unknown;
 	provider?: string;
+	searchProvider?: string;
 	workflow?: string;
 	curatorTimeoutSeconds?: unknown;
 	summaryModel?: string;
 	webSearch?: {
 		enabled?: boolean;
 	};
+	toolNames?: Partial<ToolNames>;
 	shortcuts?: {
-		curate?: string;
-		activity?: string;
+		curate?: KeyId;
+		activity?: KeyId;
 	};
 	ssrf?: {
 		/** CIDR ranges exempted from the SSRF guard (e.g. fake-IP proxy ranges). */
 		allowRanges?: string[];
+		/** Skip local hostname DNS preflight when an HTTP(S)_PROXY env var applies. */
+		trustEnvProxy?: boolean;
 	};
 }
 
@@ -108,9 +140,12 @@ interface ProviderAvailability {
 	brave: boolean;
 	parallel: boolean;
 	tavily: boolean;
+	serpdive: boolean;
+	searxng: boolean;
 	perplexity: boolean;
 	exa: boolean;
 	gemini: boolean;
+	anysearch: boolean;
 }
 
 type WebSearchWorkflow = "none" | "summary-review" | "auto-summary";
@@ -123,27 +158,29 @@ interface CuratorBootstrap {
 	timeoutSeconds: number;
 }
 
-function loadConfig(): WebSearchConfig {
-	if (!existsSync(WEB_SEARCH_CONFIG_PATH)) return {};
-	const raw = readFileSync(WEB_SEARCH_CONFIG_PATH, "utf-8");
+function parseConfigRoot(raw: string): Record<string, unknown> {
+	let parsed: unknown;
 	try {
-		return JSON.parse(raw) as WebSearchConfig;
+		parsed = JSON.parse(raw);
 	} catch (err) {
 		const message = err instanceof Error ? err.message : String(err);
 		throw new Error(`Failed to parse ${WEB_SEARCH_CONFIG_PATH}: ${message}`);
 	}
+	if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) {
+		throw new Error(`Invalid config in ${WEB_SEARCH_CONFIG_PATH}: expected a JSON object`);
+	}
+	return parsed as Record<string, unknown>;
+}
+
+function loadConfig(): WebSearchConfig {
+	if (!existsSync(WEB_SEARCH_CONFIG_PATH)) return {};
+	return parseConfigRoot(readFileSync(WEB_SEARCH_CONFIG_PATH, "utf-8")) as WebSearchConfig;
 }
 
 function saveConfig(updates: Partial<WebSearchConfig>): void {
 	let config: Record<string, unknown> = {};
 	if (existsSync(WEB_SEARCH_CONFIG_PATH)) {
-		const raw = readFileSync(WEB_SEARCH_CONFIG_PATH, "utf-8");
-		try {
-			config = JSON.parse(raw) as Record<string, unknown>;
-		} catch (err) {
-			const message = err instanceof Error ? err.message : String(err);
-			throw new Error(`Failed to parse ${WEB_SEARCH_CONFIG_PATH}: ${message}`);
-		}
+		config = parseConfigRoot(readFileSync(WEB_SEARCH_CONFIG_PATH, "utf-8"));
 	}
 
 	Object.assign(config, updates);
@@ -152,9 +189,51 @@ function saveConfig(updates: Partial<WebSearchConfig>): void {
 	writeFileSync(WEB_SEARCH_CONFIG_PATH, JSON.stringify(config, null, 2) + "\n");
 }
 
-const DEFAULT_SHORTCUTS = { curate: "ctrl+shift+s", activity: "ctrl+shift+w" };
+type ToolNames = {
+	webSearch: string;
+	sourceCheck: string;
+	fetchContent: string;
+	getSearchContent: string;
+};
+
+const DEFAULT_TOOL_NAMES: ToolNames = {
+	webSearch: "web_search",
+	sourceCheck: "source_check",
+	fetchContent: "fetch_content",
+	getSearchContent: "get_search_content",
+};
+const TOOL_NAME_PATTERN = /^[A-Za-z][A-Za-z0-9_-]{0,63}$/;
+const DEFAULT_SHORTCUTS = { curate: "ctrl+shift+s", activity: "ctrl+shift+w" } satisfies Record<string, KeyId>;
 const DEFAULT_CURATOR_TIMEOUT_SECONDS = 20;
 const MAX_CURATOR_TIMEOUT_SECONDS = 600;
+
+function resolveToolNames(config: WebSearchConfig): ToolNames {
+	if (config.toolNames !== undefined && (!config.toolNames || typeof config.toolNames !== "object" || Array.isArray(config.toolNames))) {
+		throw new Error(`toolNames in ${WEB_SEARCH_CONFIG_PATH} must be an object`);
+	}
+	const names = { ...DEFAULT_TOOL_NAMES };
+	for (const key of Object.keys(DEFAULT_TOOL_NAMES) as Array<keyof ToolNames>) {
+		const value = config.toolNames?.[key];
+		if (value === undefined) continue;
+		if (typeof value !== "string") throw new Error(`toolNames.${key} in ${WEB_SEARCH_CONFIG_PATH} must be a string`);
+		const trimmed = value.trim();
+		if (!TOOL_NAME_PATTERN.test(trimmed)) {
+			throw new Error(`toolNames.${key} in ${WEB_SEARCH_CONFIG_PATH} must start with a letter and contain only letters, numbers, underscores, or hyphens`);
+		}
+		names[key] = trimmed;
+	}
+	const registeredKeys: Array<keyof ToolNames> = config.webSearch?.enabled === false
+		? ["fetchContent", "getSearchContent"]
+		: ["webSearch", "sourceCheck", "fetchContent", "getSearchContent"];
+	const seen = new Map<string, keyof ToolNames>();
+	for (const key of registeredKeys) {
+		const name = names[key];
+		const previous = seen.get(name);
+		if (previous) throw new Error(`toolNames.${key} duplicates toolNames.${previous} in ${WEB_SEARCH_CONFIG_PATH}`);
+		seen.set(name, key);
+	}
+	return names;
+}
 
 function loadConfigForExtensionInit(): WebSearchConfig {
 	try {
@@ -170,8 +249,21 @@ function normalizeProviderInput(value: unknown): SearchProvider | undefined {
 	if (value === undefined) return undefined;
 	if (typeof value !== "string") return "auto";
 	const normalized = value.trim().toLowerCase();
-	const valid: SearchProvider[] = ["auto", "openai", "brave", "parallel", "tavily", "exa", "perplexity", "gemini"];
+	const valid: SearchProvider[] = ["auto", "openai", "brave", "parallel", "tavily", "searxng", "exa", "perplexity", "gemini", "serpdive", "anysearch"];
 	return valid.includes(normalized as SearchProvider) ? normalized as SearchProvider : "auto";
+}
+
+function resolveRequestedProvider(requested: unknown): SearchProvider {
+	const normalizedRequested = normalizeProviderInput(requested);
+	if (normalizedRequested && normalizedRequested !== "auto") return normalizedRequested;
+	const config = loadConfig();
+	return normalizeProviderInput(config.searchProvider ?? config.provider) ?? "auto";
+}
+
+function normalizeRecencyFilter(value: unknown): RecencyFilter | undefined {
+	return value === "day" || value === "week" || value === "month" || value === "year"
+		? value
+		: undefined;
 }
 
 function normalizeCuratorTimeoutSeconds(value: unknown): number | undefined {
@@ -211,9 +303,12 @@ async function getProviderAvailability(ctx: ExtensionContext): Promise<ProviderA
 		brave: isBraveAvailable(),
 		parallel: isParallelAvailable(),
 		tavily: isTavilyAvailable(),
+		serpdive: isSerpdiveAvailable(),
+		searxng: isSearXNGAvailable(),
 		perplexity: isPerplexityAvailable(),
 		exa: isExaAvailable(),
 		gemini: isGeminiApiAvailable() || !!geminiWebAvail,
+		anysearch: isAnySearchAvailable(),
 	};
 }
 
@@ -240,11 +335,13 @@ async function loadCuratorBootstrap(
 }
 
 function firstAvailableProvider(available: ProviderAvailability, preferOpenAI: boolean, fallback: ResolvedSearchProvider): ResolvedSearchProvider {
+	if (available.searxng) return "searxng";
 	if (preferOpenAI && available.openai) return "openai";
 	if (available.exa) return "exa";
 	if (available.brave) return "brave";
 	if (available.parallel) return "parallel";
 	if (available.tavily) return "tavily";
+	if (available.serpdive) return "serpdive";
 	if (available.perplexity) return "perplexity";
 	if (available.gemini) return "gemini";
 	return fallback;
@@ -255,10 +352,17 @@ function resolveProvider(
 	available: ProviderAvailability,
 	options?: Pick<PendingCurate, "numResults" | "recencyFilter">,
 ): ResolvedSearchProvider {
-	const provider = normalizeProviderInput(requested ?? loadConfig().provider ?? "auto") ?? "auto";
+	const provider = resolveRequestedProvider(requested);
 	const preferOpenAI = shouldPreferOpenAI(options);
 
 	if (provider === "auto") {
+		const routing = getConfiguredSearchRouting();
+		if (routing) {
+			for (const candidate of routing.providers) {
+				if (available[candidate]) return candidate;
+			}
+			return routing.providers[0];
+		}
 		return firstAvailableProvider(available, preferOpenAI, "exa");
 	}
 	if (provider === "openai" && !available.openai) {
@@ -272,6 +376,12 @@ function resolveProvider(
 	}
 	if (provider === "tavily" && !available.tavily) {
 		return firstAvailableProvider(available, preferOpenAI, "tavily");
+	}
+	if (provider === "serpdive" && !available.serpdive) {
+		return firstAvailableProvider(available, preferOpenAI, "serpdive");
+	}
+	if (provider === "searxng" && !available.searxng) {
+		return firstAvailableProvider(available, preferOpenAI, "searxng");
 	}
 	if (provider === "exa" && !available.exa) {
 		return firstAvailableProvider(available, preferOpenAI, "exa");
@@ -314,7 +424,7 @@ interface PendingCurate {
 	onUpdate: ((update: { content: Array<{ type: string; text: string }>; details?: Record<string, unknown> }) => void) | undefined;
 	signal: AbortSignal | undefined;
 	abortSearches: () => void;
-	finish: (value: unknown) => void;
+	finish: (value: AgentToolResult<Record<string, unknown>>) => void;
 	cancel: (reason?: "user" | "stale") => void;
 	browserPromise?: Promise<void>;
 	browserOpenError?: string;
@@ -322,15 +432,40 @@ interface PendingCurate {
 
 
 const MAX_INLINE_CONTENT = 30000; // Content returned directly to agent
+const DEFAULT_CONTENT_SLICE_LENGTH = MAX_INLINE_CONTENT;
+const MAX_CONTENT_SLICE_LENGTH = MAX_INLINE_CONTENT;
 
 function stripThumbnails(results: ExtractedContent[]): ExtractedContent[] {
 	return results.map(({ thumbnail, frames, ...rest }) => rest);
 }
 
 function formatSearchSummary(results: SearchResult[], answer: string): string {
+	if (results.length === 0) {
+		return answer ? `${answer}\n\n---\n\n**Sources:**\nNo sources returned.` : "No results found.";
+	}
 	let output = answer ? `${answer}\n\n---\n\n**Sources:**\n` : "";
 	output += results.map((r, i) => `${i + 1}. ${r.title}\n   ${r.url}`).join("\n\n");
 	return output;
+}
+
+function formatSourceCheckResult(artifact: ResearchArtifact, getSearchContentTool = DEFAULT_TOOL_NAMES.getSearchContent): string {
+	const assessment = artifact.claims?.[0];
+	const lines = [`# Source check: ${artifact.query}`, ""];
+	if (assessment) {
+		lines.push(`**Status:** ${assessment.status} (confidence ${assessment.confidence.toFixed(2)})`);
+		lines.push(`**Rationale:** ${assessment.rationale}`);
+		if (assessment.supporting_passages.length > 0) lines.push(`**Supporting passages:** ${assessment.supporting_passages.join(", ")}`);
+		if (assessment.contradicting_passages.length > 0) lines.push(`**Contradicting passages:** ${assessment.contradicting_passages.join(", ")}`);
+		lines.push("");
+	}
+	if (artifact.sources.length > 0) {
+		lines.push("## Sources");
+		for (const source of artifact.sources) lines.push(`${source.rank}. [${source.quality}] ${source.title}\n   ${source.url}`);
+		lines.push("");
+	}
+	if (artifact.errors?.length) lines.push(`Search errors: ${artifact.errors.map((entry) => `${entry.query}: ${entry.error}`).join("; ")}`);
+	lines.push(`Artifact responseId: ${artifact.id} (retrievable via ${getSearchContentTool}).`);
+	return lines.join("\n");
 }
 
 function duplicateQuerySet(results: QueryResultData[]): Set<string> {
@@ -519,12 +654,12 @@ function updateWidget(ctx: ExtensionContext): void {
 			(resetMs > 0 ? theme.fg("dim", ` (resets in ${resetSec}s)`) : ""),
 	);
 
-	ctx.ui.setWidget("web-activity", new Text(lines.join("\n"), 0, 0));
+	ctx.ui.setWidget("web-activity", lines);
 }
 
 function formatEntryLine(
 	entry: ActivityEntry,
-	theme: { fg: (color: string, text: string) => string },
+	theme: ExtensionTheme,
 ): string {
 	const typeStr = entry.type === "api" ? "API" : "GET";
 	const target =
@@ -574,6 +709,13 @@ function handleSessionChange(ctx: ExtensionContext): void {
 
 export default function (pi: ExtensionAPI) {
 	const initConfig = loadConfigForExtensionInit();
+	const toolNames = resolveToolNames(initConfig);
+	const storedContentSources = initConfig.webSearch?.enabled === false
+		? toolNames.fetchContent
+		: `${toolNames.webSearch}, ${toolNames.sourceCheck}, or ${toolNames.fetchContent}`;
+	const searchQueryDescription = initConfig.webSearch?.enabled === false
+		? "Get content for a stored search query"
+		: `Get content for this query (${toolNames.webSearch})`;
 	const curateKey = initConfig.shortcuts?.curate || DEFAULT_SHORTCUTS.curate;
 	const activityKey = initConfig.shortcuts?.activity || DEFAULT_SHORTCUTS.activity;
 
@@ -665,6 +807,7 @@ export default function (pi: ExtensionAPI) {
 				: (normalizedText.length > 0 ? Math.max(1, Math.ceil(normalizedText.length / 4)) : 0),
 			fallbackUsed: meta.fallbackUsed === true,
 			fallbackReason: meta.fallbackReason,
+			phase: meta.phase,
 			edited: meta.edited === true,
 		};
 	}
@@ -679,7 +822,7 @@ export default function (pi: ExtensionAPI) {
 			curatorUrl?: string;
 			browserOpenError?: string;
 		},
-	) {
+	): AgentToolResult<Record<string, unknown>> {
 		const message = `Search curation cancelled (${reason}).`;
 		const cancelledQueries = partial?.queries?.length
 			? partial.queries.map(q => ({
@@ -710,7 +853,7 @@ export default function (pi: ExtensionAPI) {
 	async function resolveFirstAvailableModel(
 		ctx: SummaryGenerationContext,
 		candidates: Array<{ provider: string; id: string }>,
-	): Promise<{ model: Model; apiKey: string; headers?: Record<string, string> }> {
+	): Promise<{ model: Model<Api>; apiKey: string; headers?: Record<string, string> }> {
 		const enabledModelPatterns = loadEnabledModelPatterns(ctx);
 		for (const { provider, id } of candidates) {
 			const model = ctx.modelRegistry.find(provider, id);
@@ -741,11 +884,7 @@ export default function (pi: ExtensionAPI) {
 		if (response.stopReason === "aborted") throw new Error("Aborted");
 		const contentParts = Array.isArray(response.content) ? response.content : [];
 		const text = contentParts
-			.map(p => {
-				if (!p || typeof p !== "object") return "";
-				const part = p as Record<string, unknown>;
-				return typeof part.text === "string" ? part.text : "";
-			})
+			.map(part => part.type === "text" ? part.text : "")
 			.join("")
 			.trim();
 		if (!text) throw new Error("Rewrite returned empty response");
@@ -865,7 +1004,7 @@ export default function (pi: ExtensionAPI) {
 		};
 	}
 
-	function buildSearchReturn(opts: SearchReturnOptions) {
+	function buildSearchReturn(opts: SearchReturnOptions): AgentToolResult<Record<string, unknown>> {
 		const sc = opts.results.filter(r => !r.error).length;
 		const tr = opts.results.reduce((sum, r) => sum + r.results.length, 0);
 
@@ -885,7 +1024,6 @@ export default function (pi: ExtensionAPI) {
 						: `## Query: "${query}"\n\n`;
 				}
 				if (error) output += `Error: ${error}\n\n`;
-				else if (results.length === 0) output += "No results found.\n\n";
 				else output += formatSearchSummary(results, answer) + "\n\n";
 			}
 		}
@@ -947,6 +1085,7 @@ export default function (pi: ExtensionAPI) {
 							tokenEstimate: opts.summaryMeta?.tokenEstimate ?? 0,
 							fallbackUsed: opts.summaryMeta?.fallbackUsed === true,
 							fallbackReason: opts.summaryMeta?.fallbackReason,
+							phase: opts.summaryMeta?.phase,
 							edited: opts.summaryMeta?.edited === true,
 						},
 					}
@@ -981,9 +1120,23 @@ export default function (pi: ExtensionAPI) {
 		return { results, urls };
 	}
 
-	async function openCuratorBrowser(callId: string, pc: PendingCurate, searchesComplete = true): Promise<void> {
+	async function openCuratorBrowser(callId: string, pc: PendingCurate, ctx: ExtensionContext, searchesComplete = true): Promise<void> {
 		if (pendingCurates.get(callId) !== pc) return;
 		let handle: CuratorServerHandle | null = null;
+		const sendCuratorFallbackUpdate = (message: string) => {
+			if (!handle) return;
+			pc.onUpdate?.({
+				content: [{ type: "text", text: `${message}\nOpen manually: ${handle.url}` }],
+				details: {
+					phase: "curator-fallback",
+					progress: searchesComplete ? 1 : 0.5,
+					curatorUrl: handle.url,
+					timeoutSeconds: pc.timeoutSeconds,
+					shortcut: curateKey,
+					browserOpenError: pc.browserOpenError,
+				},
+			});
+		};
 		try {
 			pc.phase = "curating";
 
@@ -1156,20 +1309,6 @@ export default function (pi: ExtensionAPI) {
 			}
 			if (searchesComplete) handle.searchesDone();
 
-			const sendCuratorFallbackUpdate = (message: string) => {
-				pc.onUpdate?.({
-					content: [{ type: "text", text: `${message}\nOpen manually: ${handle.url}` }],
-					details: {
-						phase: "curator-fallback",
-						progress: searchesComplete ? 1 : 0.5,
-						curatorUrl: handle.url,
-						timeoutSeconds: pc.timeoutSeconds,
-						shortcut: curateKey,
-						browserOpenError: pc.browserOpenError,
-					},
-				});
-			};
-
 			pc.onUpdate?.({
 				content: [{ type: "text", text: searchesComplete ? "Waiting for summary approval in browser..." : "Searches streaming to browser..." }],
 				details: {
@@ -1220,7 +1359,7 @@ export default function (pi: ExtensionAPI) {
 			const [callId, pc] = entries[entries.length - 1];
 
 			if (pc.phase === "searching") {
-				pc.browserPromise = openCuratorBrowser(callId, pc, false);
+				pc.browserPromise = openCuratorBrowser(callId, pc, ctx, false);
 				ctx.ui.notify("Opening curator — remaining searches will stream in", "info");
 				return;
 			}
@@ -1259,12 +1398,12 @@ export default function (pi: ExtensionAPI) {
 	});
 
 	if (initConfig.webSearch?.enabled !== false) pi.registerTool({
-		name: "web_search",
+		name: toolNames.webSearch,
 		label: "Web Search",
 		description:
-			`Search the web using OpenAI, Brave, Parallel, Tavily, Exa, Perplexity, or Gemini. Returns an AI-synthesized answer with source citations. OpenAI web_search uses a Codex subscription or OpenAI API key. For comprehensive research, prefer queries (plural) with 2-4 varied angles over a single query — each query gets its own synthesized answer, so varying phrasing and scope gives much broader coverage. When includeContent is true, full page content is fetched in the background. Searches auto-open the interactive browser curator and stream results live; set workflow to "none" to skip curation or "auto-summary" for a model-generated summary without the browser curator. Provider auto-selects: OpenAI when suitable and available, then Exa, Brave, Parallel, Tavily, Perplexity, Gemini API, then Gemini Web.`,
+			`Search the web using OpenAI, Brave, Parallel, Tavily, SearXNG, Exa, Perplexity, Gemini, or AnySearch. Returns an AI-synthesized answer with source citations. OpenAI search uses a Codex subscription or OpenAI API key. AnySearch is available only when explicitly selected. For comprehensive research, prefer queries (plural) with 2-4 varied angles over a single query — each query gets its own synthesized answer, so varying phrasing and scope gives much broader coverage. When includeContent is true, full page content is fetched in the background. Searches auto-open the interactive browser curator and stream results live; set workflow to "none" to skip curation or "auto-summary" for a model-generated summary without the browser curator. The configured provider is used when provider is omitted or set to auto; omit provider unless explicitly overriding it. Without a configured provider, auto-selects OpenAI when suitable and available, then Exa, Brave, Parallel, Tavily, Perplexity, Gemini API, or Gemini Web. When SearXNG is configured, it is preferred first for local/private search.`,
 		promptSnippet:
-			"Use for web research questions. Prefer {queries:[...]} with 2-4 varied angles over a single query for broader coverage.",
+			"Use for web research questions. Prefer {queries:[...]} with 2-4 varied angles over a single query for broader coverage. Omit provider unless explicitly overriding the configured default.",
 		parameters: Type.Object({
 			query: Type.Optional(Type.String({ description: "Single search query. For research tasks, prefer 'queries' with multiple varied angles instead." })),
 			queries: Type.Optional(Type.Array(Type.String(), { description: "Multiple queries searched in sequence, each returning its own synthesized answer. Prefer this for research — vary phrasing, scope, and angle across 2-4 queries to maximize coverage. Good: ['React vs Vue performance benchmarks 2026', 'React vs Vue developer experience comparison', 'React ecosystem size vs Vue ecosystem']. Bad: ['React vs Vue', 'React vs Vue comparison', 'React vs Vue review'] (too similar, redundant results)." })),
@@ -1275,7 +1414,7 @@ export default function (pi: ExtensionAPI) {
 			),
 			domainFilter: Type.Optional(Type.Array(Type.String(), { description: "Limit to domains (prefix with - to exclude)" })),
 			provider: Type.Optional(
-				StringEnum(["auto", "openai", "brave", "parallel", "tavily", "exa", "perplexity", "gemini"], { description: "Search provider (default: auto)" }),
+				StringEnum(["auto", "openai", "brave", "parallel", "tavily", "searxng", "exa", "perplexity", "gemini", "serpdive", "anysearch"], { description: "Search provider; omit this field (preferred) to use the configured provider, or use auto when none is configured" }),
 			),
 			workflow: Type.Optional(
 				StringEnum(["none", "summary-review", "auto-summary"], {
@@ -1292,6 +1431,7 @@ export default function (pi: ExtensionAPI) {
 			const configWorkflow = loadConfigForExtensionInit().workflow;
 			const workflow = resolveWorkflow(params.workflow ?? configWorkflow, ctx?.hasUI !== false);
 			const shouldCurate = workflow === "summary-review";
+			const recencyFilter = normalizeRecencyFilter(params.recencyFilter);
 
 			if (queryList.length === 0) {
 				return {
@@ -1310,8 +1450,8 @@ export default function (pi: ExtensionAPI) {
 			if (shouldCurate) {
 				closeCurator(callId);
 
-				let resolvePromise: (value: unknown) => void = () => {};
-				const promise = new Promise<unknown>((resolve) => {
+				let resolvePromise: (value: AgentToolResult<Record<string, unknown>>) => void = () => {};
+				const promise = new Promise<AgentToolResult<Record<string, unknown>>>((resolve) => {
 					resolvePromise = resolve;
 				});
 				const includeContent = params.includeContent ?? false;
@@ -1323,14 +1463,14 @@ export default function (pi: ExtensionAPI) {
 					: searchAbort.signal;
 				let cancelled = false;
 
-				const bootstrap = await loadCuratorBootstrap(params.provider, ctx, {
+				const requestedProvider = resolveRequestedProvider(params.provider);
+				const bootstrap = await loadCuratorBootstrap(requestedProvider, ctx, {
 					numResults: params.numResults,
-					recencyFilter: params.recencyFilter,
+					recencyFilter,
 				});
 				const availableProviders = bootstrap.availableProviders;
 				const defaultProvider = bootstrap.defaultProvider;
-				const rawSearchProvider = normalizeProviderInput(params.provider ?? loadConfig().provider ?? "auto") ?? "auto";
-				const searchProvider = rawSearchProvider === "auto" ? "auto" : defaultProvider;
+				const searchProvider = requestedProvider;
 				const curatorTimeoutSeconds = bootstrap.timeoutSeconds;
 				const curatorWorkflow: CuratorWorkflow = "summary-review";
 
@@ -1351,7 +1491,7 @@ export default function (pi: ExtensionAPI) {
 					queryList,
 					includeContent,
 					numResults: params.numResults,
-					recencyFilter: params.recencyFilter,
+					recencyFilter,
 					domainFilter: params.domainFilter,
 					availableProviders,
 					defaultProvider,
@@ -1368,7 +1508,7 @@ export default function (pi: ExtensionAPI) {
 					cancel: () => {},
 				};
 
-				const finish = (value: unknown) => {
+				const finish = (value: AgentToolResult<Record<string, unknown>>) => {
 					if (cancelled) return;
 					cancelled = true;
 					pc.abortSearches();
@@ -1396,7 +1536,7 @@ export default function (pi: ExtensionAPI) {
 				const onAbort = () => closeCurator(callId);
 				pendingCurates.set(callId, pc);
 				signal?.addEventListener("abort", onAbort, { once: true });
-				pc.browserPromise = openCuratorBrowser(callId, pc, false);
+				pc.browserPromise = openCuratorBrowser(callId, pc, ctx, false);
 
 				for (let qi = 0; qi < queryList.length; qi++) {
 					if (signal?.aborted || cancelled || searchAbort.signal.aborted) break;
@@ -1409,7 +1549,7 @@ export default function (pi: ExtensionAPI) {
 						const { answer, results, inlineContent, provider } = await search(queryList[qi], {
 							provider: requestedProvider,
 							numResults: params.numResults,
-							recencyFilter: params.recencyFilter,
+							recencyFilter,
 							domainFilter: params.domainFilter,
 							includeContent: params.includeContent,
 							signal: searchSignal,
@@ -1478,7 +1618,7 @@ export default function (pi: ExtensionAPI) {
 			const searchResults: QueryResultData[] = [];
 			const allUrls: string[] = [];
 			const allInlineContent: ExtractedContent[] = [];
-			const resolvedProvider = normalizeProviderInput(params.provider ?? loadConfig().provider);
+			const resolvedProvider = resolveRequestedProvider(params.provider);
 
 			for (let i = 0; i < queryList.length; i++) {
 				const query = queryList[i];
@@ -1492,7 +1632,7 @@ export default function (pi: ExtensionAPI) {
 					const { answer, results, inlineContent, provider } = await search(query, {
 						provider: resolvedProvider,
 						numResults: params.numResults,
-						recencyFilter: params.recencyFilter,
+						recencyFilter,
 						domainFilter: params.domainFilter,
 						includeContent: params.includeContent,
 						signal,
@@ -1507,6 +1647,7 @@ export default function (pi: ExtensionAPI) {
 					}
 					if (inlineContent) allInlineContent.push(...inlineContent);
 				} catch (err) {
+					if (signal?.aborted || isAbortError(err)) throw err;
 					const message = err instanceof Error ? err.message : String(err);
 					const requestedProvider = typeof resolvedProvider === "string" && resolvedProvider !== "auto"
 						? resolvedProvider
@@ -1615,6 +1756,7 @@ export default function (pi: ExtensionAPI) {
 					tokenEstimate: number;
 					fallbackUsed: boolean;
 					fallbackReason?: string;
+					phase?: "summary-model" | "deterministic-fallback";
 					edited?: boolean;
 				};
 			};
@@ -1695,12 +1837,13 @@ export default function (pi: ExtensionAPI) {
 					`duration=${details.summary.durationMs}ms`,
 					`tokens~${details.summary.tokenEstimate}`,
 					details.summary.fallbackUsed ? "fallback=true" : "fallback=false",
+					details.summary.phase ? `phase=${details.summary.phase}` : "",
 					details.summary.edited ? "edited=true" : "edited=false",
 				];
 				if (details.summary.fallbackReason) {
 					metaParts.push(`reason=${details.summary.fallbackReason}`);
 				}
-				lines.push(theme.fg("dim", "  " + metaParts.join(" · ")));
+				lines.push(theme.fg("dim", "  " + metaParts.filter(Boolean).join(" · ")));
 			}
 
 			const queryDetails = details?.curatedQueries;
@@ -1806,10 +1949,107 @@ export default function (pi: ExtensionAPI) {
 		},
 	});
 
+	if (initConfig.webSearch?.enabled !== false) pi.registerTool({
+		name: toolNames.sourceCheck,
+		label: "Source Check",
+		description: "Check a claim against web sources and return a bounded machine-readable research artifact with exact passage citations.",
+		promptSnippet: "Verify a claim with structured source evidence and passage-level citations.",
+		parameters: Type.Object({
+			claim: Type.String({ description: "The assertion to check against web sources." }),
+			queries: Type.Optional(Type.Array(Type.String(), { description: "Search queries (default: the claim)." })),
+			numResults: Type.Optional(Type.Number({ description: "Results per query (default: 5, max: 20)." })),
+			fetchContent: Type.Optional(Type.Boolean({ description: "Fetch up to 5 result pages for exact passage extraction." })),
+			recencyFilter: Type.Optional(StringEnum(["day", "week", "month", "year"], { description: "Filter by recency." })),
+			domainFilter: Type.Optional(Type.Array(Type.String(), { description: "Limit to domains; prefix with - to exclude." })),
+			provider: Type.Optional(StringEnum(["auto", "openai", "brave", "parallel", "tavily", "searxng", "exa", "perplexity", "gemini", "serpdive", "anysearch"], { description: "Search provider." })),
+		}),
+		async execute(_callId, params, signal, _onUpdate, ctx) {
+			const claim = typeof params.claim === "string" ? params.claim.trim() : "";
+			if (!claim) {
+				return { content: [{ type: "text", text: "Error: 'claim' is required." }], details: { error: "Missing claim" } };
+			}
+
+			const requestedQueries = Array.isArray(params.queries)
+				? params.queries.filter((query): query is string => typeof query === "string").map((query) => query.trim()).filter(Boolean)
+				: [];
+			const queries = (requestedQueries.length > 0 ? requestedQueries : [claim]).slice(0, 8);
+			const numResults = typeof params.numResults === "number" && Number.isFinite(params.numResults)
+				? Math.min(20, Math.max(1, Math.floor(params.numResults)))
+				: 5;
+			const domainFilter = Array.isArray(params.domainFilter)
+				? params.domainFilter.filter((domain): domain is string => typeof domain === "string")
+				: undefined;
+			const recencyFilter = normalizeRecencyFilter(params.recencyFilter);
+			const resultsByUrl = new Map<string, SearchResult>();
+			const summaries: string[] = [];
+			const errors: Array<{ query: string; error: string }> = [];
+			let provider: string | undefined;
+
+			for (const query of queries) {
+				if (signal?.aborted) break;
+				try {
+					const response = await search(query, {
+						provider: resolveRequestedProvider(params.provider),
+						numResults,
+						recencyFilter,
+						domainFilter,
+						signal,
+						extensionContext: ctx,
+					});
+					if (signal?.aborted) break;
+					provider ??= response.provider;
+					if (response.answer) summaries.push(`${query}: ${response.answer}`);
+					for (const result of response.results) {
+						if (!resultsByUrl.has(result.url)) resultsByUrl.set(result.url, result);
+					}
+				} catch (err) {
+					if (signal?.aborted || isAbortError(err)) break;
+					errors.push({ query, error: err instanceof Error ? err.message : String(err) });
+				}
+			}
+
+			const results = [...resultsByUrl.values()].slice(0, 20).map((result, index) => ({ ...result, rank: index + 1 }));
+			let fetched: ExtractedContent[] = [];
+			if (params.fetchContent && results.length > 0) {
+				const urls = results.slice(0, 5).map((result) => result.url);
+				fetched = (await Promise.all(urls.map(async (url) => {
+					try {
+						const [page] = await fetchAllContent([url], signal);
+						return page;
+					} catch (err) {
+						if (signal?.aborted || isAbortError(err)) throw err;
+						return { url, title: "", content: "", error: err instanceof Error ? err.message : String(err) };
+					}
+				}))).filter((page): page is ExtractedContent => Boolean(page));
+			}
+			const artifact = withClaimAssessment(buildResearchArtifact({
+				query: claim,
+				provider,
+				summary: summaries.length > 0 ? summaries.join("\n\n") : undefined,
+				results,
+				fetched,
+				recency: recencyFilter,
+				domainFilter,
+			}), [claim]);
+			if (errors.length > 0) artifact.errors = errors;
+			storeResearchArtifact(artifact);
+			pi.appendEntry("web-search-results", {
+				id: artifact.id,
+				type: "research",
+				timestamp: artifact.timestamp,
+				artifact,
+			});
+			return {
+				content: [{ type: "text", text: formatSourceCheckResult(artifact, toolNames.getSearchContent) }],
+				details: { responseId: artifact.id, artifact, sourceCount: artifact.sources.length, passageCount: artifact.passages.length },
+			};
+		},
+	});
+
 	pi.registerTool({
-		name: "fetch_content",
+		name: toolNames.fetchContent,
 		label: "Fetch Content",
-		description: "Fetch URL(s) and extract readable content as markdown. Supports YouTube video transcripts (with thumbnail), GitHub repository contents, and local video files (with frame thumbnail). Video frames can be extracted via timestamp/range or sampled across the entire video with frames alone. Falls back to Gemini for pages that block bots or fail Readability extraction. For YouTube and video files: ALWAYS pass the user's specific question via the prompt parameter — this directs the AI to focus on that aspect of the video, producing much better results than a generic extraction. Content is always stored and can be retrieved with get_search_content.",
+		description: `Fetch URL(s) and extract readable content as markdown. Supports YouTube video transcripts (with thumbnail), GitHub repository contents, and local video files (with frame thumbnail). Video frames can be extracted via timestamp/range or sampled across the entire video with frames alone. Falls back to Gemini for pages that block bots or fail Readability extraction. For YouTube and video files: ALWAYS pass the user's specific question via the prompt parameter — this directs the AI to focus on that aspect of the video, producing much better results than a generic extraction. Content is always stored and can be retrieved with ${toolNames.getSearchContent}.`,
 		promptSnippet:
 			"Use to extract readable content from URL(s), YouTube, GitHub repos, or local videos. For video questions, pass the user's exact question in prompt.",
 		parameters: Type.Object({
@@ -1834,7 +2074,7 @@ export default function (pi: ExtensionAPI) {
 			})),
 		}),
 
-		async execute(_toolCallId, params, signal, onUpdate) {
+		async execute(_toolCallId, params, signal, onUpdate): Promise<AgentToolResult<Record<string, unknown>>> {
 			const { urlList, options } = normalizeFetchContentParams(params);
 			if (urlList.length === 0) {
 				return {
@@ -1881,10 +2121,10 @@ export default function (pi: ExtensionAPI) {
 
 				if (truncated) {
 					output += `\n\n---\nShowing ${MAX_INLINE_CONTENT} of ${fullLength} chars. ` +
-						`Use get_search_content({ responseId: "${responseId}", urlIndex: 0 }) for full content.`;
+						`Use ${toolNames.getSearchContent}({ responseId: "${responseId}", urlIndex: 0, offset: ${MAX_INLINE_CONTENT} }) for the next slice.`;
 				}
 
-				const content: Array<{ type: string; text?: string; data?: string; mimeType?: string }> = [];
+				const content: Array<TextContent | ImageContent> = [];
 				if (result.frames?.length) {
 					for (const frame of result.frames) {
 						content.push({ type: "image", data: frame.data, mimeType: frame.mimeType });
@@ -1925,7 +2165,7 @@ export default function (pi: ExtensionAPI) {
 					output += `- ${title || url} (${content.length} chars)\n`;
 				}
 			}
-			output += `\n---\nUse get_search_content({ responseId: "${responseId}", urlIndex: 0 }) to retrieve full content.`;
+			output += `\n---\nUse ${toolNames.getSearchContent}({ responseId: "${responseId}", urlIndex: 0 }) to retrieve bounded content slices.`;
 
 			return {
 				content: [{ type: "text", text: output }],
@@ -2146,25 +2386,56 @@ export default function (pi: ExtensionAPI) {
 	});
 
 	pi.registerTool({
-		name: "get_search_content",
+		name: toolNames.getSearchContent,
 		label: "Get Search Content",
-		description: "Retrieve full content from a previous web_search or fetch_content call.",
+		description: `Retrieve bounded content slices from a previous ${storedContentSources} call.`,
 		promptSnippet:
-			"Use after web_search/fetch_content when full stored content is needed via responseId plus query/url selectors.",
+			`Use after ${storedContentSources} to retrieve stored content via responseId plus query/url selectors. Fetched URL content is returned in bounded slices; use offset/limit to continue.`,
 		parameters: Type.Object({
-			responseId: Type.String({ description: "The responseId from web_search or fetch_content" }),
-			query: Type.Optional(Type.String({ description: "Get content for this query (web_search)" })),
+			responseId: Type.String({ description: `The responseId from ${storedContentSources}` }),
+			query: Type.Optional(Type.String({ description: searchQueryDescription })),
 			queryIndex: Type.Optional(Type.Number({ description: "Get content for query at index" })),
 			url: Type.Optional(Type.String({ description: "Get content for this URL" })),
 			urlIndex: Type.Optional(Type.Number({ description: "Get content for URL at index" })),
+			offset: Type.Optional(Type.Number({ description: "Character offset for fetched URL content slices (default 0)" })),
+			limit: Type.Optional(Type.Number({ description: `Maximum characters to return for fetched URL content slices (default/max ${MAX_CONTENT_SLICE_LENGTH})` })),
 		}),
 
-		async execute(_toolCallId, params) {
+		async execute(_toolCallId, params): Promise<AgentToolResult<Record<string, unknown>>> {
 			const data = getResult(params.responseId);
 			if (!data) {
 				return {
 					content: [{ type: "text", text: `Error: No stored results for "${params.responseId}"` }],
 					details: { error: "Not found", responseId: params.responseId },
+				};
+			}
+
+			if (data.type === "research") {
+				const artifact = getResearchArtifact(params.responseId);
+				if (!artifact) {
+					return {
+						content: [{ type: "text", text: `Error: artifact ${params.responseId} not found` }],
+						details: { error: "Artifact not found", responseId: params.responseId },
+					};
+				}
+				const serialized = JSON.stringify(artifact, null, 2);
+				const offset = params.offset ?? 0;
+				const limit = params.limit ?? MAX_CONTENT_SLICE_LENGTH;
+				if (!Number.isInteger(offset) || offset < 0) {
+					return { content: [{ type: "text", text: "offset must be a non-negative integer" }], details: { error: "Invalid offset", offset } };
+				}
+				if (!Number.isInteger(limit) || limit <= 0 || limit > MAX_CONTENT_SLICE_LENGTH) {
+					return { content: [{ type: "text", text: `limit must be an integer from 1 to ${MAX_CONTENT_SLICE_LENGTH}` }], details: { error: "Invalid limit", limit, maxLimit: MAX_CONTENT_SLICE_LENGTH } };
+				}
+				if (offset > serialized.length) {
+					return { content: [{ type: "text", text: `offset ${offset} is out of range (0-${serialized.length})` }], details: { error: "Offset out of range", offset, contentLength: serialized.length } };
+				}
+				const endOffset = Math.min(offset + limit, serialized.length);
+				const artifactSlice = serialized.slice(offset, endOffset);
+				const hasMore = endOffset < serialized.length;
+				return {
+					content: [{ type: "text", text: artifactSlice }],
+					details: { responseId: artifact.id, type: "research", contentLength: serialized.length, offset, limit, returnedChars: artifactSlice.length, nextOffset: hasMore ? endOffset : null, truncated: hasMore },
 				};
 			}
 
@@ -2211,9 +2482,11 @@ export default function (pi: ExtensionAPI) {
 
 			if (data.type === "fetch" && data.urls) {
 				let urlData: ExtractedContent | undefined;
+				let selectedUrlIndex = -1;
 
 				if (params.url !== undefined) {
-					urlData = data.urls.find((u) => u.url === params.url);
+					selectedUrlIndex = data.urls.findIndex((u) => u.url === params.url);
+					urlData = data.urls[selectedUrlIndex];
 					if (!urlData) {
 						const available = data.urls.map((u) => u.url).join("\n  ");
 						return {
@@ -2222,7 +2495,8 @@ export default function (pi: ExtensionAPI) {
 						};
 					}
 				} else if (params.urlIndex !== undefined) {
-					urlData = data.urls[params.urlIndex];
+					selectedUrlIndex = params.urlIndex;
+					urlData = data.urls[selectedUrlIndex];
 					if (!urlData) {
 						return {
 							content: [{ type: "text", text: `Index ${params.urlIndex} out of range (0-${data.urls.length - 1})` }],
@@ -2244,9 +2518,50 @@ export default function (pi: ExtensionAPI) {
 					};
 				}
 
+				const offset = params.offset ?? 0;
+				const limit = params.limit ?? DEFAULT_CONTENT_SLICE_LENGTH;
+				if (!Number.isInteger(offset) || offset < 0) {
+					return {
+						content: [{ type: "text", text: "offset must be a non-negative integer" }],
+						details: { error: "Invalid offset", offset },
+					};
+				}
+				if (!Number.isInteger(limit) || limit <= 0 || limit > MAX_CONTENT_SLICE_LENGTH) {
+					return {
+						content: [{ type: "text", text: `limit must be an integer from 1 to ${MAX_CONTENT_SLICE_LENGTH}` }],
+						details: { error: "Invalid limit", limit, maxLimit: MAX_CONTENT_SLICE_LENGTH },
+					};
+				}
+				if (offset > urlData.content.length) {
+					return {
+						content: [{ type: "text", text: `offset ${offset} is out of range (0-${urlData.content.length})` }],
+						details: { error: "Offset out of range", offset, contentLength: urlData.content.length },
+					};
+				}
+
+				const endOffset = Math.min(offset + limit, urlData.content.length);
+				const contentSlice = urlData.content.slice(offset, endOffset);
+				const hasMore = endOffset < urlData.content.length;
+				let text = `# ${urlData.title || urlData.url}\n\n${contentSlice}`;
+				if (hasMore || offset > 0) {
+					text += `\n\n---\nShowing chars ${offset}-${endOffset} of ${urlData.content.length}.`;
+					if (hasMore) {
+						text += ` Use ${toolNames.getSearchContent}({ responseId: "${params.responseId}", urlIndex: ${selectedUrlIndex}, offset: ${endOffset}, limit: ${limit} }) for the next slice.`;
+					}
+				}
+
 				return {
-					content: [{ type: "text", text: `# ${urlData.title}\n\n${urlData.content}` }],
-					details: { url: urlData.url, title: urlData.title, contentLength: urlData.content.length },
+					content: [{ type: "text", text }],
+					details: {
+						url: urlData.url,
+						title: urlData.title,
+						contentLength: urlData.content.length,
+						offset,
+						limit,
+						returnedChars: contentSlice.length,
+						nextOffset: hasMore ? endOffset : null,
+						truncated: hasMore,
+					},
 				};
 			}
 
@@ -2257,18 +2572,20 @@ export default function (pi: ExtensionAPI) {
 		},
 
 		renderCall(args, theme) {
-			const { responseId, query, queryIndex, url, urlIndex } = args as {
+			const { responseId, query, queryIndex, url, urlIndex, offset } = args as {
 				responseId: string;
 				query?: string;
 				queryIndex?: number;
 				url?: string;
 				urlIndex?: number;
+				offset?: number;
 			};
 			let target = "";
 			if (query) target = `query="${query}"`;
 			else if (queryIndex !== undefined) target = `queryIndex=${queryIndex}`;
 			else if (url) target = url.length > 30 ? url.slice(0, 27) + "..." : url;
 			else if (urlIndex !== undefined) target = `urlIndex=${urlIndex}`;
+			if (offset !== undefined) target += target ? ` @ ${offset}` : `offset=${offset}`;
 			return new Text(theme.fg("toolTitle", theme.bold("get_content ")) + theme.fg("accent", target || responseId.slice(0, 8)), 0, 0);
 		},
 
@@ -2280,6 +2597,9 @@ export default function (pi: ExtensionAPI) {
 				title?: string;
 				resultCount?: number;
 				contentLength?: number;
+				offset?: number;
+				returnedChars?: number;
+				nextOffset?: number | null;
 			};
 
 			if (details?.error) {
@@ -2296,7 +2616,13 @@ export default function (pi: ExtensionAPI) {
 			if (details?.query) {
 				statusLine = theme.fg("success", `"${details.query}"`) + theme.fg("muted", ` (${details.resultCount} results)`);
 			} else {
-				statusLine = theme.fg("success", details?.title || "Content") + theme.fg("muted", ` (${details?.contentLength ?? 0} chars)`);
+				const start = details?.offset ?? 0;
+				const returned = details?.returnedChars ?? details?.contentLength ?? 0;
+				const end = start + returned;
+				const slice = details?.nextOffset !== undefined || start > 0
+					? `, showing ${start}-${end}`
+					: "";
+				statusLine = theme.fg("success", details?.title || "Content") + theme.fg("muted", ` (${details?.contentLength ?? 0} chars${slice})`);
 			}
 
 			if (!expanded) {
@@ -2334,7 +2660,7 @@ export default function (pi: ExtensionAPI) {
 			const curatorTimeoutSeconds = bootstrap.timeoutSeconds;
 			let currentProvider = initialProvider;
 			const rawSearchProvider = normalizeProviderInput(loadConfig().provider ?? "auto") ?? "auto";
-			let currentSearchProvider = rawSearchProvider === "auto" ? "auto" : initialProvider;
+			let currentSearchProvider: SearchProvider = rawSearchProvider === "auto" ? "auto" : initialProvider;
 			const summaryContext: SummaryGenerationContext = {
 				model: ctx.model,
 				modelRegistry: ctx.modelRegistry,
@@ -2587,10 +2913,10 @@ export default function (pi: ExtensionAPI) {
 			}
 
 			const label = newWorkflow === "none"
-				? "Curator disabled — web_search will return raw results"
+				? `Curator disabled — ${toolNames.webSearch} will return raw results`
 				: newWorkflow === "auto-summary"
-					? "Auto-summary enabled — web_search will generate a summary without opening the curator"
-					: "Curator enabled — web_search will open curator and auto-generate a summary draft";
+					? `Auto-summary enabled — ${toolNames.webSearch} will generate a summary without opening the curator`
+					: `Curator enabled — ${toolNames.webSearch} will open curator and auto-generate a summary draft`;
 			pi.sendMessage({
 				customType: "curator-config",
 				content: [{ type: "text", text: label }],
@@ -2615,11 +2941,15 @@ export default function (pi: ExtensionAPI) {
 
 			const cookies = await isGeminiWebAvailable();
 			if (!cookies) {
+				const diagnostic = getGeminiWebAvailabilityDiagnostic();
+				const text = diagnostic
+					? `Gemini Web is unavailable: ${diagnostic}`
+					: "Gemini Web is unavailable. Sign into gemini.google.com in a supported Chromium-based browser.";
 				pi.sendMessage({
 					customType: "google-account",
-					content: [{ type: "text", text: "Gemini Web is unavailable. Sign into gemini.google.com in a supported Chromium-based browser." }],
+					content: [{ type: "text", text }],
 					display: true,
-					details: { available: false, cookieAccessAllowed: true },
+					details: { available: false, cookieAccessAllowed: true, diagnostic },
 				}, { triggerTurn: true, deliverAs: "followUp" });
 				return;
 			}

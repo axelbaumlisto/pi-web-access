@@ -2,8 +2,9 @@ import { existsSync, readFileSync } from "node:fs";
 import { activityMonitor } from "./activity.ts";
 import type { ExtractedContent } from "./extract.ts";
 import type { SearchOptions, SearchResponse } from "./perplexity.ts";
+import { hasCredentialSource, redactCredential, resolveCredential } from "./credential-source.ts";
 import { getWebSearchConfigPath } from "./utils.ts";
-import { providerApiKey, providerUrl } from "./provider-endpoints.ts";
+import { providerProxyApiKey, providerUrl } from "./provider-endpoints.ts";
 
 // Endpoint override lives in provider-endpoints.ts (env > config > default).
 const TAVILY_API_URL = () => providerUrl("tavily");
@@ -49,18 +50,21 @@ function loadConfig(): WebSearchConfig {
 	}
 }
 
-function normalizeApiKey(value: unknown): string | null {
-	if (typeof value !== "string") return null;
-	const normalized = value.trim();
-	return normalized.length > 0 ? normalized : null;
+async function getApiKey(signal?: AbortSignal): Promise<string | null> {
+	// Destination-first: when the endpoint resolved to the unified proxy, the
+	// shared proxy key is the only correct credential.
+	const proxyKey = providerProxyApiKey("tavily");
+	if (proxyKey !== null) return proxyKey;
+	return resolveCredential({
+		provider: "Tavily",
+		configuredValue: loadConfig().tavilyApiKey,
+		environmentValue: process.env.TAVILY_API_KEY,
+		signal,
+	});
 }
 
-function getApiKey(): string | null {
-	return providerApiKey("tavily");
-}
-
-function requireApiKey(): string {
-	const apiKey = getApiKey();
+async function requireApiKey(signal?: AbortSignal): Promise<string> {
+	const apiKey = await getApiKey(signal);
 	if (!apiKey) {
 		throw new Error(
 			"Tavily API key not found. Either:\n" +
@@ -146,10 +150,16 @@ function mapInlineContent(results: TavilyResult[] | undefined): ExtractedContent
 }
 
 export function isTavilyAvailable(): boolean {
-	return !!getApiKey();
+	if (providerProxyApiKey("tavily") !== null) return true;
+	return hasCredentialSource({
+		provider: "Tavily",
+		configuredValue: loadConfig().tavilyApiKey,
+		environmentValue: process.env.TAVILY_API_KEY,
+	});
 }
 
 export async function searchWithTavily(query: string, options: TavilySearchOptions = {}): Promise<SearchResponse> {
+	const apiKey = await requireApiKey(options.signal);
 	const numResults = normalizeCount(options.numResults);
 	const body: Record<string, unknown> = {
 		query,
@@ -167,7 +177,7 @@ export async function searchWithTavily(query: string, options: TavilySearchOptio
 		response = await fetch(TAVILY_API_URL(), {
 			method: "POST",
 			headers: {
-				"Authorization": `Bearer ${requireApiKey()}`,
+				"Authorization": `Bearer ${apiKey}`,
 				"Content-Type": "application/json",
 			},
 			body: JSON.stringify(body),
@@ -175,14 +185,18 @@ export async function searchWithTavily(query: string, options: TavilySearchOptio
 		});
 	} catch (err) {
 		const message = errorMessage(err);
-		if (message.toLowerCase().includes("abort")) activityMonitor.logComplete(activityId, 0);
-		else activityMonitor.logError(activityId, message);
-		throw err;
+		const redactedMessage = redactCredential(message, apiKey);
+		if (redactedMessage.toLowerCase().includes("abort")) activityMonitor.logComplete(activityId, 0);
+		else activityMonitor.logError(activityId, redactedMessage);
+		if (redactedMessage === message) throw err;
+		const redactedError = new Error(redactedMessage);
+		if (err instanceof Error) redactedError.name = err.name;
+		throw redactedError;
 	}
 
 	if (!response.ok) {
 		activityMonitor.logComplete(activityId, response.status);
-		const errorText = await response.text();
+		const errorText = redactCredential(await response.text(), apiKey);
 		throw new Error(`Tavily API error ${response.status}: ${errorText.slice(0, 300)}`);
 	}
 

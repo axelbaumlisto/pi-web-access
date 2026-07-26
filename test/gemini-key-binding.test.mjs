@@ -40,7 +40,7 @@ const inspectGeminiKey = `
 		buildAuthHeaders,
 		isGeminiApiAvailable,
 	} = await import(${JSON.stringify(geminiApiUrl)});
-	const apiKey = getApiKey();
+	const apiKey = await getApiKey();
 	console.log(JSON.stringify({
 		apiHost: getApiHost(),
 		apiKey,

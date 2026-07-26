@@ -1,10 +1,12 @@
 {
   "name": "pi-ext-int-search",
-  "version": "1.0.1",
-  "description": "Hardened fork of nicobailon/pi-web-access with our own settings + added internal search. External + internal search for the Pi coding agent. EXTERNAL: web_search across OpenAI, Brave, Parallel, Tavily, Exa, Perplexity, Gemini (with URL fetch, GitHub clone, PDF, YouTube/video understanding). INTERNAL: memory_search over your own pi chat sessions, claude-recall memories, project docs, and git history.",
+  "version": "1.1.0",
+  "description": "Hardened fork of nicobailon/pi-web-access (synced to v0.14.0) with our own settings + added internal search. External + internal search for the Pi coding agent. EXTERNAL: web_search across OpenAI, Brave, Parallel, Tavily, SERPdive, AnySearch, SearXNG, Exa, Perplexity, Gemini (with URL fetch, GitHub clone, PDF, YouTube/video understanding, Firecrawl extraction). INTERNAL: memory_search over your own pi chat sessions, claude-recall memories, project docs, and git history.",
   "type": "module",
   "scripts": {
-    "test": "node --test"
+    "test": "node --test",
+    "typecheck": "tsc",
+    "audit:runtime": "npm audit --omit=dev --omit=peer"
   },
   "keywords": [
     "pi-package",
@@ -31,18 +33,31 @@
     "url": "https://github.com/axelbaumlisto/pi-web-access/issues"
   },
   "homepage": "https://github.com/axelbaumlisto/pi-web-access#readme",
+  "files": [
+    "*.ts",
+    "CHANGELOG.md",
+    "SECURITY.md",
+    "banner.png",
+    "pi-web-fetch-demo.mp4",
+    "skills"
+  ],
+  "devDependencies": {
+    "@types/turndown": "^5.0.6",
+    "typescript": "^7.0.2"
+  },
   "dependencies": {
     "@mozilla/readability": "^0.6.0",
     "linkedom": "^0.16.0",
     "p-limit": "^6.1.0",
+    "promise.try": "^2.0.1",
     "turndown": "^7.2.0",
+    "typebox": "^1.1.38",
     "unpdf": "^1.6.2"
   },
   "peerDependencies": {
     "@earendil-works/pi-ai": "*",
     "@earendil-works/pi-coding-agent": "*",
-    "@earendil-works/pi-tui": "*",
-    "typebox": "*"
+    "@earendil-works/pi-tui": "*"
   },
   "pi": {
     "extensions": [

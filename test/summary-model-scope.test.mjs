@@ -3,12 +3,107 @@ import { mkdir, mkdtemp, writeFile } from "node:fs/promises";
 import { readFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import test from "node:test";
+import { after, test } from "node:test";
 
 import { loadEnabledModelPatterns, modelMatchesEnabledPatterns } from "../summary-model-scope.ts";
+import { generateSummaryDraft, SUMMARY_GENERATION_DEADLINE_MS } from "../summary-review.ts";
 
 const indexSrc = readFileSync(new URL("../index.ts", import.meta.url), "utf8");
 const summarySrc = readFileSync(new URL("../summary-review.ts", import.meta.url), "utf8");
+
+function summaryContext() {
+	const model = { provider: "anthropic", id: "claude-haiku-4-5" };
+	return {
+		modelRegistry: {
+			find: () => model,
+			getApiKeyAndHeaders: async () => ({ ok: true, apiKey: "test-key" }),
+		},
+		cwd: process.cwd(),
+		isProjectTrusted: () => false,
+	};
+}
+
+const summaryResults = [{
+	query: "test query",
+	answer: "A test answer.",
+	results: [{ title: "Test source", url: "https://example.com" }],
+	error: null,
+	provider: "test",
+}];
+
+const previousAgentDir = process.env.PI_CODING_AGENT_DIR;
+const testAgentDir = await mkdtemp(join(tmpdir(), "pi-web-access-summary-deadline-"));
+await writeFile(join(testAgentDir, "settings.json"), JSON.stringify({ enabledModels: ["anthropic/claude-haiku-4-5"] }));
+process.env.PI_CODING_AGENT_DIR = testAgentDir;
+after(() => {
+	if (previousAgentDir === undefined) delete process.env.PI_CODING_AGENT_DIR;
+	else process.env.PI_CODING_AGENT_DIR = previousAgentDir;
+});
+
+test("never-settling summary completion returns a deterministic deadline fallback", async () => {
+	let completionSignal;
+	const neverSettles = new Promise(() => {});
+	const startedAt = Date.now();
+	const result = await generateSummaryDraft(
+		summaryResults,
+		summaryContext(),
+		undefined,
+		undefined,
+		undefined,
+		(_model, _request, options) => {
+			completionSignal = options.signal;
+			return neverSettles;
+		},
+		20,
+	);
+
+	assert.ok(Date.now() - startedAt < 500);
+	assert.equal(result.meta.fallbackUsed, true);
+	assert.equal(result.meta.fallbackReason, "summary-generation-timeout");
+	assert.equal(result.meta.phase, "deterministic-fallback");
+	assert.equal(completionSignal.aborted, true);
+});
+
+test("model resolution errors after the deadline return timeout fallback", async () => {
+	const context = summaryContext();
+	context.modelRegistry.getApiKeyAndHeaders = async () => {
+		await new Promise(resolve => setTimeout(resolve, 30));
+		throw new Error("late auth failure");
+	};
+
+	const result = await generateSummaryDraft(
+		summaryResults,
+		context,
+		undefined,
+		undefined,
+		undefined,
+		undefined,
+		10,
+	);
+
+	assert.equal(result.meta.fallbackUsed, true);
+	assert.equal(result.meta.fallbackReason, "summary-generation-timeout");
+	assert.equal(result.meta.phase, "deterministic-fallback");
+});
+
+test("caller abort takes precedence over a pending summary completion", async () => {
+	const controller = new AbortController();
+	const neverSettles = new Promise(() => {});
+	setTimeout(() => controller.abort(), 10);
+
+	await assert.rejects(
+		() => generateSummaryDraft(
+			summaryResults,
+			summaryContext(),
+			controller.signal,
+			undefined,
+			undefined,
+			() => neverSettles,
+			1000,
+		),
+		/Aborted/,
+	);
+});
 
 test("summary model scope matches nested provider model ids and thinking suffixes", () => {
 	assert.equal(
@@ -59,6 +154,13 @@ test("enabledModels loading uses trusted project settings over global settings",
 			process.env.PI_CODING_AGENT_DIR = previous;
 		}
 	}
+});
+
+test("summary generation has a hard deadline and preserves caller cancellation", () => {
+	assert.equal(SUMMARY_GENERATION_DEADLINE_MS, 30_000);
+	assert.match(summarySrc, /Promise\.race\(contenders\)/);
+	assert.match(summarySrc, /deadlineController\.abort\(\)/);
+	assert.match(summarySrc, /void operation\.then\(\(\) => undefined, \(\) => undefined\)/);
 });
 
 test("summary generation no longer uses catalog fallback or first available model", () => {

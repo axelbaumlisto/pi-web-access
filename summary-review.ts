@@ -1,4 +1,4 @@
-import { complete, type Message, type Model } from "@earendil-works/pi-ai/compat";
+import { complete, type Api, type Message, type Model } from "@earendil-works/pi-ai/compat";
 import type { ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { loadEnabledModelPatterns, modelMatchesEnabledPatterns } from "./summary-model-scope.ts";
 import type { QueryResultData } from "./storage.ts";
@@ -8,12 +8,15 @@ const PREFERRED_SUMMARY_MODELS = [
 	{ provider: "openai-codex", id: "gpt-5.3-codex-spark" },
 ] as const;
 
+export const SUMMARY_GENERATION_DEADLINE_MS = 30_000;
+
 export interface SummaryMeta {
 	model: string | null;
 	durationMs: number;
 	tokenEstimate: number;
 	fallbackUsed: boolean;
 	fallbackReason?: string;
+	phase?: "summary-model" | "deterministic-fallback";
 	edited?: boolean;
 }
 
@@ -173,6 +176,7 @@ export function buildDeterministicSummary(results: QueryResultData[]): { summary
 			tokenEstimate: estimateTokens(nonEmptySummary),
 			fallbackUsed: true,
 			fallbackReason: "deterministic-submit-fallback",
+			phase: "deterministic-fallback",
 			edited: false,
 		},
 	};
@@ -192,14 +196,14 @@ function parseModelSelector(value: string): { provider: string; id: string } {
 async function resolveSummaryModelCandidates(
 	ctx: SummaryGenerationContext,
 	modelOverride?: string,
-): Promise<{ candidates: Array<{ model: Model; apiKey: string; headers?: Record<string, string> }>; errors: string[] }> {
+): Promise<{ candidates: Array<{ model: Model<Api>; apiKey: string; headers?: Record<string, string> }>; errors: string[] }> {
 	const enabledModelPatterns = loadEnabledModelPatterns(ctx);
 	const specs: Array<{ provider: string; id: string }> = [];
 	const normalizedOverride = typeof modelOverride === "string" ? modelOverride.trim() : "";
 	if (normalizedOverride.length > 0) specs.push(parseModelSelector(normalizedOverride));
 	specs.push(...PREFERRED_SUMMARY_MODELS);
 
-	const candidates: Array<{ model: Model; apiKey: string; headers?: Record<string, string> }> = [];
+	const candidates: Array<{ model: Model<Api>; apiKey: string; headers?: Record<string, string> }> = [];
 	const errors: string[] = [];
 	const seen = new Set<string>();
 	for (const spec of specs) {
@@ -226,12 +230,17 @@ async function resolveSummaryModelCandidates(
 	return { candidates, errors };
 }
 
-function buildFallbackSummary(results: QueryResultData[], fallbackReason: string): { summary: string; meta: SummaryMeta } {
+function buildFallbackSummary(
+	results: QueryResultData[],
+	fallbackReason: string,
+	durationMs = 0,
+): { summary: string; meta: SummaryMeta } {
 	const deterministic = buildDeterministicSummary(results);
 	return {
 		summary: deterministic.summary,
 		meta: {
 			...deterministic.meta,
+			durationMs,
 			fallbackReason,
 		},
 	};
@@ -264,63 +273,127 @@ export async function generateSummaryDraft(
 	signal?: AbortSignal,
 	modelOverride?: string,
 	feedback?: string,
+	completeFn: typeof complete = complete,
+	deadlineMs = SUMMARY_GENERATION_DEADLINE_MS,
 ): Promise<{ summary: string; meta: SummaryMeta }> {
 	if (!ctx || !ctx.modelRegistry) {
 		throw new Error("Summary generation context unavailable");
 	}
 
-	const prompt = buildSummaryPrompt(results, feedback);
-	let resolved: Awaited<ReturnType<typeof resolveSummaryModelCandidates>>;
-	try {
-		resolved = await resolveSummaryModelCandidates(ctx, modelOverride);
-	} catch (err) {
-		const message = err instanceof Error ? err.message : String(err);
-		return buildFallbackSummary(results, `summary-model-settings-error: ${message}`);
-	}
+	const generationStartedAt = Date.now();
+	const deadlineController = new AbortController();
+	const deadlineMarker = Symbol("summary-generation-deadline");
+	let deadlineTimer: ReturnType<typeof setTimeout> | undefined;
+	let resolveDeadline!: () => void;
+	const deadlinePromise = new Promise<typeof deadlineMarker>(resolve => {
+		resolveDeadline = () => resolve(deadlineMarker);
+		deadlineTimer = setTimeout(() => {
+			deadlineController.abort();
+			resolveDeadline();
+		}, deadlineMs);
+	});
 
-	let lastError = resolved.errors.at(-1);
-	for (const { model, apiKey, headers } of resolved.candidates) {
-		const startedAt = Date.now();
-		try {
-			const userMessage: Message = {
-				role: "user",
-				content: [{ type: "text", text: prompt }],
-				timestamp: Date.now(),
-			};
+	let callerAbortListener: (() => void) | undefined;
+	const callerAbortPromise = signal
+		? new Promise<never>((_, reject) => {
+			callerAbortListener = () => reject(new Error("Aborted"));
+			if (signal.aborted) callerAbortListener();
+			else signal.addEventListener("abort", callerAbortListener, { once: true });
+		})
+		: undefined;
+	const completionSignal = signal
+		? AbortSignal.any([signal, deadlineController.signal])
+		: deadlineController.signal;
 
-			const response = await complete(model, { messages: [userMessage] }, { apiKey, headers, signal });
-			if (response.stopReason === "aborted") {
-				throw new Error("Aborted");
-			}
-
-			const contentParts = Array.isArray(response.content) ? response.content : [];
-			const summary = contentParts
-				.map(part => getTextFromContentPart(part))
-				.filter(text => text.trim().length > 0)
-				.join("\n")
-				.trim();
-
-			if (summary.length === 0) {
-				const partTypes = contentParts.map(part => getContentPartType(part));
-				const typesLabel = partTypes.length > 0 ? partTypes.join(", ") : "none";
-				throw new Error(`Summary model returned empty response (content parts: ${typesLabel})`);
-			}
-
-			return {
-				summary,
-				meta: {
-					model: `${model.provider}/${model.id}`,
-					durationMs: Math.max(0, Date.now() - startedAt),
-					tokenEstimate: estimateTokens(summary),
-					fallbackUsed: false,
-					edited: false,
-				},
-			};
-		} catch (err) {
-			if (isAbortError(err)) throw err;
-			lastError = err instanceof Error ? err.message : String(err);
+	async function raceSummaryOperation<T>(operation: Promise<T>): Promise<T> {
+		// A provider may ignore AbortSignal and never settle; observe it before racing so
+		// its eventual rejection cannot become an unhandled promise rejection.
+		void operation.then(() => undefined, () => undefined);
+		const contenders: Promise<unknown>[] = [operation, deadlinePromise];
+		if (callerAbortPromise) contenders.push(callerAbortPromise);
+		const result = await Promise.race(contenders);
+		if (result === deadlineMarker) {
+			if (signal?.aborted) throw new Error("Aborted");
+			throw deadlineMarker;
 		}
+		return result as T;
 	}
 
-	return buildFallbackSummary(results, lastError ? `summary-model-unavailable: ${lastError}` : "summary-model-unavailable");
+	try {
+		if (signal?.aborted) throw new Error("Aborted");
+		const prompt = buildSummaryPrompt(results, feedback);
+		let resolved: Awaited<ReturnType<typeof resolveSummaryModelCandidates>>;
+		try {
+			resolved = await raceSummaryOperation(resolveSummaryModelCandidates(ctx, modelOverride));
+		} catch (err) {
+			if (signal?.aborted) throw new Error("Aborted");
+			if (err === deadlineMarker || deadlineController.signal.aborted) {
+				return buildFallbackSummary(results, "summary-generation-timeout", Date.now() - generationStartedAt);
+			}
+			const message = err instanceof Error ? err.message : String(err);
+			return buildFallbackSummary(results, `summary-model-settings-error: ${message}`, Date.now() - generationStartedAt);
+		}
+
+		let lastError = resolved.errors.at(-1);
+		for (const { model, apiKey, headers } of resolved.candidates) {
+			const startedAt = Date.now();
+			try {
+				const userMessage: Message = {
+					role: "user",
+					content: [{ type: "text", text: prompt }],
+					timestamp: Date.now(),
+				};
+
+				const response = await raceSummaryOperation(Promise.resolve(completeFn(
+					model,
+					{ messages: [userMessage] },
+					{ apiKey, headers, signal: completionSignal },
+				)));
+				if (response.stopReason === "aborted") {
+					throw new Error("Aborted");
+				}
+
+				const contentParts = Array.isArray(response.content) ? response.content : [];
+				const summary = contentParts
+					.map(part => getTextFromContentPart(part))
+					.filter(text => text.trim().length > 0)
+					.join("\n")
+					.trim();
+
+				if (summary.length === 0) {
+					const partTypes = contentParts.map(part => getContentPartType(part));
+					const typesLabel = partTypes.length > 0 ? partTypes.join(", ") : "none";
+					throw new Error(`Summary model returned empty response (content parts: ${typesLabel})`);
+				}
+
+				return {
+					summary,
+					meta: {
+						model: `${model.provider}/${model.id}`,
+						durationMs: Math.max(0, Date.now() - startedAt),
+						tokenEstimate: estimateTokens(summary),
+						fallbackUsed: false,
+						phase: "summary-model",
+						edited: false,
+					},
+				};
+			} catch (err) {
+				if (signal?.aborted) throw new Error("Aborted");
+				if (err === deadlineMarker || deadlineController.signal.aborted) {
+					return buildFallbackSummary(results, "summary-generation-timeout", Date.now() - generationStartedAt);
+				}
+				if (isAbortError(err)) throw err;
+				lastError = err instanceof Error ? err.message : String(err);
+			}
+		}
+
+		return buildFallbackSummary(
+			results,
+			lastError ? `summary-model-unavailable: ${lastError}` : "summary-model-unavailable",
+			Date.now() - generationStartedAt,
+		);
+	} finally {
+		if (deadlineTimer) clearTimeout(deadlineTimer);
+		if (signal && callerAbortListener) signal.removeEventListener("abort", callerAbortListener);
+	}
 }

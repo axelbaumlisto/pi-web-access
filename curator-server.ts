@@ -12,7 +12,7 @@ export interface CuratorServerOptions {
 	queries: string[];
 	sessionToken: string;
 	timeout: number;
-	availableProviders: { openai: boolean; brave: boolean; parallel: boolean; tavily: boolean; perplexity: boolean; exa: boolean; gemini: boolean };
+	availableProviders: { openai: boolean; brave: boolean; parallel: boolean; tavily: boolean; serpdive: boolean; searxng: boolean; perplexity: boolean; exa: boolean; gemini: boolean; anysearch: boolean };
 	defaultProvider: string;
 	searchProvider: string;
 	summaryModels: Array<{ value: string; label: string }>;
@@ -132,8 +132,12 @@ function normalizeSummaryMeta(value: unknown): SummaryMeta | null {
 	if (!value || typeof value !== "object") return null;
 	const meta = value as Record<string, unknown>;
 
-	const model = meta.model;
-	if (model !== null && typeof model !== "string") return null;
+	const model = meta.model === null
+		? null
+		: typeof meta.model === "string"
+			? meta.model
+			: undefined;
+	if (model === undefined) return null;
 
 	const durationMs = meta.durationMs;
 	if (typeof durationMs !== "number" || !Number.isFinite(durationMs) || durationMs < 0) return null;
@@ -144,19 +148,27 @@ function normalizeSummaryMeta(value: unknown): SummaryMeta | null {
 	const fallbackUsed = meta.fallbackUsed;
 	if (typeof fallbackUsed !== "boolean") return null;
 
-	const fallbackReason = meta.fallbackReason;
-	if (fallbackReason !== undefined && typeof fallbackReason !== "string") return null;
+	const fallbackReason = typeof meta.fallbackReason === "string" ? meta.fallbackReason : undefined;
+	if (meta.fallbackReason !== undefined && fallbackReason === undefined) return null;
 
-	const edited = meta.edited;
-	if (edited !== undefined && typeof edited !== "boolean") return null;
+	const phase = meta.phase === "summary-model" || meta.phase === "deterministic-fallback"
+		? meta.phase
+		: undefined;
+	if (meta.phase !== undefined && phase === undefined) return null;
+	if (phase === "deterministic-fallback" && fallbackUsed !== true) return null;
+	if (phase === "summary-model" && fallbackUsed !== false) return null;
+
+	const edited = typeof meta.edited === "boolean" ? meta.edited : undefined;
+	if (meta.edited !== undefined && edited === undefined) return null;
 
 	return {
 		model,
 		durationMs,
 		tokenEstimate,
 		fallbackUsed,
-		fallbackReason,
-		edited,
+		...(fallbackReason !== undefined ? { fallbackReason } : {}),
+		...(phase !== undefined ? { phase } : {}),
+		...(edited !== undefined ? { edited } : {}),
 	};
 }
 
@@ -247,9 +259,12 @@ export function startCuratorServer(
 		if (provider === "brave") return availableProviders.brave;
 		if (provider === "parallel") return availableProviders.parallel;
 		if (provider === "tavily") return availableProviders.tavily;
+		if (provider === "serpdive") return availableProviders.serpdive;
+		if (provider === "searxng") return availableProviders.searxng;
 		if (provider === "perplexity") return availableProviders.perplexity;
 		if (provider === "exa") return availableProviders.exa;
 		if (provider === "gemini") return availableProviders.gemini;
+		if (provider === "anysearch") return availableProviders.anysearch;
 		return false;
 	}
 
@@ -419,7 +434,7 @@ export function startCuratorServer(
 						ok: true,
 						queryIndex: qi,
 						error: message,
-						provider: typeof provider === "string" && provider.length > 0 ? provider : undefined,
+						...(typeof provider === "string" && provider.length > 0 ? { provider } : {}),
 					});
 				}
 				return;
@@ -438,7 +453,7 @@ export function startCuratorServer(
 					allowEmpty: false,
 					maxExclusive: nextQueryIndex,
 				});
-				if (!parsed.ok) {
+				if ("error" in parsed) {
 					sendJson(res, 400, { ok: false, error: parsed.error });
 					return;
 				}
@@ -466,7 +481,7 @@ export function startCuratorServer(
 
 				try {
 					const result = await callbacks.onSummarize(parsed.indices, controller.signal, model, feedback);
-					if (requestId !== summarizeRequestSeq || state === "COMPLETED") {
+					if (requestId !== summarizeRequestSeq || completed) {
 						sendJson(res, 409, { ok: false, error: "Summarize request superseded" });
 						return;
 					}
@@ -523,7 +538,7 @@ export function startCuratorServer(
 					allowEmpty: true,
 					maxExclusive: nextQueryIndex,
 				});
-				if (!parsed.ok) {
+				if ("error" in parsed) {
 					sendJson(res, 400, { ok: false, error: parsed.error });
 					return;
 				}
@@ -560,7 +575,12 @@ export function startCuratorServer(
 				}
 				const rawResults = (body as { rawResults?: unknown }).rawResults === true;
 				sendJson(res, 200, { ok: true });
-				setImmediate(() => callbacks.onSubmit({ selectedQueryIndices: parsed.indices, summary, summaryMeta, rawResults }));
+				setImmediate(() => callbacks.onSubmit({
+					selectedQueryIndices: parsed.indices,
+					...(summary !== undefined ? { summary } : {}),
+					...(summaryMeta !== undefined ? { summaryMeta } : {}),
+					rawResults,
+				}));
 				return;
 			}
 

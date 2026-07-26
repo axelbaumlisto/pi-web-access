@@ -38,6 +38,7 @@ function inspectOpenAIAuth(registryResult) {
 		let registryCalls = 0;
 		const ctx = {
 			modelRegistry: {
+				find: (provider, modelId) => ({ provider, id: modelId }),
 				getApiKeyAndHeaders: async () => {
 					registryCalls += 1;
 					return ${JSON.stringify(registryResult)};

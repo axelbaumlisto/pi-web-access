@@ -28,14 +28,17 @@ export function normalizeFetchContentParams(params: FetchContentParams): Normali
 
 	const shouldIncludeFrames = frames !== undefined && (timestamp !== undefined || frames > 1);
 
+	const forceClone = typeof params.forceClone === "boolean" ? params.forceClone : undefined;
+	const model = normalizeOptionalString(params.model);
+
 	return {
 		urlList,
 		options: {
-			forceClone: typeof params.forceClone === "boolean" ? params.forceClone : undefined,
-			prompt,
-			timestamp,
-			frames: shouldIncludeFrames ? frames : undefined,
-			model: normalizeOptionalString(params.model),
+			...(forceClone !== undefined ? { forceClone } : {}),
+			...(prompt !== undefined ? { prompt } : {}),
+			...(timestamp !== undefined ? { timestamp } : {}),
+			...(shouldIncludeFrames ? { frames } : {}),
+			...(model !== undefined ? { model } : {}),
 		},
 	};
 }

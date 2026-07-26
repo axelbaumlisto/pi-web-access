@@ -1,4 +1,5 @@
 import { existsSync, readFileSync } from "node:fs";
+import { hasCredentialSource, redactCredential, resolveCredential } from "./credential-source.ts";
 import { getWebSearchConfigPath } from "./utils.ts";
 
 const DEFAULT_API_HOST = "https://generativelanguage.googleapis.com";
@@ -72,13 +73,16 @@ function getConfiguredApiKey(): string | null {
 	return normalizeApiKey(loadConfig().geminiApiKey);
 }
 
-export function getApiKey(): string | null {
-	// Resolve the destination before the credential: an ambient personal Google
-	// key must never be sent to an arbitrary override/proxy host.
-	if (isDirectGoogleHost()) {
-		return normalizeApiKey(process.env.GEMINI_API_KEY) ?? getConfiguredApiKey();
-	}
-	return getConfiguredApiKey();
+export async function getApiKey(signal?: AbortSignal): Promise<string | null> {
+	// Destination-first: an ambient personal Google key (GEMINI_API_KEY) must
+	// never be sent to an arbitrary override/proxy host — only the explicitly
+	// configured credential goes to a non-Google destination.
+	return resolveCredential({
+		provider: "Gemini",
+		configuredValue: loadConfig().geminiApiKey,
+		environmentValue: isDirectGoogleHost() ? process.env.GEMINI_API_KEY : undefined,
+		signal,
+	});
 }
 
 export function getApiHost(): string {
@@ -93,31 +97,112 @@ export function getVersionedApiBase(): string {
 	return `${getApiHost()}/${API_VERSION}`;
 }
 
+/**
+ * Legacy query-param auth helper (destination-first). Auth now travels in
+ * headers via fetchGeminiApi/buildAuthHeaders; kept for key-binding tests.
+ */
 export function buildKeyParam(apiKey: string | null): string {
 	if (isCloudflareGateway()) return "";
 	const destinationKey = isDirectGoogleHost() ? apiKey : getConfiguredApiKey();
 	return destinationKey ? `?key=${destinationKey}` : "";
 }
 
-export function getCloudflareApiKey(): string | null {
+function getLegacyCloudflareApiKey(): string | null {
 	return normalizeApiKey(process.env.CLOUDFLARE_API_KEY) ?? normalizeApiKey(loadConfig().cloudflareApiKey);
 }
 
-export function isGatewayConfigured(): boolean {
-	return isCloudflareGateway() && getCloudflareApiKey() !== null;
+async function resolveCloudflareApiKey(signal?: AbortSignal): Promise<string | null> {
+	return resolveCredential({
+		provider: "Cloudflare",
+		configuredValue: loadConfig().cloudflareApiKey,
+		environmentValue: process.env.CLOUDFLARE_API_KEY,
+		signal,
+	});
 }
 
-export function buildAuthHeaders(): Record<string, string> {
-	if (!isCloudflareGateway()) return {};
-	const cloudflareApiKey = getCloudflareApiKey();
+export function getCloudflareApiKey(): string | null {
+	return getLegacyCloudflareApiKey();
+}
+
+export function isGatewayConfigured(): boolean {
+	return isCloudflareGateway() && hasCredentialSource({
+		provider: "Cloudflare",
+		configuredValue: loadConfig().cloudflareApiKey,
+		environmentValue: process.env.CLOUDFLARE_API_KEY,
+	});
+}
+
+export function buildAuthHeaders(apiKey: string | null = null, cloudflareApiKey: string | null = getLegacyCloudflareApiKey()): Record<string, string> {
+	if (!isCloudflareGateway()) return apiKey ? { "x-goog-api-key": apiKey } : {};
 	return cloudflareApiKey ? { "cf-aig-authorization": `Bearer ${cloudflareApiKey}` } : {};
 }
 
+function redactGeminiCredentials(text: string, apiKey: string | null | undefined, cloudflareApiKey: string | null | undefined): string {
+	return redactCredential(redactCredential(text, apiKey), cloudflareApiKey);
+}
+
+const responseCredentials = new WeakMap<Response, {
+	apiKey: string | null | undefined;
+	cloudflareApiKey: string | null | undefined;
+}>();
+
+export function redactGeminiApiResponse(response: Response, text: string, apiKey?: string | null): string {
+	const credentials = responseCredentials.get(response);
+	return redactGeminiCredentials(text, credentials?.apiKey ?? apiKey, credentials?.cloudflareApiKey);
+}
+
+export async function fetchGeminiApi(
+	url: string | URL,
+	init: RequestInit = {},
+	apiKey?: string | null,
+): Promise<Response> {
+	const parsedUrl = new URL(url);
+	for (const name of parsedUrl.searchParams.keys()) {
+		if (["key", "api_key"].includes(name.toLowerCase())) {
+			throw new Error("Gemini API credential query parameters are not allowed");
+		}
+	}
+	const resolvedApiKey = apiKey === undefined ? await getApiKey(init.signal ?? undefined) : apiKey;
+	const cloudflareApiKey = isCloudflareGateway() ? await resolveCloudflareApiKey(init.signal ?? undefined) : null;
+	const allowedOrigins = new Set([
+		new URL(getApiHost()).origin,
+		new URL(DEFAULT_API_HOST).origin,
+	]);
+	if ((resolvedApiKey || isGatewayConfigured()) && !allowedOrigins.has(parsedUrl.origin)) {
+		throw new Error("Gemini API request host is not allowed");
+	}
+	const headers = new Headers(init.headers);
+	headers.delete("x-goog-api-key");
+	headers.delete("cf-aig-authorization");
+	for (const [name, value] of Object.entries(buildAuthHeaders(resolvedApiKey, cloudflareApiKey))) {
+		headers.set(name, value);
+	}
+	try {
+		const response = await fetch(parsedUrl, { ...init, headers });
+		responseCredentials.set(response, { apiKey: resolvedApiKey, cloudflareApiKey });
+		return response;
+	} catch (error) {
+		const message = error instanceof Error ? error.message : String(error);
+		const redactedMessage = redactGeminiCredentials(message, resolvedApiKey, cloudflareApiKey);
+		if (redactedMessage === message) throw error;
+		const redactedError = new Error(redactedMessage);
+		if (error instanceof Error) redactedError.name = error.name;
+		throw redactedError;
+	}
+}
+
 export function isGeminiApiAvailable(): boolean {
-	return getApiKey() !== null || isGatewayConfigured();
+	// Destination-first: the ambient GEMINI_API_KEY only counts for a direct
+	// Google destination — it is never sent to an override/proxy host.
+	return hasCredentialSource({
+		provider: "Gemini",
+		configuredValue: loadConfig().geminiApiKey,
+		environmentValue: isDirectGoogleHost() ? process.env.GEMINI_API_KEY : undefined,
+	}) || isGatewayConfigured();
 }
 
 export interface GeminiApiOptions {
+	apiKey?: string;
 	model?: string;
 	mimeType?: string;
 	signal?: AbortSignal;
@@ -129,18 +214,18 @@ export async function queryGeminiApiWithVideo(
 	videoUri: string,
 	options: GeminiApiOptions = {},
 ): Promise<string> {
-	const apiKey = getApiKey();
+	const signal = withTimeout(options.signal, options.timeoutMs ?? 120000);
+	const apiKey = options.apiKey ?? await getApiKey(signal);
 	if (!apiKey && !isGatewayConfigured()) {
 		throw new Error(
 			"Gemini API not configured. Either:\n" +
-			`  1. Set GEMINI_API_KEY in ${CONFIG_PATH}\n` +
+			`  1. Configure geminiApiKey in ${CONFIG_PATH} or set GEMINI_API_KEY\n` +
 			"  2. Set GOOGLE_GEMINI_BASE_URL + CLOUDFLARE_API_KEY for Cloudflare AI Gateway routing"
 		);
 	}
 
 	const model = options.model ?? DEFAULT_MODEL;
-	const signal = withTimeout(options.signal, options.timeoutMs ?? 120000);
-	const url = `${getVersionedApiBase()}/models/${model}:generateContent${buildKeyParam(apiKey)}`;
+	const url = `${getVersionedApiBase()}/models/${model}:generateContent`;
 
 	const fileData: Record<string, string> = { fileUri: videoUri };
 	if (options.mimeType) fileData.mimeType = options.mimeType;
@@ -157,15 +242,15 @@ export async function queryGeminiApiWithVideo(
 		],
 	};
 
-	const res = await fetch(url, {
+	const res = await fetchGeminiApi(url, {
 		method: "POST",
-		headers: { "Content-Type": "application/json", ...buildAuthHeaders() },
+		headers: { "Content-Type": "application/json" },
 		body: JSON.stringify(body),
 		signal,
-	});
+	}, apiKey);
 
 	if (!res.ok) {
-		const errorText = await res.text();
+		const errorText = redactGeminiApiResponse(res, await res.text(), apiKey);
 		throw new Error(`Gemini API error ${res.status}: ${errorText.slice(0, 300)}`);
 	}
 

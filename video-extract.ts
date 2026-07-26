@@ -4,7 +4,7 @@ import { readFile } from "node:fs/promises";
 import { resolve, extname, basename, join, dirname } from "node:path";
 import { activityMonitor } from "./activity.ts";
 import { isGeminiWebAvailable, queryWithCookies } from "./gemini-web.ts";
-import { queryGeminiApiWithVideo, getApiKey, API_BASE } from "./gemini-api.ts";
+import { queryGeminiApiWithVideo, getApiKey, fetchGeminiApi, API_BASE, redactGeminiApiResponse } from "./gemini-api.ts";
 import { extractHeadingTitle, type ExtractedContent, type ExtractOptions, type FrameResult } from "./extract.ts";
 import { readExecError, trimErrorText, mapFfmpegError, getWebSearchConfigPath } from "./utils.ts";
 
@@ -41,6 +41,8 @@ interface VideoFileInfo {
 	absolutePath: string;
 	mimeType: string;
 	sizeBytes: number;
+	maxSizeBytes: number;
+	withinUploadLimit: boolean;
 }
 
 interface VideoConfig {
@@ -129,9 +131,13 @@ export function isVideoFile(input: string): VideoFileInfo | null {
 	if (!stat.isFile()) return null;
 
 	const maxBytes = config.maxSizeMB * 1024 * 1024;
-	if (stat.size > maxBytes) return null;
-
-	return { absolutePath, mimeType, sizeBytes: stat.size };
+	return {
+		absolutePath,
+		mimeType,
+		sizeBytes: stat.size,
+		maxSizeBytes: maxBytes,
+		withinUploadLimit: stat.size <= maxBytes,
+	};
 }
 
 function resolveFilePath(filePath: string): string | null {
@@ -164,6 +170,12 @@ export async function extractVideo(
 	const effectivePrompt = options?.prompt ?? DEFAULT_VIDEO_PROMPT;
 	const effectiveModel = options?.model ?? config.preferredModel;
 	const displayName = basename(info.absolutePath);
+	if (!info.withinUploadLimit) {
+		const sizeMB = (info.sizeBytes / 1024 / 1024).toFixed(1);
+		const maxSizeMB = (info.maxSizeBytes / 1024 / 1024).toFixed(1);
+		const error = `Local video ${displayName} is ${sizeMB} MiB, above configured video.maxSizeMB (${maxSizeMB} MiB) for Gemini analysis. Use timestamp/frames for ffmpeg frame extraction, increase video.maxSizeMB, or compress the file.`;
+		return { url: info.absolutePath, title: displayName, content: error, error };
+	}
 	const activityId = activityMonitor.logStart({ type: "fetch", url: `video:${displayName}` });
 
 	const result = await tryVideoGeminiApi(info, effectivePrompt, effectiveModel, signal)
@@ -259,7 +271,7 @@ async function tryVideoGeminiApi(
 	model: string,
 	signal?: AbortSignal,
 ): Promise<ExtractedContent | null> {
-	const apiKey = getApiKey();
+	const apiKey = await getApiKey(signal);
 	if (!apiKey) return null;
 	if (signal?.aborted) return null;
 
@@ -271,6 +283,7 @@ async function tryVideoGeminiApi(
 		await pollFileState(fileName, apiKey, signal, 120000);
 
 		const text = await queryGeminiApiWithVideo(prompt, uploaded.uri, {
+			apiKey,
 			model,
 			mimeType: info.mimeType,
 			signal,
@@ -298,10 +311,9 @@ async function uploadToFilesApi(
 ): Promise<{ name: string; uri: string }> {
 	const displayName = basename(info.absolutePath);
 
-	const initRes = await fetch(`${UPLOAD_BASE}/files`, {
+	const initRes = await fetchGeminiApi(`${UPLOAD_BASE}/files`, {
 		method: "POST",
 		headers: {
-			"x-goog-api-key": apiKey,
 			"X-Goog-Upload-Protocol": "resumable",
 			"X-Goog-Upload-Command": "start",
 			"X-Goog-Upload-Header-Content-Length": String(info.sizeBytes),
@@ -310,10 +322,10 @@ async function uploadToFilesApi(
 		},
 		body: JSON.stringify({ file: { display_name: displayName } }),
 		signal,
-	});
+	}, apiKey);
 
 	if (!initRes.ok) {
-		const text = await initRes.text();
+		const text = redactGeminiApiResponse(initRes, await initRes.text(), apiKey);
 		throw new Error(`File upload init failed: ${initRes.status} (${text.slice(0, 200)})`);
 	}
 
@@ -321,7 +333,7 @@ async function uploadToFilesApi(
 	if (!uploadUrl) throw new Error("No upload URL in response headers");
 
 	const fileData = await readFile(info.absolutePath);
-	const uploadRes = await fetch(uploadUrl, {
+	const uploadRes = await fetchGeminiApi(uploadUrl, {
 		method: "PUT",
 		headers: {
 			"Content-Length": String(info.sizeBytes),
@@ -330,10 +342,10 @@ async function uploadToFilesApi(
 		},
 		body: fileData,
 		signal,
-	});
+	}, apiKey);
 
 	if (!uploadRes.ok) {
-		const text = await uploadRes.text();
+		const text = redactGeminiApiResponse(uploadRes, await uploadRes.text(), apiKey);
 		throw new Error(`File upload failed: ${uploadRes.status} (${text.slice(0, 200)})`);
 	}
 
@@ -352,7 +364,7 @@ async function pollFileState(
 	while (Date.now() < deadline) {
 		if (signal?.aborted) throw new Error("Aborted");
 
-		const res = await fetch(`${API_BASE}/${fileName}?key=${apiKey}`, { signal });
+		const res = await fetchGeminiApi(`${API_BASE}/${fileName}`, { signal }, apiKey);
 		if (!res.ok) throw new Error(`File state check failed: ${res.status}`);
 
 		const data = await res.json() as { state: string };
@@ -366,7 +378,7 @@ async function pollFileState(
 }
 
 function deleteGeminiFile(fileName: string, apiKey: string): void {
-	fetch(`${API_BASE}/${fileName}?key=${apiKey}`, { method: "DELETE" }).catch((err) => {
+	void fetchGeminiApi(`${API_BASE}/${fileName}`, { method: "DELETE" }, apiKey).catch((err) => {
 		const message = err instanceof Error ? err.message : String(err);
 		console.error(`Failed to delete Gemini file ${fileName}: ${message}`);
 	});

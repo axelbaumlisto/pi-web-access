@@ -4,6 +4,51 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+## [0.14.0] - 2026-07-25
+
+### Added
+- Added optional `fetchContent.domainPolicy` hostname allow/deny rules for `fetch_content`, checked before target requests and redirects while preserving SSRF protection and local-source behavior. Thanks Joseph Maliksi (@jmaliksi) for #79.
+- Added explicit-only AnySearch direct search provider with anonymous access, optional `anysearchApiKey` / `ANYSEARCH_API_KEY` credentials, strict response validation, and request-time credential sources. Thanks Robin (@choronz) for #130.
+- Added SERPdive search provider with request-time credential sources, a free-tier `krill` default that never spends on install, opt-in `mako`/`moby` retrieval depth, locally applied domain filters, and recency documented as a query hint rather than a guaranteed freshness filter. Thanks Eden d'Alexis (@edendalexis) for #139.
+- Added opt-in ordered search routing through `searchRouting.providers` with explicit transient, quota, and network fallback kinds; named providers remain strict, single-provider config retains precedence, and exhausted routes preserve per-provider diagnostics. Thanks @smithyyang for #77.
+- Added optional self-hosted SearXNG search with SSRF-guarded base URLs, local-first auto selection, result filters, and documented `ssrf.allowRanges` opt-ins. Thanks to Marcos A. Núñez (@marnunez) for PR #107 and Avinash Kanaujiya (@avinashkanaujiya) for issue #105.
+- Added optional self-hosted Firecrawl extraction for `fetch_content`, using `/v2/scrape` by default (or `/v1/scrape` for older images), request-time credential sources, cache-only requests by default, cross-origin redirect credential stripping, and local-first fallback behavior when configured. Thanks Florian Kinder (@fank) for PR #123 and Avinash Kanaujiya (@avinashkanaujiya) for issue #105.
+- Added opt-in configurable public tool names for environments where another extension or model reserves the defaults, while keeping `web_search`, `source_check`, `fetch_content`, and `get_search_content` unchanged by default. Thanks Kaiqiang (@youkq95) for reporting #138.
+- Added `SECURITY.md` guidance for private vulnerability reporting. Thanks Aurelio Ribeiro (@aurelio-ribeiro) for #128.
+- Added request-time `$ENV_VAR` and `!command` credential sources for every provider API-key field, including escaped `$$` and `$!` literals, while preserving legacy environment precedence for literal config values. Thanks to Eugene Strizhok (@estrizhok) for #159.
+- Added request-time `$ENV_VAR` and `!command` credential sources for Exa and Gemini API configuration, with bounded output, redacted failures, strict source precedence, and shell-local 1Password session forwarding limited to the resolver command. Thanks to Ezra Miller (@ezmill) for #137.
+- Added `source_check` machine-readable research artifacts with passage-level provenance, bounded page fetching, durable session retrieval, and conservative claim assessments. Thanks Clark Everson (@gr3enarr0w) for PR #111 and issue #108.
+
+### Changed
+- Limited the published package contents to runtime files, docs, and declared assets, keeping internal tests out of the npm tarball.
+- Deferred the heavy content extraction module until the first `fetch_content` or `includeContent` search call, reducing extension startup work. Thanks Kaushik Gopal (@kaushikgopal) for PR #125.
+- Send direct Gemini API credentials in `x-goog-api-key` headers for generate, upload, status, and delete requests instead of URL query parameters.
+
+### Removed
+- Removed the bundled `librarian` skill from this package instead of keeping a second research workflow coupled to GitHub clone internals. Thanks mcwalrus (@mcwalrus) for #136 and gravewhisper (@gravewhisper) for #23.
+
+### Fixed
+- Prevented opt-in Gemini Web browser cookies from crossing origins on redirects, disabled automatic redirects for cookie-bearing generation and upload requests, and restored local file reads for Gemini Web uploads.
+- Preserved caller cancellation in non-curated multi-query searches instead of continuing with later queries, and passed the active extension context into curator-added searches.
+- Hardened new provider result boundaries and removed a dead auto-routing condition without changing provider behavior.
+- Hardened unreleased config/result boundaries by rejecting malformed config roots, reporting malformed SSRF JSON, normalizing invalid Perplexity result counts, and rejecting contradictory curator summary metadata.
+- Reworked opt-in Gemini Web browser-cookie extraction to scan non-default Chromium profiles, preflight required cookie names before Keychain/secret-tool access, and cache encryption passwords only in-process. Thanks Kevin Truong (@kevinQTruong) for the originating PR #14, Jessica Black (@jssblck) for reporting #9, János Veres (@jveres) for reporting #2, and RimuruW (@RimuruW) for reporting #15.
+- Added read-only `sqlite3` CLI and Python stdlib fallbacks when `node:sqlite` is unavailable, with sanitized actionable diagnostics instead of silently reporting Gemini Web as unavailable.
+- Bounded curator summary-model generation and returned a deterministic, phase-labeled fallback when a draft exceeds its deadline, while preserving caller cancellation and model-resolution errors. Thanks torn1147 (@torn1147) for reporting #43.
+- Used `gemini-2.5-flash` as the Gemini API grounded-search default while preserving configured `searchModel` values and the shared URL/video defaults. Thanks lajarre for reporting #11.
+- Used the configured search provider when tool calls omit `provider` or emit the schema's `auto` default, while preserving explicit provider overrides and auto fallback without configuration. Thanks Pavlo (@fxposter) for reporting #17.
+- Clarified that `githubClone.enabled: false` disables GitHub clone/API specialization while leaving generic URL extraction available. Thanks Carlos Peralta (@cperalt) for issue #26.
+- Added an opt-in `ssrf.trustEnvProxy` setting that skips local DNS preflight only for hostnames routed through configured HTTP(S) proxy environment variables, while retaining localhost, literal private-IP, and `NO_PROXY` protections. This addresses the DNS failure described in #104 without claiming full proxy transport support. Thanks Daniel Birn (@DBPhoenix) for PR #109 and mystery4f for reporting #104.
+- Kept PDF extraction compatible with runtimes without native `Promise.try` and limited PDF.js output to errors. Thanks Guido Witt-Dörring (@guwidoe) for PRs #33 and #34.
+- Returned fetched URL content from `get_search_content` in bounded slices with explicit `offset`/`limit` continuation metadata, preventing large stored pages from overflowing the next model request. Thanks @manfredlift for reporting #112.
+- Kept oversized local videos recognizable for ffmpeg frame/timestamp extraction while preserving the Gemini analysis upload size limit. Thanks @Xandaar for reporting #135.
+- Declared `typebox` as a regular runtime dependency so clean/global installs can load the extension without relying on Pi or Feynman to provide that peer. Thanks @DuskyElf, @tonytziorvas, and @53able for reporting #59, #63, and #66.
+- Preserved OpenAI/Codex answers even when the provider returns no source citations instead of replacing them with `No results found`. Thanks AstroHan (@Astro-Han) for reporting #117.
+- Prevented browser auto-open failures from crashing the curator fallback path with `ReferenceError: sendCuratorFallbackUpdate is not defined`. Thanks Nisarg Patel (@pnisarg) for PR #121; Apostol Apostolov (@apoapostolov), @2seoik, and Demetre Dzmanashvili (@demetere) for related PRs #133, #120, and #114; and @ruanlinxin, @bluewatercg, @tonydiep, and @pinion05 for reports #103, #116, #126, and #127.
+- Added a focused SSRF error hint for TUN/fake-IP `198.18.0.0/15` addresses that points users to the existing `ssrf.allowRanges` opt-in. Thanks Aaron (@BenjaminAaron196) for PR #141 and AstroHan (@Astro-Han) for reporting #134.
+- Registered the web activity widget with Pi's supported string-array API to prevent `content is not a function` crashes when toggling non-default shortcuts. Thanks @llllllllqq for reporting #158.
+- Registered the web activity widget as a Pi component factory instead of passing a `Text` instance directly. Thanks Trey Hoover (@treyhoover) for PR #132.
+
 ## [0.13.0] - 2026-06-25
 
 ### Added

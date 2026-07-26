@@ -2,8 +2,9 @@ import { existsSync, readFileSync } from "node:fs";
 import { activityMonitor } from "./activity.ts";
 import type { ExtractedContent } from "./extract.ts";
 import type { SearchOptions, SearchResponse } from "./perplexity.ts";
+import { hasCredentialSource, redactCredential, resolveCredential } from "./credential-source.ts";
 import { getWebSearchConfigPath } from "./utils.ts";
-import { providerApiKey, providerUrl, resolveProviderEndpoint } from "./provider-endpoints.ts";
+import { providerProxyApiKey, providerUrl, resolveProviderEndpoint } from "./provider-endpoints.ts";
 import { redactError } from "./redact.ts";
 
 const EXA_DEFAULT_MCP_URL = "https://mcp.exa.ai/mcp";
@@ -79,15 +80,16 @@ function loadConfig(): WebSearchConfig {
 	}
 }
 
-function normalizeApiKey(value: unknown): string | null {
-	if (typeof value !== "string") return null;
-	const normalized = value.trim();
-	return normalized.length > 0 ? normalized : null;
-}
-
-function getApiKey(): string | null {
-	// per-provider EXA_API_KEY/exaApiKey, else the shared proxy key (when proxied).
-	return providerApiKey("exa");
+async function getApiKey(signal?: AbortSignal): Promise<string | null> {
+	// Destination-first: the shared proxy key when the endpoint is proxied.
+	const proxyKey = providerProxyApiKey("exa");
+	if (proxyKey !== null) return proxyKey;
+	return resolveCredential({
+		provider: "Exa",
+		configuredValue: loadConfig().exaApiKey,
+		environmentValue: process.env.EXA_API_KEY,
+		signal,
+	});
 }
 
 function requestSignal(signal?: AbortSignal): AbortSignal {
@@ -371,11 +373,15 @@ export function isExaAvailable(): boolean {
 }
 
 export function hasExaApiKey(): boolean {
-	return !!getApiKey();
+	return hasCredentialSource({
+		provider: "Exa",
+		configuredValue: loadConfig().exaApiKey,
+		environmentValue: process.env.EXA_API_KEY,
+	});
 }
 
 export async function searchWithExa(query: string, options: ExaSearchOptions = {}): Promise<ExaSearchResult> {
-	const apiKey = getApiKey();
+	const apiKey = await getApiKey(options.signal);
 	if (!apiKey) {
 		return searchWithExaMcp(query, options);
 	}
@@ -403,7 +409,7 @@ export async function searchWithExa(query: string, options: ExaSearchOptions = {
 			});
 
 			if (!response.ok) {
-				const errorText = await response.text();
+				const errorText = redactCredential(await response.text(), apiKey);
 				throw new Error(`Exa API error ${response.status}: ${redactError(errorText)}`);
 			}
 
@@ -444,7 +450,7 @@ export async function searchWithExa(query: string, options: ExaSearchOptions = {
 		});
 
 		if (!response.ok) {
-			const errorText = await response.text();
+			const errorText = redactCredential(await response.text(), apiKey);
 			throw new Error(`Exa API error ${response.status}: ${redactError(errorText)}`);
 		}
 
@@ -468,11 +474,13 @@ export async function searchWithExa(query: string, options: ExaSearchOptions = {
 		return mapped;
 	} catch (err) {
 		const message = err instanceof Error ? err.message : String(err);
-		if (message.toLowerCase().includes("abort")) {
+		const redactedMessage = redactCredential(message, apiKey);
+		if (redactedMessage.toLowerCase().includes("abort")) {
 			activityMonitor.logComplete(activityId, 0);
 		} else {
-			activityMonitor.logError(activityId, message);
+			activityMonitor.logError(activityId, redactedMessage);
 		}
-		throw err;
+		if (redactedMessage === message) throw err;
+		throw new Error(redactedMessage);
 	}
 }

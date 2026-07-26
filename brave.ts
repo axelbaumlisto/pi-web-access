@@ -1,8 +1,9 @@
 import { existsSync, readFileSync } from "node:fs";
 import { activityMonitor } from "./activity.ts";
 import type { SearchOptions, SearchResult, SearchResponse } from "./perplexity.ts";
+import { hasCredentialSource, redactCredential, resolveCredential } from "./credential-source.ts";
 import { getWebSearchConfigPath } from "./utils.ts";
-import { providerApiKey, providerUrl } from "./provider-endpoints.ts";
+import { providerProxyApiKey, providerUrl } from "./provider-endpoints.ts";
 import { redactError } from "./redact.ts";
 
 // Search endpoint override lives in provider-endpoints.ts (env > config >
@@ -40,14 +41,16 @@ function loadConfig(): WebSearchConfig {
 	}
 }
 
-function normalizeApiKey(value: unknown): string | null {
-	if (typeof value !== "string") return null;
-	const normalized = value.trim();
-	return normalized.length > 0 ? normalized : null;
-}
-
-function getApiKey(): string | null {
-	return providerApiKey("brave");
+async function getApiKey(signal?: AbortSignal): Promise<string | null> {
+	// Destination-first: the shared proxy key when the endpoint is proxied.
+	const proxyKey = providerProxyApiKey("brave");
+	if (proxyKey !== null) return proxyKey;
+	return resolveCredential({
+		provider: "Brave",
+		configuredValue: loadConfig().braveApiKey,
+		environmentValue: process.env.BRAVE_API_KEY,
+		signal,
+	});
 }
 
 function normalizeCount(value: number | undefined): number {
@@ -152,14 +155,19 @@ function matchesDomainFilters(url: string, filters: NormalizedDomainFilters): bo
 }
 
 export function isBraveAvailable(): boolean {
-	return !!getApiKey();
+	if (providerProxyApiKey("brave") !== null) return true;
+	return hasCredentialSource({
+		provider: "Brave",
+		configuredValue: loadConfig().braveApiKey,
+		environmentValue: process.env.BRAVE_API_KEY,
+	});
 }
 
 export async function searchWithBrave(
 	query: string,
 	options: SearchOptions = {},
 ): Promise<SearchResponse> {
-	const apiKey = getApiKey();
+	const apiKey = await getApiKey(options.signal);
 	if (!apiKey) {
 		throw new Error(
 			"Brave Search API key not found. Either:\n" +
@@ -204,7 +212,7 @@ export async function searchWithBrave(
 
 		if (!response.ok) {
 			activityMonitor.logError(activityId, `HTTP ${response.status}`);
-			const errorText = await response.text();
+			const errorText = redactCredential(await response.text(), apiKey);
 			throw new Error(`Brave Search API error ${response.status}: ${redactError(errorText)}`);
 		}
 
@@ -242,11 +250,15 @@ export async function searchWithBrave(
 		return { answer, results };
 	} catch (err) {
 		const message = err instanceof Error ? err.message : String(err);
-		if (message.toLowerCase().includes("abort")) {
+		const redactedMessage = redactCredential(message, apiKey);
+		if (redactedMessage.toLowerCase().includes("abort")) {
 			activityMonitor.logComplete(activityId, 0);
 		} else {
-			activityMonitor.logError(activityId, message);
+			activityMonitor.logError(activityId, redactedMessage);
 		}
-		throw err;
+		if (redactedMessage === message) throw err;
+		const redactedError = new Error(redactedMessage);
+		if (err instanceof Error) redactedError.name = err.name;
+		throw redactedError;
 	}
 }

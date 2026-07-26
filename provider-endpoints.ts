@@ -225,13 +225,25 @@ export function providerApiKey(provider: SearchProviderId): string | null {
 	// If the endpoint resolved to the unified proxy, the shared proxy key is the
 	// ONLY correct credential — a personal per-provider key (e.g. an ambient
 	// OPENAI_API_KEY) must NOT be transmitted to the proxy gateway.
-	const base = proxyBaseUrl();
-	const resolvedToProxy =
-		base !== null && sameOrigin(resolveProviderEndpoint(provider).url, base);
-	if (resolvedToProxy) return proxyApiKey();
+	const proxyKey = providerProxyApiKey(provider);
+	if (proxyKey !== null) return proxyKey;
 	const envKey = process.env[ep.keyEnv];
 	if (typeof envKey === "string" && envKey.trim().length > 0) return envKey.trim();
 	const cfgKey = loadRawConfig()[ep.keyConfigKey];
 	if (typeof cfgKey === "string" && cfgKey.trim().length > 0) return cfgKey.trim();
 	return null;
+}
+
+/**
+ * Destination-first proxy credential: returns the shared proxy key when the
+ * provider's endpoint resolved to the unified proxy origin, otherwise null.
+ * Callers that use async credential sources (credential-source.ts) should
+ * check this FIRST — a personal per-provider key must never be transmitted
+ * to the proxy gateway.
+ */
+export function providerProxyApiKey(provider: SearchProviderId): string | null {
+	const base = proxyBaseUrl();
+	if (base === null) return null;
+	if (!sameOrigin(resolveProviderEndpoint(provider).url, base)) return null;
+	return proxyApiKey();
 }

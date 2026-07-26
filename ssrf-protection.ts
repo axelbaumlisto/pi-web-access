@@ -1,5 +1,7 @@
 import { lookup as dnsLookup } from "node:dns/promises";
+import { existsSync, readFileSync } from "node:fs";
 import net from "node:net";
+import { getWebSearchConfigPath } from "./utils.ts";
 
 const DEFAULT_MAX_REDIRECTS = 5;
 const REDIRECT_STATUSES = new Set([301, 302, 303, 307, 308]);
@@ -8,8 +10,125 @@ export type LookupAddress = { address: string; family: number };
 export type Lookup = (hostname: string) => Promise<LookupAddress[]>;
 type Fetch = typeof fetch;
 
+const WEB_SEARCH_CONFIG_PATH = getWebSearchConfigPath();
+
+export interface SsrfConfig {
+	allowRanges: string[];
+	trustEnvProxy: boolean;
+}
+
+export interface DomainPolicy {
+	allow: string[];
+	deny: string[];
+}
+
+const DEFAULT_DOMAIN_POLICY: DomainPolicy = { allow: [], deny: [] };
+
+export function loadFetchContentDomainPolicy(): DomainPolicy {
+	if (!existsSync(WEB_SEARCH_CONFIG_PATH)) return { ...DEFAULT_DOMAIN_POLICY };
+	let raw: string;
+	try {
+		raw = readFileSync(WEB_SEARCH_CONFIG_PATH, "utf-8");
+	} catch {
+		return { ...DEFAULT_DOMAIN_POLICY };
+	}
+	let parsed: unknown;
+	try {
+		parsed = JSON.parse(raw);
+	} catch (err) {
+		const message = err instanceof Error ? err.message : String(err);
+		throw new Error(`Failed to parse ${WEB_SEARCH_CONFIG_PATH}: ${message}`);
+	}
+	if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) {
+		return { ...DEFAULT_DOMAIN_POLICY };
+	}
+	const fetchContent = (parsed as { fetchContent?: unknown }).fetchContent;
+	if (fetchContent === undefined || fetchContent === null) return { ...DEFAULT_DOMAIN_POLICY };
+	if (typeof fetchContent !== "object" || Array.isArray(fetchContent)) {
+		throw new Error(`fetchContent in ${WEB_SEARCH_CONFIG_PATH} must be an object`);
+	}
+	const policy = (fetchContent as { domainPolicy?: unknown }).domainPolicy;
+	if (policy === undefined || policy === null) return { ...DEFAULT_DOMAIN_POLICY };
+	if (typeof policy !== "object" || Array.isArray(policy)) {
+		throw new Error(`fetchContent.domainPolicy in ${WEB_SEARCH_CONFIG_PATH} must be an object`);
+	}
+	const config = policy as { allow?: unknown; deny?: unknown };
+	return {
+		allow: parseDomainEntries(config.allow, "allow"),
+		deny: parseDomainEntries(config.deny, "deny"),
+	};
+}
+
+function parseDomainEntries(value: unknown, field: "allow" | "deny"): string[] {
+	if (value === undefined || value === null) return [];
+	if (!Array.isArray(value)) {
+		throw new Error(`fetchContent.domainPolicy.${field} in ${WEB_SEARCH_CONFIG_PATH} must be an array of hostnames`);
+	}
+	return value.map((entry, index) => {
+		if (typeof entry !== "string") {
+			throw new Error(`fetchContent.domainPolicy.${field} in ${WEB_SEARCH_CONFIG_PATH} must contain only hostnames; entry ${index + 1} is ${typeof entry}`);
+		}
+		const hostname = normalizeDomainEntry(entry);
+		if (!hostname) {
+			throw new Error(`fetchContent.domainPolicy.${field} in ${WEB_SEARCH_CONFIG_PATH} contains an invalid hostname: ${JSON.stringify(entry)}`);
+		}
+		return hostname;
+	});
+}
+
+function normalizeDomainEntry(entry: string): string | null {
+	const hostname = normalizeHostname(entry.trim());
+	if (!hostname || /\s|[\\/?:#@]/.test(hostname)) return null;
+	if (net.isIP(hostname)) return hostname;
+	if (hostname.length > 253 || !/^(?:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.)*[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$/i.test(hostname)) return null;
+	return hostname;
+}
+
+export function loadSsrfConfig(): SsrfConfig {
+	if (!existsSync(WEB_SEARCH_CONFIG_PATH)) return { allowRanges: [], trustEnvProxy: false };
+	let raw: string;
+	try {
+		raw = readFileSync(WEB_SEARCH_CONFIG_PATH, "utf-8");
+	} catch {
+		return { allowRanges: [], trustEnvProxy: false };
+	}
+	let parsed: unknown;
+	try {
+		parsed = JSON.parse(raw);
+	} catch (err) {
+		const message = err instanceof Error ? err.message : String(err);
+		throw new Error(`Failed to parse ${WEB_SEARCH_CONFIG_PATH}: ${message}`);
+	}
+	if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) {
+		return { allowRanges: [], trustEnvProxy: false };
+	}
+	const ssrf = (parsed as { ssrf?: unknown }).ssrf;
+	if (ssrf === undefined || ssrf === null) return { allowRanges: [], trustEnvProxy: false };
+	if (typeof ssrf !== "object" || Array.isArray(ssrf)) {
+		throw new Error(`ssrf in ${WEB_SEARCH_CONFIG_PATH} must be an object`);
+	}
+	const config = ssrf as { allowRanges?: unknown; trustEnvProxy?: unknown };
+	if (config.allowRanges !== undefined && config.allowRanges !== null && !Array.isArray(config.allowRanges)) {
+		throw new Error(`ssrf.allowRanges in ${WEB_SEARCH_CONFIG_PATH} must be an array of CIDR strings`);
+	}
+	if (config.trustEnvProxy !== undefined && typeof config.trustEnvProxy !== "boolean") {
+		throw new Error(`ssrf.trustEnvProxy in ${WEB_SEARCH_CONFIG_PATH} must be a boolean`);
+	}
+	const allowRangesValue: unknown[] = Array.isArray(config.allowRanges) ? config.allowRanges : [];
+	const allowRanges = allowRangesValue.map((entry, index) => {
+		if (typeof entry !== "string") {
+			throw new Error(`ssrf.allowRanges in ${WEB_SEARCH_CONFIG_PATH} must contain only CIDR strings; entry ${index + 1} is ${typeof entry}`);
+		}
+		return entry.trim();
+	}).filter(Boolean);
+	parseAllowRanges(allowRanges);
+	return { allowRanges, trustEnvProxy: config.trustEnvProxy === true };
+}
+
 interface ValidationOptions {
 	lookup?: Lookup;
+	/** Optional hostname policy for fetch_content target URLs. */
+	domainPolicy?: DomainPolicy;
 	/**
 	 * CIDR ranges (e.g. "198.18.0.0/15") to exempt from the SSRF guard.
 	 * Useful when a host runs a TUN/fake-IP proxy (Surge, Clash, Mihomo, ...)
@@ -17,6 +136,13 @@ interface ValidationOptions {
 	 * strictly; an invalid entry throws so misconfiguration is not silent.
 	 */
 	allowRanges?: string[];
+	/**
+	 * When true, trust an explicitly-configured HTTP(S) proxy for hostname
+	 * resolution instead of performing local DNS lookups inside the sandbox.
+	 * Literal IPs and localhost remain blocked, and NO_PROXY hosts still use
+	 * the local SSRF preflight. This does not configure proxy transport.
+	 */
+	trustEnvProxy?: boolean;
 }
 
 /** Parsed entry from `allowRanges`: a network address (4 or 16 bytes) + prefix length. */
@@ -47,11 +173,14 @@ export async function validateRemoteUrl(rawUrl: string | URL, options: Validatio
 	}
 
 	const allowRanges = parseAllowRanges(options.allowRanges);
+	assertDomainPolicy(hostname, options.domainPolicy);
 
 	if (net.isIP(hostname)) {
 		assertPublicAddress(hostname, hostname, allowRanges);
 		return url;
 	}
+
+	if (shouldTrustEnvProxy(url, options.trustEnvProxy === true)) return url;
 
 	let addresses: LookupAddress[];
 	try {
@@ -100,6 +229,83 @@ function normalizeHostname(hostname: string): string {
 	return hostname.toLowerCase().replace(/^\[|\]$/g, "").replace(/\.$/, "");
 }
 
+function assertDomainPolicy(hostname: string, policy?: DomainPolicy): void {
+	if (!policy) return;
+	if (policy.deny.some((entry) => domainMatches(hostname, entry))) {
+		throw new Error(`Blocked hostname by fetch_content domain policy: ${hostname}`);
+	}
+	if (policy.allow.length > 0 && !policy.allow.some((entry) => domainMatches(hostname, entry))) {
+		throw new Error(`Hostname not allowed by fetch_content domain policy: ${hostname}`);
+	}
+}
+
+function domainMatches(hostname: string, entry: string): boolean {
+	return hostname === entry || hostname.endsWith(`.${entry}`);
+}
+
+function getProxyForProtocol(protocol: string): string {
+	const candidates = protocol === "http:"
+		? [process.env.HTTP_PROXY, process.env.http_proxy, process.env.ALL_PROXY, process.env.all_proxy]
+		: protocol === "https:"
+			? [process.env.HTTPS_PROXY, process.env.https_proxy, process.env.HTTP_PROXY, process.env.http_proxy, process.env.ALL_PROXY, process.env.all_proxy]
+			: [];
+	for (const candidate of candidates) {
+		const value = candidate?.trim();
+		if (!value) continue;
+		try {
+			const proxyUrl = new URL(value);
+			if ((proxyUrl.protocol === "http:" || proxyUrl.protocol === "https:") && proxyUrl.hostname) return value;
+		} catch {
+			// Invalid proxy env vars should not weaken local DNS SSRF checks.
+		}
+	}
+	return "";
+}
+
+function hostnameMatchesNoProxy(hostname: string, port: string, entry: string): boolean {
+	const trimmed = entry.trim();
+	if (!trimmed) return false;
+	if (trimmed === "*") return true;
+
+	// NO_PROXY entries may include a port. Strip it only after handling
+	// bracketed IPv6 literals, which can contain several colons.
+	let hostEntry = trimmed;
+	let entryPort: string | undefined;
+	if (hostEntry.startsWith("[")) {
+		const closingBracket = hostEntry.indexOf("]");
+		if (closingBracket >= 0) {
+			const suffix = hostEntry.slice(closingBracket + 1);
+			if (/^:\\d+$/.test(suffix)) entryPort = suffix.slice(1);
+			hostEntry = hostEntry.slice(0, closingBracket + 1);
+		}
+	} else {
+		const colon = hostEntry.lastIndexOf(":");
+		if (colon > -1 && /^\d+$/.test(hostEntry.slice(colon + 1))) {
+			entryPort = hostEntry.slice(colon + 1);
+			hostEntry = hostEntry.slice(0, colon);
+		}
+	}
+	if (entryPort !== undefined && entryPort !== port) return false;
+
+	const normalizedEntry = normalizeHostname(hostEntry);
+	if (!normalizedEntry) return false;
+	if (normalizedEntry === hostname) return true;
+	const suffix = normalizedEntry.startsWith("*.")
+		? normalizedEntry.slice(1)
+		: normalizedEntry.startsWith(".")
+			? normalizedEntry
+			: `.${normalizedEntry}`;
+	return hostname.endsWith(suffix);
+}
+
+function shouldTrustEnvProxy(url: URL, enabled: boolean): boolean {
+	if (!enabled || !getProxyForProtocol(url.protocol)) return false;
+	const hostname = normalizeHostname(url.hostname);
+	const port = url.port || (url.protocol === "https:" ? "443" : "80");
+	const noProxy = process.env.NO_PROXY || process.env.no_proxy || "";
+	return !noProxy.split(",").some(entry => hostnameMatchesNoProxy(hostname, port, entry));
+}
+
 function assertPublicAddress(address: string, hostname: string, allowRanges: ParsedCidr[] = []): void {
 	const normalized = normalizeHostname(address);
 	const ipVersion = net.isIP(normalized);
@@ -108,11 +314,19 @@ function assertPublicAddress(address: string, hostname: string, allowRanges: Par
 	// users exempt synthetic ranges produced by TUN/fake-IP proxies (e.g. 198.18/15).
 	if (isInAllowedRange(normalized, ipVersion, allowRanges)) return;
 	if (ipVersion === 4 && isBlockedIPv4(normalized)) {
-		throw new Error(`Blocked internal address for ${hostname}: ${normalized}`);
+		const hint = isFakeIpProxyAddress(normalized)
+			? '. This address is in 198.18.0.0/15, commonly used by TUN/fake-IP proxies. If that matches your setup, configure ssrf.allowRanges with ["198.18.0.0/15"] in web-search.json.'
+			: "";
+		throw new Error(`Blocked internal address for ${hostname}: ${normalized}${hint}`);
 	}
 	if (ipVersion === 6 && isBlockedIPv6(normalized)) {
 		throw new Error(`Blocked internal address for ${hostname}: ${normalized}`);
 	}
+}
+
+function isFakeIpProxyAddress(address: string): boolean {
+	const [a, b] = address.split(".").map(part => Number(part));
+	return a === 198 && (b === 18 || b === 19);
 }
 
 function isBlockedIPv4(address: string): boolean {
@@ -126,7 +340,7 @@ function isBlockedIPv4(address: string): boolean {
 		(a === 169 && b === 254) ||
 		(a === 172 && b >= 16 && b <= 31) ||
 		(a === 192 && b === 168) ||
-		(a === 198 && (b === 18 || b === 19)) ||
+		isFakeIpProxyAddress(address) ||
 		a >= 224;
 }
 

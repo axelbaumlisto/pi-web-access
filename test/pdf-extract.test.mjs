@@ -1,6 +1,13 @@
 import assert from "node:assert/strict";
 import { spawnSync } from "node:child_process";
+import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { createRequire } from "node:module";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import { pathToFileURL } from "node:url";
 import { test } from "node:test";
+
+const require = createRequire(import.meta.url);
 
 const extractorUrl = new URL("../pdf-extract.ts", import.meta.url).href;
 
@@ -20,7 +27,66 @@ test("extractPDFToMarkdown works on Node 22 without native Promise.try", () => {
   assert.match(child.stdout, /Hello PDF/);
 });
 
-function buildChildScript(moduleUrl) {
+test("extractPDFToMarkdown passes PDF.js errors-only verbosity", () => {
+  const loaderDir = mkdtempSync(join(tmpdir(), "pi-web-access-pdf-loader-"));
+  const loaderPath = join(loaderDir, "unpdf-loader.mjs");
+  writeFileSync(loaderPath, buildUnpdfLoader());
+
+  try {
+    const child = spawnSync(
+      process.execPath,
+      ["--experimental-loader", loaderPath, "--input-type=module"],
+      {
+        input: buildChildScript(extractorUrl, true),
+        encoding: "utf8",
+        maxBuffer: 2 * 1024 * 1024,
+      },
+    );
+
+    assert.equal(
+      child.status,
+      0,
+      "PDF verbosity assertion failed in a child process. stderr summary:\n" + errorSummary(child.stderr),
+    );
+
+    const options = JSON.parse(child.stdout.trim().split("\n").at(-1));
+    assert.equal(options.verbosity, 0);
+  } finally {
+    rmSync(loaderDir, { recursive: true, force: true });
+  }
+});
+
+function buildUnpdfLoader() {
+  const unpdfUrl = pathToFileURL(require.resolve("unpdf")).href;
+  return `
+    const unpdfUrl = ${JSON.stringify(unpdfUrl)};
+
+    export function resolve(specifier, context, nextResolve) {
+      if (specifier === "unpdf") {
+        return { url: "pi-web-access:test-unpdf", shortCircuit: true };
+      }
+      return nextResolve(specifier, context);
+    }
+
+    export async function load(url, context, nextLoad) {
+      if (url === "pi-web-access:test-unpdf") {
+        return {
+          format: "module",
+          shortCircuit: true,
+          source:
+            "import * as unpdf from " + JSON.stringify(unpdfUrl) + ";" +
+            "export const getDocumentProxy = (...args) => {" +
+            "  globalThis.__piWebAccessUnpdfOptions = args[1];" +
+            "  return unpdf.getDocumentProxy(...args);" +
+            "};",
+        };
+      }
+      return nextLoad(url, context);
+    }
+  `;
+}
+
+function buildChildScript(moduleUrl, printOptions = false) {
   return `
     import { mkdtemp, readFile } from "node:fs/promises";
     import { tmpdir } from "node:os";
@@ -50,6 +116,7 @@ function buildChildScript(moduleUrl) {
     );
 
     console.log(await readFile(result.outputPath, "utf8"));
+    ${printOptions ? "console.log(JSON.stringify(globalThis.__piWebAccessUnpdfOptions));" : ""}
 
     function makePdf(text) {
       const content = "BT /F1 24 Tf 72 720 Td (" + text + ") Tj ET";

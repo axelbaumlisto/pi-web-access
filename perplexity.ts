@@ -1,7 +1,9 @@
+import { existsSync, readFileSync } from "node:fs";
 import { activityMonitor } from "./activity.ts";
 import type { ExtractedContent } from "./extract.ts";
+import { hasCredentialSource, redactCredential, resolveCredential } from "./credential-source.ts";
 import { getWebSearchConfigPath } from "./utils.ts";
-import { providerApiKey, providerUrl } from "./provider-endpoints.ts";
+import { providerProxyApiKey, providerUrl } from "./provider-endpoints.ts";
 import { redactError } from "./redact.ts";
 
 // Endpoint override lives in provider-endpoints.ts (env > config > default).
@@ -37,8 +39,38 @@ export interface SearchOptions {
 	signal?: AbortSignal;
 }
 
-function getApiKey(): string {
-	const key = providerApiKey("perplexity");
+interface WebSearchConfig {
+	perplexityApiKey?: unknown;
+}
+
+let cachedConfig: WebSearchConfig | null = null;
+
+function loadConfig(): WebSearchConfig {
+	if (cachedConfig) return cachedConfig;
+	if (!existsSync(CONFIG_PATH)) {
+		cachedConfig = {};
+		return cachedConfig;
+	}
+
+	const content = readFileSync(CONFIG_PATH, "utf-8");
+	try {
+		cachedConfig = JSON.parse(content) as WebSearchConfig;
+		return cachedConfig;
+	} catch (err) {
+		const message = err instanceof Error ? err.message : String(err);
+		throw new Error(`Failed to parse ${CONFIG_PATH}: ${message}`);
+	}
+}
+
+async function getApiKey(signal?: AbortSignal): Promise<string> {
+	// Destination-first: the shared proxy key when the endpoint is proxied.
+	const proxyKey = providerProxyApiKey("perplexity");
+	const key = proxyKey ?? await resolveCredential({
+		provider: "Perplexity",
+		configuredValue: loadConfig().perplexityApiKey,
+		environmentValue: process.env.PERPLEXITY_API_KEY,
+		signal,
+	});
 	if (!key) {
 		throw new Error(
 			"Perplexity API key not found. Either:\n" +
@@ -74,7 +106,12 @@ function validateDomainFilter(domains: string[]): string[] {
 }
 
 export function isPerplexityAvailable(): boolean {
-	return providerApiKey("perplexity") !== null;
+	if (providerProxyApiKey("perplexity") !== null) return true;
+	return hasCredentialSource({
+		provider: "Perplexity",
+		configuredValue: loadConfig().perplexityApiKey,
+		environmentValue: process.env.PERPLEXITY_API_KEY,
+	});
 }
 
 export async function searchWithPerplexity(query: string, options: SearchOptions = {}): Promise<SearchResponse> {
@@ -89,7 +126,7 @@ export async function searchWithPerplexity(query: string, options: SearchOptions
 		windowMs: RATE_LIMIT.windowMs,
 	});
 
-	const apiKey = getApiKey();
+	const apiKey = await getApiKey(options.signal);
 	const requestBody: Record<string, unknown> = {
 		model: "sonar",
 		messages: [{ role: "user", content: query }],
@@ -124,17 +161,21 @@ export async function searchWithPerplexity(query: string, options: SearchOptions
 		});
 	} catch (err) {
 		const message = err instanceof Error ? err.message : String(err);
-		if (message.toLowerCase().includes("abort")) {
+		const redactedMessage = redactCredential(message, apiKey);
+		if (redactedMessage.toLowerCase().includes("abort")) {
 			activityMonitor.logComplete(activityId, 0);
 		} else {
-			activityMonitor.logError(activityId, message);
+			activityMonitor.logError(activityId, redactedMessage);
 		}
-		throw err;
+		if (redactedMessage === message) throw err;
+		const redactedError = new Error(redactedMessage);
+		if (err instanceof Error) redactedError.name = err.name;
+		throw redactedError;
 	}
 
 	if (!response.ok) {
 		activityMonitor.logComplete(activityId, response.status);
-		const errorText = await response.text();
+		const errorText = redactCredential(await response.text(), apiKey);
 		throw new Error(`Perplexity API error ${response.status}: ${redactError(errorText)}`);
 	}
 
@@ -151,6 +192,8 @@ export async function searchWithPerplexity(query: string, options: SearchOptions
 	const citations = Array.isArray(data.citations) ? data.citations : [];
 
 	const results: SearchResult[] = [];
+	// Fork behavior: preserve EVERY citation — the answer text references sources
+	// by index ([8]), so capping at numResults would break those references.
 	for (let i = 0; i < citations.length; i++) {
 		const citation = citations[i];
 		if (typeof citation === "string") {

@@ -1,57 +1,148 @@
 import { existsSync, readFileSync } from "node:fs";
 import type { ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { activityMonitor } from "./activity.ts";
-import { getApiKey, getVersionedApiBase, buildKeyParam, buildAuthHeaders, isGatewayConfigured, DEFAULT_MODEL } from "./gemini-api.ts";
-import { isGeminiWebAvailable, queryWithCookies } from "./gemini-web.ts";
+import { CredentialResolutionError } from "./credential-source.ts";
+import { getApiKey, getVersionedApiBase, fetchGeminiApi, isGatewayConfigured, isGeminiApiAvailable, redactGeminiApiResponse } from "./gemini-api.ts";
+import { getGeminiWebAvailabilityDiagnostic, isGeminiWebAvailable, queryWithCookies } from "./gemini-web.ts";
 import { isPerplexityAvailable, searchWithPerplexity, type SearchResult, type SearchResponse, type SearchOptions } from "./perplexity.ts";
-import { hasExaApiKey, isExaAvailable, searchWithExa } from "./exa.ts";
+import { isExaAvailable, searchWithExa } from "./exa.ts";
 import { isBraveAvailable, searchWithBrave } from "./brave.ts";
 import { isOpenAISearchAvailable, searchWithOpenAI } from "./openai-search.ts";
 import { isParallelAvailable, searchWithParallel } from "./parallel.ts";
 import { isTavilyAvailable, searchWithTavily } from "./tavily.ts";
+import { isSerpdiveAvailable, searchWithSerpdive } from "./serpdive.ts";
+import { isSearXNGAvailable, searchWithSearXNG } from "./searxng.ts";
+import { isAnySearchAvailable, searchWithAnySearch } from "./anysearch.ts";
 import { getWebSearchConfigPath } from "./utils.ts";
 import { validateRemoteUrl } from "./ssrf-protection.ts";
 
-export type SearchProvider = "auto" | "openai" | "brave" | "parallel" | "tavily" | "perplexity" | "gemini" | "exa";
+export type SearchProvider = "auto" | "openai" | "brave" | "parallel" | "tavily" | "searxng" | "perplexity" | "gemini" | "exa" | "serpdive" | "anysearch";
 export type ResolvedSearchProvider = Exclude<SearchProvider, "auto">;
+export type SearchProviderErrorKind =
+	| "transient"
+	| "quota"
+	| "network"
+	| "credential"
+	| "config"
+	| "auth"
+	| "invalid-request"
+	| "invalid-response"
+	| "aborted"
+	| "unknown";
+
+export interface SearchRoutingConfig {
+	providers: ResolvedSearchProvider[];
+	fallbackOn: Array<Extract<SearchProviderErrorKind, "transient" | "quota" | "network">>;
+}
+
+export class SearchProviderError extends Error {
+	readonly provider: ResolvedSearchProvider;
+	readonly kind: SearchProviderErrorKind;
+	readonly status?: number;
+	readonly causeError: unknown;
+
+	constructor(
+		provider: ResolvedSearchProvider,
+		kind: SearchProviderErrorKind,
+		message: string,
+		status: number | undefined,
+		cause: unknown,
+	) {
+		super(`${provider} search failed (${kind}): ${message}`);
+		this.name = "SearchProviderError";
+		this.provider = provider;
+		this.kind = kind;
+		this.status = status;
+		this.causeError = cause;
+	}
+}
 
 export interface AttributedSearchResponse extends SearchResponse {
 	provider: ResolvedSearchProvider;
 }
 
 const CONFIG_PATH = getWebSearchConfigPath();
+const DEFAULT_SEARCH_MODEL = "gemini-2.5-flash";
+const VALID_SEARCH_PROVIDERS: SearchProvider[] = ["auto", "openai", "brave", "parallel", "tavily", "searxng", "perplexity", "gemini", "exa", "serpdive", "anysearch"];
+const VALID_ROUTING_KINDS = ["transient", "quota", "network"] as const;
 
-let cachedSearchConfig: { searchProvider: SearchProvider; searchModel?: string } | null = null;
+type SearchConfig = {
+	searchProvider: SearchProvider;
+	searchProviderConfigured: boolean;
+	searchRouting?: SearchRoutingConfig;
+	searchModel?: string;
+};
 
-function getSearchConfig(): { searchProvider: SearchProvider; searchModel?: string } {
+let cachedSearchConfig: SearchConfig | null = null;
+
+function getSearchConfig(): SearchConfig {
 	if (cachedSearchConfig) return cachedSearchConfig;
 	if (!existsSync(CONFIG_PATH)) {
-		cachedSearchConfig = { searchProvider: "auto", searchModel: undefined };
+		cachedSearchConfig = { searchProvider: "auto", searchProviderConfigured: false };
 		return cachedSearchConfig;
 	}
 
 	const rawText = readFileSync(CONFIG_PATH, "utf-8");
-	let raw: {
-		searchProvider?: SearchProvider;
-		provider?: SearchProvider;
-		searchModel?: unknown;
-	};
+	let raw: Record<string, unknown>;
 	try {
-		raw = JSON.parse(rawText) as {
-			searchProvider?: SearchProvider;
-			provider?: SearchProvider;
-			searchModel?: unknown;
-		};
+		const parsed: unknown = JSON.parse(rawText);
+		if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) {
+			throw new Error("expected a JSON object");
+		}
+		raw = parsed as Record<string, unknown>;
 	} catch (err) {
 		const message = err instanceof Error ? err.message : String(err);
 		throw new Error(`Failed to parse ${CONFIG_PATH}: ${message}`);
 	}
 
+	const searchModel = normalizeSearchModel(raw.searchModel);
+	const searchProviderConfigured = Object.hasOwn(raw, "searchProvider") || Object.hasOwn(raw, "provider");
 	cachedSearchConfig = {
 		searchProvider: normalizeSearchProvider(raw.searchProvider ?? raw.provider),
-		searchModel: normalizeSearchModel(raw.searchModel),
+		searchProviderConfigured,
+		...(Object.hasOwn(raw, "searchRouting") ? { searchRouting: normalizeSearchRouting(raw.searchRouting) } : {}),
+		...(searchModel ? { searchModel } : {}),
 	};
 	return cachedSearchConfig;
+}
+
+function normalizeSearchRouting(value: unknown): SearchRoutingConfig {
+	if (!value || typeof value !== "object" || Array.isArray(value)) {
+		throw new Error(`searchRouting in ${CONFIG_PATH} must be an object`);
+	}
+	const raw = value as Record<string, unknown>;
+	if (!Array.isArray(raw.providers) || raw.providers.length === 0) {
+		throw new Error(`searchRouting.providers in ${CONFIG_PATH} must be a non-empty array`);
+	}
+	const providers: ResolvedSearchProvider[] = [];
+	for (const provider of raw.providers) {
+		const normalized = typeof provider === "string" ? provider.trim().toLowerCase() : "";
+		if (!VALID_SEARCH_PROVIDERS.includes(normalized as SearchProvider) || normalized === "auto") {
+			throw new Error(`searchRouting.providers in ${CONFIG_PATH} contains an invalid provider: ${String(provider)}`);
+		}
+		if (providers.includes(normalized as ResolvedSearchProvider)) {
+			throw new Error(`searchRouting.providers in ${CONFIG_PATH} must not contain duplicates: ${normalized}`);
+		}
+		providers.push(normalized as ResolvedSearchProvider);
+	}
+	if (!Array.isArray(raw.fallbackOn) || raw.fallbackOn.length === 0) {
+		throw new Error(`searchRouting.fallbackOn in ${CONFIG_PATH} must be a non-empty array`);
+	}
+	const fallbackOn: SearchRoutingConfig["fallbackOn"] = [];
+	for (const kind of raw.fallbackOn) {
+		if (typeof kind !== "string" || !VALID_ROUTING_KINDS.includes(kind as typeof VALID_ROUTING_KINDS[number])) {
+			throw new Error(`searchRouting.fallbackOn in ${CONFIG_PATH} may only contain transient, quota, or network`);
+		}
+		if (!fallbackOn.includes(kind as SearchRoutingConfig["fallbackOn"][number])) {
+			fallbackOn.push(kind as SearchRoutingConfig["fallbackOn"][number]);
+		}
+	}
+	return { providers, fallbackOn };
+}
+
+export function getConfiguredSearchRouting(): SearchRoutingConfig | undefined {
+	const config = getSearchConfig();
+	return config.searchProviderConfigured ? undefined : config.searchRouting;
 }
 
 function normalizeSearchModel(value: unknown): string | undefined {
@@ -62,8 +153,7 @@ function normalizeSearchModel(value: unknown): string | undefined {
 
 function normalizeSearchProvider(value: unknown): SearchProvider {
 	const normalized = typeof value === "string" ? value.trim().toLowerCase() : "";
-	const valid: SearchProvider[] = ["auto", "openai", "brave", "parallel", "tavily", "perplexity", "gemini", "exa"];
-	return valid.includes(normalized as SearchProvider) ? normalized as SearchProvider : "auto";
+	return VALID_SEARCH_PROVIDERS.includes(normalized as SearchProvider) ? normalized as SearchProvider : "auto";
 }
 
 export interface FullSearchOptions extends SearchOptions {
@@ -99,13 +189,15 @@ async function searchWithGemini(
 		const apiResult = await searchWithGeminiApi(query, options);
 		if (apiResult) return apiResult;
 	} catch (err) {
-		if (isAbortError(err)) throw err;
+		if (err instanceof CredentialResolutionError || isAbortError(err)) throw err;
 		errors.push(`Gemini API: ${errorMessage(err)}`);
 	}
 
 	try {
 		const webResult = await searchWithGeminiWeb(query, options);
 		if (webResult) return webResult;
+		const diagnostic = getGeminiWebAvailabilityDiagnostic();
+		if (diagnostic) errors.push(`Gemini Web: ${diagnostic}`);
 	} catch (err) {
 		if (isAbortError(err)) throw err;
 		errors.push(`Gemini Web: ${errorMessage(err)}`);
@@ -123,60 +215,124 @@ function isEmptyResponse(r: SearchResponse): boolean {
 	return (!r.results || r.results.length === 0) && !r.answer?.trim();
 }
 
-export async function search(query: string, options: FullSearchOptions = {}): Promise<AttributedSearchResponse> {
-	const config = getSearchConfig();
-	const provider = options.provider ?? config.searchProvider;
+function providerErrorStatus(message: string): number | undefined {
+	const match = message.match(/\b(?:error|status|http)\s+(\d{3})\b/i);
+	if (!match) return undefined;
+	return Number(match[1]);
+}
 
+function classifyProviderError(provider: ResolvedSearchProvider, err: unknown): SearchProviderError {
+	if (err instanceof SearchProviderError) return err;
+	const message = errorMessage(err);
+	const lower = message.toLowerCase();
+	const status = providerErrorStatus(message);
+	let kind: SearchProviderErrorKind = "unknown";
+	if (err instanceof CredentialResolutionError || /(?:api )?key (?:not found|missing)|credential resolution/.test(lower)) {
+		kind = "credential";
+	} else if (isAbortError(err)) {
+		kind = "aborted";
+	} else if (status === 401 || status === 403) {
+		kind = "auth";
+	} else if (status === 400 || status === 422) {
+		kind = "invalid-request";
+	} else if (status === 402 || status === 429) {
+		kind = "quota";
+	} else if (status !== undefined && (status === 408 || status === 425 || status >= 500)) {
+		kind = "transient";
+	} else if (/rate limit|quota|too many requests/.test(lower)) {
+		kind = "quota";
+	} else if (/unauthorized|forbidden|permission denied/.test(lower)) {
+		kind = "auth";
+	} else if (/bad request|invalid request/.test(lower)) {
+		kind = "invalid-request";
+	} else if (/invalid json|no parseable response|returned invalid response|returned empty response/.test(lower)) {
+		kind = "invalid-response";
+	} else if (/temporar|service unavailable|server error/.test(lower)) {
+		kind = "transient";
+	} else if (err instanceof TypeError || /fetch failed|network|econnreset|econnrefused|enotfound|etimedout|timed out|socket/.test(lower)) {
+		kind = "network";
+	} else if (/invalid or missing|invalid config|failed to parse|must be an? |configuration/.test(lower)) {
+		kind = "config";
+	}
+	return new SearchProviderError(provider, kind, message, status, err);
+}
+
+async function searchWithResolvedProvider(
+	provider: ResolvedSearchProvider,
+	query: string,
+	options: FullSearchOptions,
+): Promise<AttributedSearchResponse> {
 	if (provider === "openai") {
 		const result = await searchWithOpenAI(query, options, options.extensionContext);
-		return { ...result, provider: "openai" };
+		return { ...result, provider };
 	}
-
-	if (provider === "brave") {
-		const result = await searchWithBrave(query, options);
-		return { ...result, provider: "brave" };
-	}
-
-	if (provider === "parallel") {
-		const result = await searchWithParallel(query, options);
-		return { ...result, provider: "parallel" };
-	}
-
-	if (provider === "tavily") {
-		const result = await searchWithTavily(query, options);
-		return { ...result, provider: "tavily" };
-	}
-
-	if (provider === "perplexity") {
-		const result = await searchWithPerplexity(query, options);
-		return { ...result, provider: "perplexity" };
-	}
-
+	if (provider === "brave") return { ...(await searchWithBrave(query, options)), provider };
+	if (provider === "parallel") return { ...(await searchWithParallel(query, options)), provider };
+	if (provider === "tavily") return { ...(await searchWithTavily(query, options)), provider };
+	if (provider === "serpdive") return { ...(await searchWithSerpdive(query, options)), provider };
+	if (provider === "anysearch") return { ...(await searchWithAnySearch(query, options)), provider };
+	if (provider === "perplexity") return { ...(await searchWithPerplexity(query, options)), provider };
+	if (provider === "searxng") return { ...(await searchWithSearXNG(query, options)), provider };
 	if (provider === "gemini") {
 		const result = await searchWithGemini(query, options, true);
-		if (result) return { ...result, provider: "gemini" };
+		if (result) return { ...result, provider };
 		throw new Error(
 			"Gemini search unavailable. Either:\n" +
-			`  1. Set GEMINI_API_KEY in ${CONFIG_PATH}\n` +
+			`  1. Configure geminiApiKey in ${CONFIG_PATH} or set GEMINI_API_KEY\n` +
 			"  2. Set GOOGLE_GEMINI_BASE_URL + CLOUDFLARE_API_KEY for Cloudflare AI Gateway routing\n" +
-			"  3. Sign into gemini.google.com in a supported Chromium-based browser"
+			"  3. Sign into gemini.google.com in a supported Chromium-based browser",
 		);
 	}
+	const result = await searchWithExa(query, options);
+	if (result) return { ...result, provider };
+	throw new Error("Exa search returned no results.");
+}
 
-	if (provider === "exa") {
-		const exaApiKeyConfigured = hasExaApiKey();
-		try {
-			const result = await searchWithExa(query, options);
-			if (result) return { ...result, provider: "exa" };
-			if (exaApiKeyConfigured) {
-				throw new Error("Exa search returned no results.");
-			}
-		} catch (err) {
-			const message = err instanceof Error ? err.message : String(err);
-			if (message.toLowerCase().includes("abort")) throw err;
-			if (exaApiKeyConfigured) throw err;
-			// No API key: allow provider fallback.
+async function isResolvedProviderAvailable(provider: ResolvedSearchProvider, options: FullSearchOptions): Promise<boolean> {
+	if (provider === "openai") return isOpenAISearchAvailable(options.extensionContext);
+	if (provider === "brave") return isBraveAvailable();
+	if (provider === "parallel") return isParallelAvailable();
+	if (provider === "tavily") return isTavilyAvailable();
+	if (provider === "serpdive") return isSerpdiveAvailable();
+	if (provider === "anysearch") return isAnySearchAvailable();
+	if (provider === "perplexity") return isPerplexityAvailable();
+	if (provider === "searxng") return isSearXNGAvailable();
+	if (provider === "gemini") return isGeminiApiAvailable() || !!(await isGeminiWebAvailable());
+	return isExaAvailable();
+}
+
+async function searchWithConfiguredRouting(
+	query: string,
+	options: FullSearchOptions,
+	routing: SearchRoutingConfig,
+): Promise<AttributedSearchResponse> {
+	const diagnostics: string[] = [];
+	for (const provider of routing.providers) {
+		if (!(await isResolvedProviderAvailable(provider, options))) {
+			diagnostics.push(`${provider}: unavailable`);
+			continue;
 		}
+		try {
+			return await searchWithResolvedProvider(provider, query, options);
+		} catch (err) {
+			const classified = classifyProviderError(provider, err);
+			diagnostics.push(`${provider} [${classified.kind}]: ${errorMessage(err)}`);
+			if (!routing.fallbackOn.includes(classified.kind as SearchRoutingConfig["fallbackOn"][number])) {
+				throw classified;
+			}
+		}
+	}
+	throw new Error(`Configured search routing exhausted:\n  - ${diagnostics.join("\n  - ")}`);
+}
+
+export async function search(query: string, options: FullSearchOptions = {}): Promise<AttributedSearchResponse> {
+	const config = getSearchConfig();
+	const provider = options.provider === undefined || options.provider === "auto"
+		? config.searchProvider
+		: options.provider;
+	if (provider !== "auto") return searchWithResolvedProvider(provider, query, options);
+	if (!config.searchProviderConfigured && config.searchRouting) {
+		return searchWithConfiguredRouting(query, options, config.searchRouting);
 	}
 
 	const fallbackErrors: string[] = [];
@@ -201,6 +357,16 @@ export async function search(query: string, options: FullSearchOptions = {}): Pr
 		return attributed;
 	};
 
+	if (isSearXNGAvailable()) {
+		try {
+			const hit = takeAuto(await searchWithSearXNG(query, options), "searxng");
+			if (hit) return hit;
+		} catch (err) {
+			if (isAbortError(err)) throw err;
+			fallbackErrors.push(`SearXNG: ${errorMessage(err)}`);
+		}
+	}
+
 	if (shouldTryOpenAIInAuto(options)) {
 		try {
 			if (await isOpenAISearchAvailable(options.extensionContext)) {
@@ -213,12 +379,12 @@ export async function search(query: string, options: FullSearchOptions = {}): Pr
 		}
 	}
 
-	if (provider !== "exa" && isExaAvailable()) {
+	if (isExaAvailable()) {
 		try {
 			const hit = takeAuto(await searchWithExa(query, options), "exa");
 			if (hit) return hit;
 		} catch (err) {
-			if (isAbortError(err)) throw err;
+			if (err instanceof CredentialResolutionError || isAbortError(err)) throw err;
 			fallbackErrors.push(`Exa: ${errorMessage(err)}`);
 		}
 	}
@@ -253,6 +419,16 @@ export async function search(query: string, options: FullSearchOptions = {}): Pr
 		}
 	}
 
+	if (isSerpdiveAvailable()) {
+		try {
+			const hit = takeAuto(await searchWithSerpdive(query, options), "serpdive");
+			if (hit) return hit;
+		} catch (err) {
+			if (isAbortError(err)) throw err;
+			fallbackErrors.push(`SERPdive: ${errorMessage(err)}`);
+		}
+	}
+
 	if (isPerplexityAvailable()) {
 		try {
 			const hit = takeAuto(await searchWithPerplexity(query, options), "perplexity");
@@ -283,38 +459,40 @@ export async function search(query: string, options: FullSearchOptions = {}): Pr
 	throw new Error(
 		"No search provider available. Either:\n" +
 		"  1. Use /login to sign in with a Codex subscription for OpenAI web search\n" +
-		`  2. Set openaiApiKey, braveApiKey, parallelApiKey, tavilyApiKey, perplexityApiKey, exaApiKey, geminiApiKey, or cloudflareApiKey in ${CONFIG_PATH}\n` +
-		"  3. Set OPENAI_API_KEY, BRAVE_API_KEY, PARALLEL_API_KEY, TAVILY_API_KEY, EXA_API_KEY, PERPLEXITY_API_KEY, GEMINI_API_KEY, or CLOUDFLARE_API_KEY env vars\n" +
+		`  2. Set openaiApiKey, braveApiKey, parallelApiKey, tavilyApiKey, serpdiveApiKey, searxngBaseUrl, perplexityApiKey, exaApiKey, geminiApiKey, or cloudflareApiKey in ${CONFIG_PATH}\n` +
+		"  3. Set OPENAI_API_KEY, BRAVE_API_KEY, PARALLEL_API_KEY, TAVILY_API_KEY, SERPDIVE_API_KEY, SEARXNG_BASE_URL, EXA_API_KEY, PERPLEXITY_API_KEY, GEMINI_API_KEY, or CLOUDFLARE_API_KEY env vars\n" +
 		"  4. Set GOOGLE_GEMINI_BASE_URL with CLOUDFLARE_API_KEY for Cloudflare AI Gateway routing\n" +
-		"  5. Sign into gemini.google.com in a supported Chromium-based browser"
+		"  5. Sign into gemini.google.com in a supported Chromium-based browser\n" +
+		"  6. Explicitly select provider: \"anysearch\" for anonymous AnySearch"
 	);
 }
 
 async function searchWithGeminiApi(query: string, options: SearchOptions = {}): Promise<SearchResponse | null> {
-	const apiKey = getApiKey();
+	const requestSignal = AbortSignal.any([
+		AbortSignal.timeout(60000),
+		...(options.signal ? [options.signal] : []),
+	]);
+	const apiKey = await getApiKey(requestSignal);
 	if (!apiKey && !isGatewayConfigured()) return null;
 
 	const activityId = activityMonitor.logStart({ type: "api", query });
 
 	try {
-		const model = getSearchConfig().searchModel ?? DEFAULT_MODEL;
+		const model = getSearchConfig().searchModel ?? DEFAULT_SEARCH_MODEL;
 		const body = {
 			contents: [{ role: "user", parts: [{ text: appendSearchConstraints(query, options) }] }],
 			tools: [{ google_search: {} }],
 		};
 
-		const res = await fetch(`${getVersionedApiBase()}/models/${model}:generateContent${buildKeyParam(apiKey)}`, {
+		const res = await fetchGeminiApi(`${getVersionedApiBase()}/models/${model}:generateContent`, {
 			method: "POST",
-			headers: { "Content-Type": "application/json", ...buildAuthHeaders() },
+			headers: { "Content-Type": "application/json" },
 			body: JSON.stringify(body),
-			signal: AbortSignal.any([
-				AbortSignal.timeout(60000),
-				...(options.signal ? [options.signal] : []),
-			]),
-		});
+			signal: requestSignal,
+		}, apiKey);
 
 		if (!res.ok) {
-			const errorText = await res.text();
+			const errorText = redactGeminiApiResponse(res, await res.text(), apiKey);
 			throw new Error(`Gemini API error ${res.status}: ${errorText.slice(0, 300)}`);
 		}
 

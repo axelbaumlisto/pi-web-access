@@ -7,11 +7,12 @@ import { extractRSCContent } from "./rsc-extract.ts";
 import { extractPDFToMarkdown, isPDF } from "./pdf-extract.ts";
 import { extractGitHub } from "./github-extract.ts";
 import { isYouTubeURL, isYouTubeEnabled, extractYouTube, extractYouTubeFrame, extractYouTubeFrames, getYouTubeStreamInfo } from "./youtube-extract.ts";
+import { CredentialResolutionError } from "./credential-source.ts";
 import { extractWithUrlContext, extractWithGeminiWeb } from "./gemini-url-context.ts";
 import { extractWithParallel, isParallelAvailable } from "./parallel.ts";
+import { extractWithFirecrawl, isFirecrawlAvailable } from "./firecrawl.ts";
 import { isVideoFile, extractVideo, extractVideoFrame, getLocalVideoDuration } from "./video-extract.ts";
-import { existsSync, readFileSync } from "node:fs";
-import { fetchRemoteUrl, validateRemoteUrl, type Lookup } from "./ssrf-protection.ts";
+import { fetchRemoteUrl, loadFetchContentDomainPolicy, loadSsrfConfig, validateRemoteUrl, type Lookup } from "./ssrf-protection.ts";
 import { formatSeconds, getWebSearchConfigPath } from "./utils.ts";
 
 const DEFAULT_TIMEOUT_MS = 30000;
@@ -21,37 +22,10 @@ const NON_RECOVERABLE_ERRORS = ["Unsupported content type", "Response too large"
 const MIN_USEFUL_CONTENT = 500;
 const WEB_SEARCH_CONFIG_PATH = getWebSearchConfigPath();
 
-/**
- * Read `ssrf.allowRanges` (CIDR strings) from web-search.json. Returns [] when
- * the file is missing, unreadable, or the key is unset so SSRF protection stays
- * fully on by default. Throws when `ssrf.allowRanges` is present but not an array
- * so a mistyped value (e.g. a bare string instead of a JSON array) fails loudly
- * instead of being silently ignored. Exempts synthetic ranges used by TUN/fake-IP
- * proxies (e.g. 198.18.0.0/15).
- */
+export { loadSsrfConfig } from "./ssrf-protection.ts";
+
 export function loadSsrfAllowRanges(): string[] {
-	let value: unknown;
-	try {
-		if (!existsSync(WEB_SEARCH_CONFIG_PATH)) return [];
-		const raw = readFileSync(WEB_SEARCH_CONFIG_PATH, "utf-8");
-		value = (JSON.parse(raw) as { ssrf?: { allowRanges?: unknown } })?.ssrf?.allowRanges;
-	} catch {
-		// Missing/unreadable file or invalid JSON: fail safe with SSRF fully on.
-		return [];
-	}
-	if (value === undefined || value === null) return [];
-	if (!Array.isArray(value)) {
-		throw new Error(`ssrf.allowRanges in ${WEB_SEARCH_CONFIG_PATH} must be an array of CIDR strings`);
-	}
-	const ranges: string[] = [];
-	for (const [index, entry] of value.entries()) {
-		if (typeof entry !== "string") {
-			throw new Error(`ssrf.allowRanges in ${WEB_SEARCH_CONFIG_PATH} must contain only CIDR strings; entry ${index + 1} is ${typeof entry}`);
-		}
-		const trimmed = entry.trim();
-		if (trimmed) ranges.push(trimmed);
-	}
-	return ranges;
+	return loadSsrfConfig().allowRanges;
 }
 
 function errorMessage(err: unknown): string {
@@ -120,7 +94,14 @@ async function extractWithJinaReader(
 	const activityId = activityMonitor.logStart({ type: "api", query: `jina: ${url}` });
 
 	try {
-		await validateRemoteUrl(url, { allowRanges: loadSsrfAllowRanges(), lookup });
+		const ssrf = loadSsrfConfig();
+		const domainPolicy = loadFetchContentDomainPolicy();
+		await validateRemoteUrl(url, {
+			allowRanges: ssrf.allowRanges,
+			trustEnvProxy: ssrf.trustEnvProxy,
+			domainPolicy,
+			...(lookup ? { lookup } : {}),
+		});
 		const res = await fetch(jinaUrl, {
 			headers: {
 				"Accept": "text/markdown",
@@ -221,7 +202,7 @@ function buildFrameResult(
 		content: `${frames.length} frames extracted from ${label}`,
 		error: null,
 		frames,
-		duration,
+		...(duration !== undefined ? { duration } : {}),
 	};
 }
 
@@ -253,6 +234,27 @@ export async function extractContent(
 ): Promise<ExtractedContent> {
 	if (signal?.aborted) {
 		return { url, title: "", content: "", error: "Aborted" };
+	}
+
+	let remoteUrl: URL | null = null;
+	try {
+		const parsed = new URL(url);
+		if (parsed.protocol === "http:" || parsed.protocol === "https:") remoteUrl = parsed;
+	} catch {
+	}
+	if (remoteUrl) {
+		try {
+			const ssrf = loadSsrfConfig();
+			const domainPolicy = loadFetchContentDomainPolicy();
+			await validateRemoteUrl(remoteUrl, {
+				allowRanges: ssrf.allowRanges,
+				trustEnvProxy: ssrf.trustEnvProxy,
+				domainPolicy,
+				...(options?.lookup ? { lookup: options.lookup } : {}),
+			});
+		} catch (err) {
+			return { url, title: "", content: "", error: errorMessage(err) };
+		}
 	}
 
 	if (options?.frames && !options.timestamp) {
@@ -405,10 +407,7 @@ export async function extractContent(
 	}
 
 	try {
-		const parsed = new URL(url);
-		if (parsed.protocol === "http:" || parsed.protocol === "https:") {
-			await validateRemoteUrl(parsed, { allowRanges: loadSsrfAllowRanges(), lookup: options?.lookup });
-		}
+		if (!remoteUrl) new URL(url);
 	} catch (err) {
 		return { url, title: "", content: "", error: errorMessage(err) };
 	}
@@ -458,6 +457,24 @@ export async function extractContent(
 	if (!httpResult.error) return httpResult;
 	if (NON_RECOVERABLE_ERRORS.some(prefix => httpResult.error!.startsWith(prefix))) return httpResult;
 
+	let firecrawlError: string | null = null;
+	try {
+		if (isFirecrawlAvailable()) {
+			const ssrf = loadSsrfConfig();
+			const firecrawlResult = await extractWithFirecrawl(url, signal, {
+				timeoutMs: options?.timeoutMs,
+				...(options?.lookup ? { lookup: options.lookup } : {}),
+				ssrf,
+			});
+			if (firecrawlResult) return firecrawlResult;
+		}
+	} catch (err) {
+		if (isAbortError(err)) return abortedResult(url);
+		firecrawlError = errorMessage(err);
+		if (isConfigParseError(err)) return { ...httpResult, error: firecrawlError };
+	}
+	if (signal?.aborted) return abortedResult(url);
+
 	const jinaResult = await extractWithJinaReader(url, signal, options?.lookup);
 	if (jinaResult) return jinaResult;
 	if (signal?.aborted) return abortedResult(url);
@@ -483,7 +500,7 @@ export async function extractContent(
 			?? await extractWithGeminiWeb(url, signal);
 	} catch (err) {
 		if (isAbortError(err)) return abortedResult(url);
-		if (isConfigParseError(err)) {
+		if (err instanceof CredentialResolutionError || isConfigParseError(err)) {
 			return { ...httpResult, error: errorMessage(err) };
 		}
 	}
@@ -493,9 +510,11 @@ export async function extractContent(
 
 	const guidance = [
 		httpResult.error,
+		...(firecrawlError ? [`Firecrawl fallback failed: ${firecrawlError}`] : []),
 		...(parallelError ? [`Parallel fallback failed: ${parallelError}`] : []),
 		"",
 		"Fallback options:",
+		`  \u2022 Set firecrawlBaseUrl in ${WEB_SEARCH_CONFIG_PATH} to a self-hosted Firecrawl instance`,
 		`  \u2022 Set PARALLEL_API_KEY in ${WEB_SEARCH_CONFIG_PATH}`,
 		`  \u2022 Set GEMINI_API_KEY in ${WEB_SEARCH_CONFIG_PATH}`,
 		"  \u2022 Sign into gemini.google.com in Chrome",
@@ -541,6 +560,8 @@ async function extractViaHttp(
 	signal?.addEventListener("abort", onAbort);
 
 	try {
+		const ssrf = loadSsrfConfig();
+		const domainPolicy = loadFetchContentDomainPolicy();
 		const response = await fetchRemoteUrl(
 			url,
 			{
@@ -557,7 +578,12 @@ async function extractViaHttp(
 					"Upgrade-Insecure-Requests": "1",
 				},
 			},
-			{ allowRanges: loadSsrfAllowRanges(), lookup: options?.lookup },
+			{
+				allowRanges: ssrf.allowRanges,
+				trustEnvProxy: ssrf.trustEnvProxy,
+				domainPolicy,
+				...(options?.lookup ? { lookup: options.lookup } : {}),
+			},
 		);
 
 		if (!response.ok) {
@@ -655,6 +681,9 @@ async function extractViaHttp(
 			};
 		}
 
+		if (typeof article.content !== "string") {
+			throw new Error("Readability returned invalid article content");
+		}
 		const markdown = turndown.turndown(article.content);
 		activityMonitor.logComplete(activityId, response.status);
 

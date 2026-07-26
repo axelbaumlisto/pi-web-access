@@ -32,7 +32,7 @@ function baseOptions(timeout = 1) {
 		queries: ["test query"],
 		sessionToken: "test-token",
 		timeout,
-		availableProviders: { openai: false, brave: false, parallel: false, tavily: false, perplexity: false, exa: true, gemini: false },
+		availableProviders: { openai: false, brave: false, parallel: false, tavily: false, searxng: false, perplexity: false, exa: true, gemini: false },
 		defaultProvider: "exa",
 		searchProvider: "exa",
 		summaryModels: [],
@@ -75,6 +75,28 @@ test("curator times out when searches finish but no browser connects", async () 
 
 		const reason = await withTimeout(cancelPromise, "no-browser timeout");
 		assert.equal(reason, "timeout");
+	} finally {
+		handle.close();
+	}
+});
+
+test("curator submit rejects contradictory summary metadata", async () => {
+	const { startCuratorServer } = await loadServer();
+	const handle = await startCuratorServer(baseOptions(20), baseCallbacks(() => {}));
+
+	try {
+		for (const summaryMeta of [
+			{ model: null, durationMs: 0, tokenEstimate: 0, fallbackUsed: false, phase: "deterministic-fallback" },
+			{ model: "model", durationMs: 0, tokenEstimate: 0, fallbackUsed: true, phase: "summary-model" },
+		]) {
+			const response = await fetch(new URL("/submit", handle.url), {
+				method: "POST",
+				headers: { "Content-Type": "application/json" },
+				body: JSON.stringify({ token: "test-token", selected: [], summaryMeta }),
+			});
+			assert.equal(response.status, 400);
+			assert.deepEqual(await response.json(), { ok: false, error: "Invalid summaryMeta" });
+		}
 	} finally {
 		handle.close();
 	}

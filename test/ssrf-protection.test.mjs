@@ -56,6 +56,65 @@ test("validateRemoteUrl permits public HTTP and HTTPS targets", async () => {
 	assert.equal((await validateRemoteUrl("https://[2606:2800:220:1:248:1893:25c8:1946]/")).hostname, "[2606:2800:220:1:248:1893:25c8:1946]");
 });
 
+test("domain policy allows exact and subdomain matches, and is off by default", async () => {
+	assert.equal((await validateRemoteUrl("https://example.com/", { lookup: publicLookup })).hostname, "example.com");
+	assert.equal((await validateRemoteUrl("https://www.example.com/", {
+		lookup: publicLookup,
+		domainPolicy: { allow: ["example.com"], deny: [] },
+	})).hostname, "www.example.com");
+	await assert.rejects(
+		validateRemoteUrl("https://other.test/", {
+			lookup: publicLookup,
+			domainPolicy: { allow: ["example.com"], deny: [] },
+		}),
+		/Hostname not allowed by fetch_content domain policy/,
+	);
+});
+
+test("domain policy deny wins over allow", async () => {
+	await assert.rejects(
+		validateRemoteUrl("https://private.example.com/", {
+			lookup: publicLookup,
+			domainPolicy: { allow: ["example.com"], deny: ["private.example.com"] },
+		}),
+		/Blocked hostname by fetch_content domain policy/,
+	);
+});
+
+test("domain policy validates redirect targets before following", async () => {
+	const requested = [];
+	const fetchImpl = async (url) => {
+		requested.push(url.toString());
+		return new Response("", { status: 302, headers: { location: "https://denied.example/next" } });
+	};
+
+	await assert.rejects(
+		fetchRemoteUrl("https://allowed.example/", {}, {
+			lookup: publicLookup,
+			fetch: fetchImpl,
+			domainPolicy: { allow: ["allowed.example"], deny: ["denied.example"] },
+		}),
+		/Blocked hostname by fetch_content domain policy/,
+	);
+	assert.deepEqual(requested, ["https://allowed.example/"]);
+});
+
+test("domain policy never relaxes SSRF protection", async () => {
+	await assert.rejects(
+		validateRemoteUrl("http://127.0.0.1/", {
+			domainPolicy: { allow: ["127.0.0.1"], deny: [] },
+		}),
+		/Blocked internal address/,
+	);
+	await assert.rejects(
+		validateRemoteUrl("https://internal.example/", {
+			lookup: async () => [{ address: "10.0.0.5", family: 4 }],
+			domainPolicy: { allow: ["example"], deny: [] },
+		}),
+		/Blocked internal address/,
+	);
+});
+
 test("fetchRemoteUrl validates redirect targets before following", async () => {
 	const requested = [];
 	const fetchImpl = async (url) => {
@@ -90,6 +149,15 @@ test("fetchRemoteUrl follows validated public redirects manually", async () => {
 	assert.equal(response.status, 200);
 	assert.equal(await response.text(), "ok");
 	assert.deepEqual(requested, ["https://example.com/start", "https://example.com/next"]);
+});
+
+test("fake-IP block errors point to the allowRanges opt-in", async () => {
+	const fakeIpLookup = async () => [{ address: "198.18.0.56", family: 4 }];
+
+	await assert.rejects(
+		validateRemoteUrl("https://example.test/", { lookup: fakeIpLookup }),
+		/Blocked internal address for example\.test: 198\.18\.0\.56\..*TUN\/fake-IP proxies.*ssrf\.allowRanges.*198\.18\.0\.0\/15/,
+	);
 });
 
 test("allowRanges exempts a synthetic fake-IP range (e.g. 198.18.0.0/15)", async () => {
@@ -210,4 +278,108 @@ test("allowRanges flows through fetchRemoteUrl and its redirect targets", async 
 	);
 	assert.equal(response.status, 200);
 	assert.deepEqual(requested, ["https://example.com/", "http://198.18.0.99/admin"]);
+});
+
+test("trustEnvProxy skips hostname DNS only for a configured proxy", async () => {
+	const previous = {
+		HTTP_PROXY: process.env.HTTP_PROXY,
+		http_proxy: process.env.http_proxy,
+		HTTPS_PROXY: process.env.HTTPS_PROXY,
+		https_proxy: process.env.https_proxy,
+		ALL_PROXY: process.env.ALL_PROXY,
+		all_proxy: process.env.all_proxy,
+		NO_PROXY: process.env.NO_PROXY,
+		no_proxy: process.env.no_proxy,
+	};
+	try {
+		for (const key of Object.keys(previous)) delete process.env[key];
+		process.env.HTTPS_PROXY = "http://proxy.example.test:8080";
+		let lookups = 0;
+		const lookup = async () => {
+			lookups++;
+			throw new Error("DNS should not run for proxied host");
+		};
+
+		await validateRemoteUrl("https://public.example.test/", { trustEnvProxy: true, lookup });
+		assert.equal(lookups, 0);
+
+		await assert.rejects(
+			validateRemoteUrl("https://127.0.0.1/", { trustEnvProxy: true, lookup }),
+			/Blocked internal address/,
+		);
+		await assert.rejects(
+			validateRemoteUrl("https://localhost/", { trustEnvProxy: true, lookup }),
+			/Blocked internal hostname/,
+		);
+	} finally {
+		for (const [key, value] of Object.entries(previous)) {
+			if (value === undefined) delete process.env[key];
+			else process.env[key] = value;
+		}
+	}
+});
+
+test("trustEnvProxy ignores invalid proxy environment values", async () => {
+	const previous = {
+		HTTP_PROXY: process.env.HTTP_PROXY,
+		http_proxy: process.env.http_proxy,
+		HTTPS_PROXY: process.env.HTTPS_PROXY,
+		https_proxy: process.env.https_proxy,
+		ALL_PROXY: process.env.ALL_PROXY,
+		all_proxy: process.env.all_proxy,
+		NO_PROXY: process.env.NO_PROXY,
+		no_proxy: process.env.no_proxy,
+	};
+	try {
+		for (const key of Object.keys(previous)) delete process.env[key];
+		for (const value of ["garbage", "file:///tmp/proxy", "   "]) {
+			process.env.HTTPS_PROXY = value;
+			let lookups = 0;
+			const url = await validateRemoteUrl("https://public.example.test/", {
+				trustEnvProxy: true,
+				lookup: async () => {
+					lookups++;
+					return [{ address: "93.184.216.34", family: 4 }];
+				},
+			});
+			assert.equal(url.hostname, "public.example.test");
+			assert.equal(lookups, 1);
+		}
+	} finally {
+		for (const [key, value] of Object.entries(previous)) {
+			if (value === undefined) delete process.env[key];
+			else process.env[key] = value;
+		}
+	}
+});
+
+test("trustEnvProxy still performs DNS for NO_PROXY hosts", async () => {
+	const previous = {
+		HTTPS_PROXY: process.env.HTTPS_PROXY,
+		NO_PROXY: process.env.NO_PROXY,
+	};
+	try {
+		process.env.HTTPS_PROXY = "http://proxy.example.test:8080";
+		process.env.NO_PROXY = "public.example.test:443, .internal.example.test";
+		let lookups = 0;
+		const lookup = async () => {
+			lookups++;
+			return [{ address: "93.184.216.34", family: 4 }];
+		};
+
+		await validateRemoteUrl("https://public.example.test/", { trustEnvProxy: true, lookup });
+		await validateRemoteUrl("https://api.internal.example.test/", { trustEnvProxy: true, lookup });
+		assert.equal(lookups, 2);
+
+		await validateRemoteUrl("https://public.example.test:8443/", { trustEnvProxy: true, lookup });
+		assert.equal(lookups, 2);
+
+		await validateRemoteUrl("https://other.example.test/", { trustEnvProxy: true, lookup });
+		assert.equal(lookups, 2);
+	} finally {
+		for (const [key, value] of Object.entries(previous)) {
+			if (value === undefined) delete process.env[key];
+			else process.env[key] = value;
+		}
+	}
 });

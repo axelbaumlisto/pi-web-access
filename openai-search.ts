@@ -2,8 +2,9 @@ import { existsSync, readFileSync } from "node:fs";
 import type { ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { activityMonitor } from "./activity.ts";
 import type { SearchOptions, SearchResponse, SearchResult } from "./perplexity.ts";
+import { hasCredentialSource, redactCredential, resolveCredential } from "./credential-source.ts";
 import { getWebSearchConfigPath } from "./utils.ts";
-import { PROVIDER_ENDPOINTS, providerApiKey, providerUrl } from "./provider-endpoints.ts";
+import { PROVIDER_ENDPOINTS, providerProxyApiKey, providerUrl } from "./provider-endpoints.ts";
 
 // Standard Responses endpoint override lives in provider-endpoints.ts
 // (env OPENAI_RESPONSES_URL > config openaiResponsesUrl > default). The codex
@@ -52,12 +53,6 @@ function loadConfig(): WebSearchConfig {
 		const message = err instanceof Error ? err.message : String(err);
 		throw new Error(`Failed to parse ${CONFIG_PATH}: ${message}`);
 	}
-}
-
-function normalizeApiKey(value: unknown): string | null {
-	if (typeof value !== "string") return null;
-	const normalized = value.trim();
-	return normalized.length > 0 ? normalized : null;
 }
 
 function normalizeDomain(value: string): string | null {
@@ -133,43 +128,74 @@ function isOpenAIAuthOrigin(url: string): boolean {
 	}
 }
 
-export async function resolveOpenAIAuth(ctx?: ExtensionContext): Promise<OpenAIAuth | undefined> {
+async function resolvePiAuth(ctx: ExtensionContext, responsesUrl: string): Promise<OpenAIAuth | undefined> {
+	for (const candidate of AUTH_MODEL_CANDIDATES) {
+		for (const modelId of candidate.models) {
+			try {
+				const model = ctx.modelRegistry.find(candidate.provider, modelId);
+				if (!model) continue;
+				const resolved = await ctx.modelRegistry.getApiKeyAndHeaders(model);
+				if (resolved.ok && resolved.apiKey) {
+					return {
+						provider: candidate.provider,
+						apiKey: resolved.apiKey,
+						model: modelId,
+						headers: resolved.headers ?? {},
+						responsesUrl,
+					};
+				}
+			} catch {
+			}
+		}
+	}
+	return undefined;
+}
+
+export async function resolveOpenAIAuth(ctx?: ExtensionContext, signal?: AbortSignal): Promise<OpenAIAuth | undefined> {
 	const responsesUrl = OPENAI_RESPONSES_URL();
 
 	// Model-registry credentials are personal OpenAI/Codex credentials. Only
 	// consult the registry when that credential will go to an OpenAI-owned
 	// origin; proxy/override destinations must use their destination-bound key.
 	if (ctx && isOpenAIAuthOrigin(responsesUrl)) {
-		const { getModel } = await import("@earendil-works/pi-ai/compat");
-		for (const candidate of AUTH_MODEL_CANDIDATES) {
-			for (const modelId of candidate.models) {
-				const model = getModel(candidate.provider, modelId);
-				if (!model) continue;
-				try {
-					const resolved = await ctx.modelRegistry.getApiKeyAndHeaders(model);
-					if (resolved.ok && resolved.apiKey) {
-						return {
-							provider: candidate.provider,
-							apiKey: resolved.apiKey,
-							model: modelId,
-							headers: resolved.headers ?? {},
-							responsesUrl,
-						};
-					}
-				} catch {
-				}
-			}
-		}
+		const auth = await resolvePiAuth(ctx, responsesUrl);
+		if (auth) return auth;
 	}
 
-	const apiKey = providerApiKey("openai");
+	// Destination-first: the shared proxy key when the endpoint is proxied.
+	const proxyKey = providerProxyApiKey("openai");
+	if (proxyKey !== null) {
+		return { provider: "openai", apiKey: proxyKey, model: "gpt-5.4", headers: {}, responsesUrl };
+	}
+
+	const config = loadConfig();
+	const hasSource = hasCredentialSource({
+		provider: "OpenAI",
+		configuredValue: config.openaiApiKey,
+		environmentValue: process.env.OPENAI_API_KEY,
+	});
+	if (!hasSource) return undefined;
+	const apiKey = await resolveCredential({
+		provider: "OpenAI",
+		configuredValue: config.openaiApiKey,
+		environmentValue: process.env.OPENAI_API_KEY,
+		signal,
+	});
 	return apiKey
 		? { provider: "openai", apiKey, model: "gpt-5.4", headers: {}, responsesUrl }
 		: undefined;
 }
 
 export async function isOpenAISearchAvailable(ctx?: ExtensionContext): Promise<boolean> {
-	return !!(await resolveOpenAIAuth(ctx));
+	const responsesUrl = OPENAI_RESPONSES_URL();
+	if (ctx && isOpenAIAuthOrigin(responsesUrl) && await resolvePiAuth(ctx, responsesUrl)) return true;
+	if (providerProxyApiKey("openai") !== null) return true;
+	const config = loadConfig();
+	return hasCredentialSource({
+		provider: "OpenAI",
+		configuredValue: config.openaiApiKey,
+		environmentValue: process.env.OPENAI_API_KEY,
+	});
 }
 
 function buildInstructions(options: SearchOptions): string {
@@ -348,7 +374,7 @@ export async function searchWithOpenAI(
 	options: SearchOptions = {},
 	ctx?: ExtensionContext,
 ): Promise<SearchResponse> {
-	const auth = await resolveOpenAIAuth(ctx);
+	const auth = await resolveOpenAIAuth(ctx, options.signal);
 	if (!auth) {
 		throw new Error(
 			"OpenAI web search unavailable. Either:\n" +
@@ -397,7 +423,7 @@ export async function searchWithOpenAI(
 
 		if (!response.ok) {
 			activityMonitor.logError(activityId, `HTTP ${response.status}`);
-			const errorText = await response.text();
+			const errorText = redactCredential(await response.text(), auth.apiKey);
 			throw new Error(`OpenAI API error ${response.status}: ${errorText.slice(0, 300)}`);
 		}
 
@@ -414,11 +440,15 @@ export async function searchWithOpenAI(
 		return { answer, results };
 	} catch (err) {
 		const message = err instanceof Error ? err.message : String(err);
-		if (message.toLowerCase().includes("abort")) {
+		const redactedMessage = redactCredential(message, auth.apiKey);
+		if (redactedMessage.toLowerCase().includes("abort")) {
 			activityMonitor.logComplete(activityId, 0);
 		} else {
-			activityMonitor.logError(activityId, message);
+			activityMonitor.logError(activityId, redactedMessage);
 		}
-		throw err;
+		if (redactedMessage === message) throw err;
+		const redactedError = new Error(redactedMessage);
+		if (err instanceof Error) redactedError.name = err.name;
+		throw redactedError;
 	}
 }
