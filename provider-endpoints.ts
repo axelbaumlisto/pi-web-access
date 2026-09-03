@@ -1,30 +1,53 @@
 /**
- * Central registry of search-provider base URLs + override resolution.
+ * Central registry of search-provider endpoints + destination-first credentials.
  *
- * Every provider's endpoint can be overridden (e.g. to route through a proxy
- * that fronts a pooled API key) via, in priority order:
- *   1. environment variable  (e.g. EXA_BASE_URL)
- *   2. web-search.json config field  (e.g. exaBaseUrl)
- *   3. the hardcoded default
+ * URL resolution (`providerUrl`), priority:
+ *   1. per-provider env        (e.g. EXA_BASE_URL)
+ *   2. per-provider config     (e.g. exaBaseUrl)
+ *   3. unified proxy base + provider proxyPath (if both configured)
+ *   4. hardcoded default
+ * Steps 1–3 are validated by `resolveApiBaseUrl` (absolute HTTPS, no
+ * credentials, no query/fragment). Defaults are trusted constants.
  *
- * This mirrors the pattern gemini-api.ts already used for
- * GOOGLE_GEMINI_BASE_URL / geminiBaseUrl, but keeps the exa/brave/perplexity
- * (etc.) endpoints in ONE place instead of copy-pasting normalizeBaseUrl + a
- * getter into each provider module.
+ * `kind` tells callers what they get back:
+ *   "base" — a base; the provider appends its own path (exa /search, tavily
+ *            /search, parallel /v1/search). Proxy paths for these are bases too.
+ *   "full" — the complete endpoint; caller adds only query/body. A per-provider
+ *            override for a "full" provider is still a BASE (upstream semantics:
+ *            `braveBaseUrl` is `…/res/v1`) and gets `overrideSuffix` appended;
+ *            the proxy path is already complete (gateway route contract).
  *
  * UNIFIED PROXY MODE
  * ------------------
- * When every provider is fronted by the SAME gateway (e.g. a self-hosted proxy
- * that injects a pooled key), setting one base host + one key is enough:
- *   env  WEB_SEARCH_PROXY_URL  / config proxyBaseUrl   (e.g. https://airpx.cc)
- *   env  WEB_SEARCH_PROXY_KEY  / config proxyApiKey     (e.g. sk-proxy-...)
- * Each provider's endpoint is then derived as `${proxyBase}${proxyPath}` and
- * its API key falls back to the shared proxy key — so you don't repeat the
- * per-provider *BaseUrl / *ApiKey fields. Per-provider overrides still win.
+ * One gateway fronts several providers and injects a pooled key:
+ *   env WEB_SEARCH_PROXY_URL / config proxyBaseUrl   (e.g. https://gateway.example)
+ *   env WEB_SEARCH_PROXY_KEY / config proxyApiKey    (e.g. sk-proxy-...)
+ * Each fronted provider's endpoint becomes `${proxyBase}${proxyPath}`.
+ *
+ * DESTINATION-FIRST KEY BINDING (security invariant)
+ * ---------------------------------------------------
+ * The credential is chosen AFTER the destination resolves:
+ *   - destination is the proxy origin → the shared proxy key is the ONLY
+ *     credential. If it is missing the provider is UNAVAILABLE — we never fall
+ *     back to a personal per-provider key (env / $ENV / !cmd / registry).
+ *   - destination is anywhere else → upstream's credential-source rules
+ *     (`$ENV` / `!cmd` / literal, env-before-config for literals). The proxy
+ *     key is never sent to a non-proxy host.
+ * "Proxy origin" is a parsed-origin compare, not startsWith: an override to
+ * `gateway.example.evil.com` is not the proxy.
+ *
+ * gemini is intentionally NOT here: gemini-api.ts has its own resolver
+ * (Cloudflare AI Gateway detection, API_VERSION, ADC). OpenAI's codex
+ * endpoint (chatgpt.com) stays hardcoded in openai-search.ts (OAuth flow).
  */
 
 import { existsSync, readFileSync } from "node:fs";
-import { getWebSearchConfigPath } from "./utils.ts";
+import {
+	hasCredentialSource,
+	resolveCredential,
+	type CredentialOptions,
+} from "./credential-source.ts";
+import { getWebSearchConfigPath, resolveApiBaseUrl } from "./utils.ts";
 
 export type SearchProviderId =
 	| "exa"
@@ -34,114 +57,98 @@ export type SearchProviderId =
 	| "parallel"
 	| "openai";
 
-// gemini is intentionally NOT here: gemini-api.ts keeps its own resolver
-// (getApiHost) because it also detects Cloudflare AI Gateway routing and
-// applies API_VERSION — logic that doesn't fit the simple base/URL swap here.
-// OpenAI's codex endpoint (chatgpt.com backend) is likewise left hardcoded in
-// openai-search.ts: it's a separate OAuth/codex flow, not a plain key swap.
+export type EndpointKind = "base" | "full";
 
 interface ProviderEndpoint {
-	/** Default base/URL when no override is set. */
+	/** Human label used in credential-resolution errors ("Exa", "Brave", …). */
+	label: string;
+	/** What `providerUrl()` returns — see module doc. */
+	kind: EndpointKind;
+	/** Default endpoint when nothing overrides it (a base for kind:"base", complete for kind:"full"). */
 	default: string;
-	/** Environment variable that overrides it. */
+	/** Environment variable that overrides the base. */
 	env: string;
-	/** web-search.json field that overrides it. */
+	/** web-search.json field that overrides the base. */
 	configKey: string;
 	/**
-	 * Path under the unified proxy base that serves this provider. When set and
-	 * a proxy base is configured (WEB_SEARCH_PROXY_URL / proxyBaseUrl), the
-	 * endpoint becomes `${proxyBase}${proxyPath}`. Omit for providers the proxy
-	 * does not front (they keep their own default / per-provider override).
+	 * Appended to a per-provider OVERRIDE (which is always a base) to form the
+	 * full endpoint. Only meaningful for kind:"full". Never appended to the
+	 * default (already complete) or to the proxy path (gateway route contract).
+	 */
+	overrideSuffix?: string;
+	/**
+	 * Path under the unified proxy base that serves this provider. Omit for
+	 * providers the gateway does not front.
 	 */
 	proxyPath?: string;
-	/** Per-provider API-key env var (for the shared-key fallback resolver). */
-	keyEnv: string;
-	/** Per-provider API-key config field. */
-	keyConfigKey: string;
 }
 
-// Unified-proxy config keys (single base + single key for all providers).
 const PROXY_BASE_ENV = "WEB_SEARCH_PROXY_URL";
 const PROXY_BASE_CONFIG = "proxyBaseUrl";
 const PROXY_KEY_ENV = "WEB_SEARCH_PROXY_KEY";
 const PROXY_KEY_CONFIG = "proxyApiKey";
 
-/**
- * Default endpoints. For exa this is the API *base* (paths like /search,
- * /answer, /mcp are appended by the caller); for brave/perplexity it is the
- * FULL endpoint URL (query params / body are added by the caller).
- */
 export const PROVIDER_ENDPOINTS: Record<SearchProviderId, ProviderEndpoint> = {
 	exa: {
+		label: "Exa",
+		kind: "base",
 		default: "https://api.exa.ai",
 		env: "EXA_BASE_URL",
 		configKey: "exaBaseUrl",
 		proxyPath: "/v1/exa",
-		keyEnv: "EXA_API_KEY",
-		keyConfigKey: "exaApiKey",
 	},
 	brave: {
+		label: "Brave",
+		kind: "full",
 		default: "https://api.search.brave.com/res/v1/web/search",
 		env: "BRAVE_BASE_URL",
 		configKey: "braveBaseUrl",
+		// upstream: braveBaseUrl is the `…/res/v1` base; provider appends /web/search
+		overrideSuffix: "/web/search",
+		// gateway route contract: this IS the complete search endpoint
 		proxyPath: "/v1/brave/search",
-		keyEnv: "BRAVE_API_KEY",
-		keyConfigKey: "braveApiKey",
 	},
 	perplexity: {
+		label: "Perplexity",
+		kind: "full",
 		default: "https://api.perplexity.ai/chat/completions",
 		env: "PERPLEXITY_BASE_URL",
 		configKey: "perplexityBaseUrl",
 		proxyPath: "/v1/chat/completions",
-		keyEnv: "PERPLEXITY_API_KEY",
-		keyConfigKey: "perplexityApiKey",
 	},
 	tavily: {
-		default: "https://api.tavily.com/search",
+		label: "Tavily",
+		kind: "base",
+		default: "https://api.tavily.com",
 		env: "TAVILY_BASE_URL",
 		configKey: "tavilyBaseUrl",
-		// no proxyPath: the gateway does not front Tavily.
-		keyEnv: "TAVILY_API_KEY",
-		keyConfigKey: "tavilyApiKey",
+		// not fronted by the gateway
 	},
-	// parallel is a *base* (paths /v1/search and /v1/extract are appended).
 	parallel: {
+		label: "Parallel",
+		kind: "base",
 		default: "https://api.parallel.ai",
 		env: "PARALLEL_BASE_URL",
 		configKey: "parallelBaseUrl",
-		// no proxyPath: the gateway does not front Parallel.
-		keyEnv: "PARALLEL_API_KEY",
-		keyConfigKey: "parallelApiKey",
+		// not fronted by the gateway
 	},
-	// openai's standard Responses endpoint (the codex endpoint stays hardcoded).
 	openai: {
+		label: "OpenAI",
+		kind: "full",
 		default: "https://api.openai.com/v1/responses",
 		env: "OPENAI_RESPONSES_URL",
 		configKey: "openaiResponsesUrl",
 		proxyPath: "/v1/responses",
-		keyEnv: "OPENAI_API_KEY",
-		keyConfigKey: "openaiApiKey",
 	},
 };
 
-/** True when two URLs share the same parsed origin (scheme+host+port). */
-function sameOrigin(a: string, b: string): boolean {
-	try {
-		return new URL(a).origin === new URL(b).origin;
-	} catch {
-		return false;
-	}
-}
-
-export function normalizeBaseUrl(value: unknown): string | null {
-	if (typeof value !== "string") return null;
-	const normalized = value.trim().replace(/\/+$/, "");
-	return normalized.length > 0 ? normalized : null;
-}
+// ---------------------------------------------------------------------------
+// config
+// ---------------------------------------------------------------------------
 
 let cachedConfig: Record<string, unknown> | null = null;
 
-/** Drop the cached web-search.json so the next call re-reads it (key rotation). */
+/** Drop the cached web-search.json so the next call re-reads it (tests / key rotation). */
 export function resetEndpointCache(): void {
 	cachedConfig = null;
 }
@@ -156,52 +163,94 @@ function loadRawConfig(): Record<string, unknown> {
 	try {
 		cachedConfig = JSON.parse(readFileSync(path, "utf-8")) as Record<string, unknown>;
 	} catch {
+		// A malformed file must not silently turn into "no proxy": the proxy URL
+		// may still arrive via env. Callers handle the missing-key case as
+		// "provider unavailable" (see resolveProviderKey), never as a fallback.
 		cachedConfig = {};
 	}
 	return cachedConfig;
 }
 
-/** The unified proxy base host, if configured (env > config). */
-export function proxyBaseUrl(): string | null {
-	return (
-		normalizeBaseUrl(process.env[PROXY_BASE_ENV]) ??
-		normalizeBaseUrl(loadRawConfig()[PROXY_BASE_CONFIG])
-	);
+function trimmedString(value: unknown): string | undefined {
+	if (typeof value !== "string") return undefined;
+	const t = value.trim();
+	return t.length > 0 ? t : undefined;
 }
 
-/** The shared proxy API key, if configured (env > config). */
+// ---------------------------------------------------------------------------
+// proxy
+// ---------------------------------------------------------------------------
+
+/**
+ * The unified proxy base, validated (HTTPS, no creds, no query), or null when
+ * not configured. THROWS on an invalid value — this is the one URL that
+ * receives every key, so it gets the same rules as per-provider overrides.
+ */
+export function proxyBaseUrl(): string | null {
+	const resolved = resolveApiBaseUrl({
+		configKey: PROXY_BASE_CONFIG,
+		configuredValue: loadRawConfig()[PROXY_BASE_CONFIG],
+		defaultValue: "",
+		environmentKey: PROXY_BASE_ENV,
+		environmentValue: process.env[PROXY_BASE_ENV],
+	});
+	return resolved === "" ? null : resolved;
+}
+
+/** The shared proxy API key (env > config), or null. */
 export function proxyApiKey(): string | null {
-	const envVal = process.env[PROXY_KEY_ENV];
-	if (typeof envVal === "string" && envVal.trim().length > 0) return envVal.trim();
-	const cfgVal = loadRawConfig()[PROXY_KEY_CONFIG];
-	if (typeof cfgVal === "string" && cfgVal.trim().length > 0) return cfgVal.trim();
-	return null;
+	return trimmedString(process.env[PROXY_KEY_ENV]) ?? trimmedString(loadRawConfig()[PROXY_KEY_CONFIG]) ?? null;
+}
+
+// ---------------------------------------------------------------------------
+// endpoints
+// ---------------------------------------------------------------------------
+
+export type EndpointSource = "override" | "proxy" | "default";
+
+export interface ResolvedEndpoint {
+	/** The endpoint according to `kind` (see module doc). */
+	url: string;
+	/** Where it came from. */
+	source: EndpointSource;
+	/** True unless the default is in effect (Exa: MCP only moves off mcp.exa.ai when overridden). */
+	overridden: boolean;
 }
 
 /**
- * Resolve a provider's endpoint. Priority:
- *   1. per-provider env    (e.g. EXA_BASE_URL)
- *   2. per-provider config  (e.g. exaBaseUrl)
- *   3. unified proxy base + provider proxyPath (if both configured)
- *   4. hardcoded default
- *
- * `overridden` is true for cases 1–3 (used by Exa: its MCP endpoint only moves
- * off mcp.exa.ai when an override is explicitly in effect).
+ * Resolve a provider's endpoint. May THROW when a configured URL (per-provider
+ * override or proxy base) is invalid; the message names the offending
+ * env var / config key. Availability checks must use `isProxiedDestination`,
+ * which never throws.
  */
-export function resolveProviderEndpoint(
-	provider: SearchProviderId,
-): { url: string; overridden: boolean } {
+export function resolveProviderEndpoint(provider: SearchProviderId): ResolvedEndpoint {
 	const ep = PROVIDER_ENDPOINTS[provider];
-	const perProvider =
-		normalizeBaseUrl(process.env[ep.env]) ?? normalizeBaseUrl(loadRawConfig()[ep.configKey]);
-	if (perProvider !== null) return { url: perProvider, overridden: true };
 
-	const base = proxyBaseUrl();
-	if (base !== null && ep.proxyPath) {
-		return { url: `${base}${ep.proxyPath}`, overridden: true };
+	// 1–2: per-provider override (env > config). Validated by resolveApiBaseUrl.
+	// Sentinel default lets us tell "override present" from "use default".
+	const SENTINEL = "";
+	const override = resolveApiBaseUrl({
+		configKey: ep.configKey,
+		configuredValue: loadRawConfig()[ep.configKey],
+		defaultValue: SENTINEL,
+		environmentKey: ep.env,
+		environmentValue: process.env[ep.env],
+	});
+	if (override !== SENTINEL) {
+		const url = ep.kind === "full" && ep.overrideSuffix ? `${override}${ep.overrideSuffix}` : override;
+		// An explicit override equal to the default is not an override (Exa MCP rule).
+		if (url === ep.default) return { url, source: "default", overridden: false };
+		return { url, source: "override", overridden: true };
 	}
 
-	return { url: ep.default, overridden: false };
+	// 3: unified proxy (validated inside proxyBaseUrl; may throw).
+	if (ep.proxyPath) {
+		const base = proxyBaseUrl();
+		if (base !== null) return { url: `${base}${ep.proxyPath}`, source: "proxy", overridden: true };
+	}
+
+	// 4: default
+	return { url: ep.default, source: "default", overridden: false };
 }
 
 /** Convenience: just the resolved URL for a provider. */
@@ -209,41 +258,64 @@ export function providerUrl(provider: SearchProviderId): string {
 	return resolveProviderEndpoint(provider).url;
 }
 
-/**
- * Resolve a provider's API key. Priority:
- *   1. per-provider env    (e.g. EXA_API_KEY)
- *   2. per-provider config  (e.g. exaApiKey)
- * Destination-first: if the endpoint resolved to the unified proxy (same
- * parsed origin), the shared proxy key is returned — a personal per-provider
- * key must not leak to the gateway. Otherwise: per-provider env > per-provider
- * config. The shared key is never sent to a non-proxy host (origin compare,
- * not startsWith — airpx.cc.evil.com must not pass). Returns null if none set.
- */
-export function providerApiKey(provider: SearchProviderId): string | null {
-	const ep = PROVIDER_ENDPOINTS[provider];
-	// Resolve the DESTINATION first, then pick the key that belongs to it.
-	// If the endpoint resolved to the unified proxy, the shared proxy key is the
-	// ONLY correct credential — a personal per-provider key (e.g. an ambient
-	// OPENAI_API_KEY) must NOT be transmitted to the proxy gateway.
-	const proxyKey = providerProxyApiKey(provider);
-	if (proxyKey !== null) return proxyKey;
-	const envKey = process.env[ep.keyEnv];
-	if (typeof envKey === "string" && envKey.trim().length > 0) return envKey.trim();
-	const cfgKey = loadRawConfig()[ep.keyConfigKey];
-	if (typeof cfgKey === "string" && cfgKey.trim().length > 0) return cfgKey.trim();
-	return null;
+/** True when two URLs share the same parsed origin (scheme+host+port). */
+function sameOrigin(a: string, b: string): boolean {
+	try {
+		return new URL(a).origin === new URL(b).origin;
+	} catch {
+		return false;
+	}
 }
 
 /**
- * Destination-first proxy credential: returns the shared proxy key when the
- * provider's endpoint resolved to the unified proxy origin, otherwise null.
- * Callers that use async credential sources (credential-source.ts) should
- * check this FIRST — a personal per-provider key must never be transmitted
- * to the proxy gateway.
+ * Does this provider's request go to the unified proxy origin?
+ * NEVER throws: an invalid proxy/override URL means "not proxied" here, and
+ * the real fetch path surfaces the descriptive error. This keeps a single bad
+ * URL from aborting the whole auto-search chain at the availability step.
  */
-export function providerProxyApiKey(provider: SearchProviderId): string | null {
-	const base = proxyBaseUrl();
-	if (base === null) return null;
-	if (!sameOrigin(resolveProviderEndpoint(provider).url, base)) return null;
-	return proxyApiKey();
+export function isProxiedDestination(provider: SearchProviderId): boolean {
+	try {
+		const base = proxyBaseUrl();
+		if (base === null) return false;
+		return sameOrigin(resolveProviderEndpoint(provider).url, base);
+	} catch {
+		return false;
+	}
+}
+
+// ---------------------------------------------------------------------------
+// credentials (destination-first)
+// ---------------------------------------------------------------------------
+
+/** Per-provider credential inputs; `provider` label is derived from the registry. */
+export type ProviderCredentialOptions = Omit<CredentialOptions, "provider">;
+
+function withLabel(provider: SearchProviderId, opts: ProviderCredentialOptions): CredentialOptions {
+	return { ...opts, provider: PROVIDER_ENDPOINTS[provider].label };
+}
+
+/**
+ * Resolve the API key for a provider request (async: honours `$ENV` / `!cmd`
+ * sources via credential-source.ts).
+ *   proxied destination → shared proxy key, or null (UNAVAILABLE — never a personal key)
+ *   otherwise           → upstream resolveCredential(opts)
+ */
+export async function resolveProviderKey(
+	provider: SearchProviderId,
+	opts: ProviderCredentialOptions,
+): Promise<string | null> {
+	if (isProxiedDestination(provider)) return proxyApiKey();
+	return resolveCredential(withLabel(provider, opts));
+}
+
+/**
+ * Cheap availability check mirroring `resolveProviderKey` without running
+ * `!cmd` sources or throwing.
+ */
+export function providerHasCredential(
+	provider: SearchProviderId,
+	opts: ProviderCredentialOptions,
+): boolean {
+	if (isProxiedDestination(provider)) return proxyApiKey() !== null;
+	return hasCredentialSource(withLabel(provider, opts));
 }

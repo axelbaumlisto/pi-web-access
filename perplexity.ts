@@ -1,9 +1,9 @@
 import { existsSync, readFileSync } from "node:fs";
 import { activityMonitor } from "./activity.ts";
 import type { ExtractedContent } from "./extract.ts";
-import { hasCredentialSource, redactCredential, resolveCredential } from "./credential-source.ts";
+import { redactCredential } from "./credential-source.ts";
 import { getWebSearchConfigPath } from "./utils.ts";
-import { providerProxyApiKey, providerUrl } from "./provider-endpoints.ts";
+import { providerHasCredential, providerUrl, resolveProviderKey } from "./provider-endpoints.ts";
 import { redactError } from "./redact.ts";
 
 // Endpoint override lives in provider-endpoints.ts (env > config > default).
@@ -63,10 +63,9 @@ function loadConfig(): WebSearchConfig {
 }
 
 async function getApiKey(signal?: AbortSignal): Promise<string> {
-	// Destination-first: the shared proxy key when the endpoint is proxied.
-	const proxyKey = providerProxyApiKey("perplexity");
-	const key = proxyKey ?? await resolveCredential({
-		provider: "Perplexity",
+	// Destination-first (provider-endpoints.ts): proxied → shared proxy key or
+	// unavailable; otherwise upstream credential sources ($ENV / !cmd / literal).
+	const key = await resolveProviderKey("perplexity", {
 		configuredValue: loadConfig().perplexityApiKey,
 		environmentValue: process.env.PERPLEXITY_API_KEY,
 		signal,
@@ -106,9 +105,7 @@ function validateDomainFilter(domains: string[]): string[] {
 }
 
 export function isPerplexityAvailable(): boolean {
-	if (providerProxyApiKey("perplexity") !== null) return true;
-	return hasCredentialSource({
-		provider: "Perplexity",
+	return providerHasCredential("perplexity", {
 		configuredValue: loadConfig().perplexityApiKey,
 		environmentValue: process.env.PERPLEXITY_API_KEY,
 	});

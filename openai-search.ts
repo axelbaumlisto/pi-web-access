@@ -2,9 +2,9 @@ import { existsSync, readFileSync } from "node:fs";
 import type { ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { activityMonitor } from "./activity.ts";
 import type { SearchOptions, SearchResponse, SearchResult } from "./perplexity.ts";
-import { hasCredentialSource, redactCredential, resolveCredential } from "./credential-source.ts";
+import { redactCredential } from "./credential-source.ts";
 import { getWebSearchConfigPath } from "./utils.ts";
-import { PROVIDER_ENDPOINTS, providerProxyApiKey, providerUrl } from "./provider-endpoints.ts";
+import { PROVIDER_ENDPOINTS, providerHasCredential, providerUrl, resolveProviderKey } from "./provider-endpoints.ts";
 
 // Standard Responses endpoint override lives in provider-endpoints.ts
 // (env OPENAI_RESPONSES_URL > config openaiResponsesUrl > default). The codex
@@ -162,25 +162,15 @@ export async function resolveOpenAIAuth(ctx?: ExtensionContext, signal?: AbortSi
 		if (auth) return auth;
 	}
 
-	// Destination-first: the shared proxy key when the endpoint is proxied.
-	const proxyKey = providerProxyApiKey("openai");
-	if (proxyKey !== null) {
-		return { provider: "openai", apiKey: proxyKey, model: "gpt-5.4", headers: {}, responsesUrl };
-	}
-
+	// Destination-first (provider-endpoints.ts): proxied → shared proxy key or
+	// unavailable; otherwise upstream credential sources ($ENV / !cmd / literal).
 	const config = loadConfig();
-	const hasSource = hasCredentialSource({
-		provider: "OpenAI",
+	const credential = {
 		configuredValue: config.openaiApiKey,
 		environmentValue: process.env.OPENAI_API_KEY,
-	});
-	if (!hasSource) return undefined;
-	const apiKey = await resolveCredential({
-		provider: "OpenAI",
-		configuredValue: config.openaiApiKey,
-		environmentValue: process.env.OPENAI_API_KEY,
-		signal,
-	});
+	};
+	if (!providerHasCredential("openai", credential)) return undefined;
+	const apiKey = await resolveProviderKey("openai", { ...credential, signal });
 	return apiKey
 		? { provider: "openai", apiKey, model: "gpt-5.4", headers: {}, responsesUrl }
 		: undefined;
@@ -189,10 +179,8 @@ export async function resolveOpenAIAuth(ctx?: ExtensionContext, signal?: AbortSi
 export async function isOpenAISearchAvailable(ctx?: ExtensionContext): Promise<boolean> {
 	const responsesUrl = OPENAI_RESPONSES_URL();
 	if (ctx && isOpenAIAuthOrigin(responsesUrl) && await resolvePiAuth(ctx, responsesUrl)) return true;
-	if (providerProxyApiKey("openai") !== null) return true;
 	const config = loadConfig();
-	return hasCredentialSource({
-		provider: "OpenAI",
+	return providerHasCredential("openai", {
 		configuredValue: config.openaiApiKey,
 		environmentValue: process.env.OPENAI_API_KEY,
 	});

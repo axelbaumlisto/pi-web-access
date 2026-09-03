@@ -2,9 +2,9 @@ import { existsSync, readFileSync } from "node:fs";
 import { activityMonitor } from "./activity.ts";
 import type { ExtractedContent } from "./extract.ts";
 import type { SearchOptions, SearchResponse } from "./perplexity.ts";
-import { hasCredentialSource, redactCredential, resolveCredential } from "./credential-source.ts";
+import { redactCredential } from "./credential-source.ts";
 import { getWebSearchConfigPath } from "./utils.ts";
-import { providerProxyApiKey, providerUrl, resolveProviderEndpoint } from "./provider-endpoints.ts";
+import { providerHasCredential, providerUrl, resolveProviderEndpoint, resolveProviderKey } from "./provider-endpoints.ts";
 import { redactError } from "./redact.ts";
 
 const EXA_DEFAULT_MCP_URL = "https://mcp.exa.ai/mcp";
@@ -81,11 +81,9 @@ function loadConfig(): WebSearchConfig {
 }
 
 async function getApiKey(signal?: AbortSignal): Promise<string | null> {
-	// Destination-first: the shared proxy key when the endpoint is proxied.
-	const proxyKey = providerProxyApiKey("exa");
-	if (proxyKey !== null) return proxyKey;
-	return resolveCredential({
-		provider: "Exa",
+	// Destination-first (provider-endpoints.ts): proxied → shared proxy key or
+	// unavailable; otherwise upstream credential sources ($ENV / !cmd / literal).
+	return resolveProviderKey("exa", {
 		configuredValue: loadConfig().exaApiKey,
 		environmentValue: process.env.EXA_API_KEY,
 		signal,
@@ -373,8 +371,7 @@ export function isExaAvailable(): boolean {
 }
 
 export function hasExaApiKey(): boolean {
-	return hasCredentialSource({
-		provider: "Exa",
+	return providerHasCredential("exa", {
 		configuredValue: loadConfig().exaApiKey,
 		environmentValue: process.env.EXA_API_KEY,
 	});

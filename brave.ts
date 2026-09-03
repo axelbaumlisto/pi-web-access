@@ -1,13 +1,14 @@
 import { existsSync, readFileSync } from "node:fs";
 import { activityMonitor } from "./activity.ts";
 import type { SearchOptions, SearchResult, SearchResponse } from "./perplexity.ts";
-import { hasCredentialSource, redactCredential, resolveCredential } from "./credential-source.ts";
+import { redactCredential } from "./credential-source.ts";
 import { getWebSearchConfigPath } from "./utils.ts";
-import { providerProxyApiKey, providerUrl } from "./provider-endpoints.ts";
+import { providerHasCredential, providerUrl, resolveProviderKey } from "./provider-endpoints.ts";
 import { redactError } from "./redact.ts";
 
-// Search endpoint override lives in provider-endpoints.ts (env > config >
-// default). The value is the FULL search URL; query params are appended.
+// kind:"full" — provider-endpoints.ts returns the complete search endpoint in
+// every mode (default, `braveBaseUrl` base + /web/search, or proxy route);
+// only query params are appended here.
 const getBraveUrl = () => providerUrl("brave");
 const CONFIG_PATH = getWebSearchConfigPath();
 const SEARCH_TIMEOUT_MS = 30_000;
@@ -42,11 +43,9 @@ function loadConfig(): WebSearchConfig {
 }
 
 async function getApiKey(signal?: AbortSignal): Promise<string | null> {
-	// Destination-first: the shared proxy key when the endpoint is proxied.
-	const proxyKey = providerProxyApiKey("brave");
-	if (proxyKey !== null) return proxyKey;
-	return resolveCredential({
-		provider: "Brave",
+	// Destination-first (provider-endpoints.ts): proxied → shared proxy key or
+	// unavailable; otherwise upstream credential sources ($ENV / !cmd / literal).
+	return resolveProviderKey("brave", {
 		configuredValue: loadConfig().braveApiKey,
 		environmentValue: process.env.BRAVE_API_KEY,
 		signal,
@@ -155,9 +154,7 @@ function matchesDomainFilters(url: string, filters: NormalizedDomainFilters): bo
 }
 
 export function isBraveAvailable(): boolean {
-	if (providerProxyApiKey("brave") !== null) return true;
-	return hasCredentialSource({
-		provider: "Brave",
+	return providerHasCredential("brave", {
 		configuredValue: loadConfig().braveApiKey,
 		environmentValue: process.env.BRAVE_API_KEY,
 	});

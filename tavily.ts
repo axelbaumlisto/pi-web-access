@@ -2,12 +2,13 @@ import { existsSync, readFileSync } from "node:fs";
 import { activityMonitor } from "./activity.ts";
 import type { ExtractedContent } from "./extract.ts";
 import type { SearchOptions, SearchResponse } from "./perplexity.ts";
-import { hasCredentialSource, redactCredential, resolveCredential } from "./credential-source.ts";
+import { redactCredential } from "./credential-source.ts";
 import { getWebSearchConfigPath } from "./utils.ts";
-import { providerProxyApiKey, providerUrl } from "./provider-endpoints.ts";
+import { providerHasCredential, providerUrl, resolveProviderKey } from "./provider-endpoints.ts";
 
 // Endpoint override lives in provider-endpoints.ts (env > config > default).
-const TAVILY_API_URL = () => providerUrl("tavily");
+// kind:"base" — upstream semantics: tavilyBaseUrl is the API base, we append /search.
+const TAVILY_API_URL = () => `${providerUrl("tavily")}/search`;
 const CONFIG_PATH = getWebSearchConfigPath();
 const SEARCH_TIMEOUT_MS = 60_000;
 
@@ -51,12 +52,9 @@ function loadConfig(): WebSearchConfig {
 }
 
 async function getApiKey(signal?: AbortSignal): Promise<string | null> {
-	// Destination-first: when the endpoint resolved to the unified proxy, the
-	// shared proxy key is the only correct credential.
-	const proxyKey = providerProxyApiKey("tavily");
-	if (proxyKey !== null) return proxyKey;
-	return resolveCredential({
-		provider: "Tavily",
+	// Destination-first (provider-endpoints.ts): proxied → shared proxy key or
+	// unavailable; otherwise upstream credential sources ($ENV / !cmd / literal).
+	return resolveProviderKey("tavily", {
 		configuredValue: loadConfig().tavilyApiKey,
 		environmentValue: process.env.TAVILY_API_KEY,
 		signal,
@@ -150,9 +148,7 @@ function mapInlineContent(results: TavilyResult[] | undefined): ExtractedContent
 }
 
 export function isTavilyAvailable(): boolean {
-	if (providerProxyApiKey("tavily") !== null) return true;
-	return hasCredentialSource({
-		provider: "Tavily",
+	return providerHasCredential("tavily", {
 		configuredValue: loadConfig().tavilyApiKey,
 		environmentValue: process.env.TAVILY_API_KEY,
 	});
