@@ -82,9 +82,7 @@ test("Brave search applies domain filters in the query and returned results", as
 	assert.deepEqual(output.results.map((result) => result.url), ["https://github.com/nicobailon/pi-web-access"]);
 });
 
-// Fork behavior: every citation is preserved regardless of numResults, because
-// the answer text references sources by index ([8]).
-test("Perplexity preserves all citations regardless of numResults", async () => {
+test("Perplexity normalizes invalid result counts", async () => {
 	const home = await mkdtemp(join(tmpdir(), "pi-web-access-perplexity-count-"));
 	const child = runChild(`
 		globalThis.fetch = async () => new Response(JSON.stringify({
@@ -104,7 +102,7 @@ test("Perplexity preserves all citations regardless of numResults", async () => 
 	});
 
 	assert.equal(child.status, 0, child.stderr);
-	assert.deepEqual(JSON.parse(child.stdout.trim()).counts, [5, 5, 5]);
+	assert.deepEqual(JSON.parse(child.stdout.trim()).counts, [1, 5, 3]);
 });
 
 test("Tavily search uses bearer auth and maps filters/content", async () => {

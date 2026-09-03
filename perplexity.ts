@@ -127,6 +127,10 @@ export async function searchWithPerplexity(query: string, options: SearchOptions
 	});
 
 	const apiKey = await getApiKey(options.signal);
+	const numResults = typeof options.numResults === "number" && Number.isFinite(options.numResults)
+		? Math.max(1, Math.min(Math.floor(options.numResults), 20))
+		: 5;
+
 	const requestBody: Record<string, unknown> = {
 		model: "sonar",
 		messages: [{ role: "user", content: query }],
@@ -192,9 +196,7 @@ export async function searchWithPerplexity(query: string, options: SearchOptions
 	const citations = Array.isArray(data.citations) ? data.citations : [];
 
 	const results: SearchResult[] = [];
-	// Fork behavior: preserve EVERY citation — the answer text references sources
-	// by index ([8]), so capping at numResults would break those references.
-	for (let i = 0; i < citations.length; i++) {
+	for (let i = 0; i < Math.min(citations.length, numResults); i++) {
 		const citation = citations[i];
 		if (typeof citation === "string") {
 			results.push({ title: `Source ${i + 1}`, url: citation, snippet: "" });

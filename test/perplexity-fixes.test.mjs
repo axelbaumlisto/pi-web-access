@@ -54,34 +54,6 @@ test("Perplexity is available with only unified proxy config", async () => {
 	assert.deepEqual(parseChild(child), { available: true });
 });
 
-test("Perplexity preserves every citation even when numResults is lower", async () => {
-	const agentDir = await makeConfig();
-	const child = runChild(`
-		globalThis.fetch = async () => new Response(JSON.stringify({
-			choices: [{ message: { content: "The supporting evidence is in source [8]." } }],
-			citations: Array.from({ length: 9 }, (_, index) => index % 2 === 0
-				? "https://example.com/source-" + (index + 1)
-				: { title: "Named source " + (index + 1), url: "https://example.com/source-" + (index + 1) }),
-		}), { status: 200, headers: { "content-type": "application/json" } });
-
-		const { searchWithPerplexity } = await import(${JSON.stringify(perplexityModuleUrl)});
-		const result = await searchWithPerplexity("cited answer", { numResults: 5 });
-		console.log(JSON.stringify({ answer: result.answer, results: result.results }));
-	`, {
-		PI_CODING_AGENT_DIR: agentDir,
-		PERPLEXITY_API_KEY: "perplexity-test-key",
-	});
-
-	const output = parseChild(child);
-	assert.match(output.answer, /\[8\]/);
-	assert.equal(output.results.length, 9);
-	assert.deepEqual(
-		output.results.map((result) => result.url),
-		Array.from({ length: 9 }, (_, index) => `https://example.com/source-${index + 1}`),
-	);
-	assert.equal(output.results[7].title, "Named source 8");
-});
-
 test("Perplexity fetch has its own 30-second AbortSignal", async () => {
 	const agentDir = await makeConfig();
 	const child = runChild(`
