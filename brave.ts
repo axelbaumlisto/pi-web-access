@@ -4,7 +4,7 @@ import type { SearchOptions, SearchResult, SearchResponse } from "./perplexity.t
 import { redactCredential } from "./credential-source.ts";
 import { getWebSearchConfigPath } from "./utils.ts";
 import { providerHasCredential, providerUrl, resolveProviderKey } from "./provider-endpoints.ts";
-import { redactError } from "./redact.ts";
+import { redactError, redactProviderError } from "./redact.ts";
 
 // kind:"full" — provider-endpoints.ts returns the complete search endpoint in
 // every mode (default, `braveBaseUrl` base + /web/search, or proxy route);
@@ -209,8 +209,8 @@ export async function searchWithBrave(
 
 		if (!response.ok) {
 			activityMonitor.logError(activityId, `HTTP ${response.status}`);
-			const errorText = redactCredential(await response.text(), apiKey);
-			throw new Error(`Brave Search API error ${response.status}: ${redactError(errorText)}`);
+			const errorText = redactProviderError(await response.text(), apiKey);
+			throw new Error(`Brave Search API error ${response.status}: ${errorText}`);
 		}
 
 		let data: {

@@ -1,3 +1,5 @@
+import { redactCredential } from "./credential-source.ts";
+
 // Secret patterns for upstream error bodies. The sk-/AIza prefixes are matched
 // from a word boundary with a low length floor so that even a short fragment
 // (e.g. the ~10-char body window a JSON.parse SyntaxError echoes back, like
@@ -36,4 +38,14 @@ export function redactError(text: string, max = 300): string {
 		body = body.replace(TRAILING_PARTIAL, "[REDACTED]");
 	}
 	return truncated ? `${body}…` : body;
+}
+
+/**
+ * Provider error-path redaction in one call: exact-match scrub of the known
+ * credential(s) (upstream `redactCredential`) followed by pattern scrub +
+ * bounded truncation (`redactError`). Use at every `!response.ok` /
+ * invalid-JSON site instead of composing the two by hand.
+ */
+export function redactProviderError(text: string, ...credentials: (string | null | undefined)[]): string {
+	return redactError(credentials.reduce<string>((acc, credential) => redactCredential(acc, credential), text));
 }

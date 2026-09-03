@@ -4,7 +4,7 @@ import type { ExtractedContent } from "./extract.ts";
 import { redactCredential } from "./credential-source.ts";
 import { getWebSearchConfigPath } from "./utils.ts";
 import { providerHasCredential, providerUrl, resolveProviderKey } from "./provider-endpoints.ts";
-import { redactError } from "./redact.ts";
+import { redactError, redactProviderError } from "./redact.ts";
 
 // Endpoint override lives in provider-endpoints.ts (env > config > default).
 // The value is the FULL chat/completions URL, so it can front a proxy that
@@ -176,8 +176,8 @@ export async function searchWithPerplexity(query: string, options: SearchOptions
 
 	if (!response.ok) {
 		activityMonitor.logComplete(activityId, response.status);
-		const errorText = redactCredential(await response.text(), apiKey);
-		throw new Error(`Perplexity API error ${response.status}: ${redactError(errorText)}`);
+		const errorText = redactProviderError(await response.text(), apiKey);
+		throw new Error(`Perplexity API error ${response.status}: ${errorText}`);
 	}
 
 	let data: Record<string, unknown>;

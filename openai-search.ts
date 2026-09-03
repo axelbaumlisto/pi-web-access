@@ -3,6 +3,7 @@ import type { ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { activityMonitor } from "./activity.ts";
 import type { SearchOptions, SearchResponse, SearchResult } from "./perplexity.ts";
 import { redactCredential } from "./credential-source.ts";
+import { redactProviderError } from "./redact.ts";
 import { getWebSearchConfigPath } from "./utils.ts";
 import { PROVIDER_ENDPOINTS, providerHasCredential, providerUrl, resolveProviderKey } from "./provider-endpoints.ts";
 
@@ -411,8 +412,8 @@ export async function searchWithOpenAI(
 
 		if (!response.ok) {
 			activityMonitor.logError(activityId, `HTTP ${response.status}`);
-			const errorText = redactCredential(await response.text(), auth.apiKey);
-			throw new Error(`OpenAI API error ${response.status}: ${errorText.slice(0, 300)}`);
+			const errorText = redactProviderError(await response.text(), auth.apiKey);
+			throw new Error(`OpenAI API error ${response.status}: ${errorText}`);
 		}
 
 		const parsed = await parseOpenAIResponse(response);

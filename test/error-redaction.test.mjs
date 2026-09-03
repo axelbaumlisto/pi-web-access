@@ -5,7 +5,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { test } from "node:test";
 
-import { redactError } from "../redact.ts";
+import { redactError, redactProviderError } from "../redact.ts";
 
 const perplexityModuleUrl = new URL("../perplexity.ts", import.meta.url).href;
 const exaModuleUrl = new URL("../exa.ts", import.meta.url).href;
@@ -90,6 +90,18 @@ test("redactError key= param respects a query/form boundary (MEDIUM 4)", () => {
 	// `monkey=` must NOT be treated as a `key=` param
 	assert.equal(redactError("monkey=value", 1_000), "monkey=value");
 	assert.match(redactError("a=1&key=zzz", 1_000), /\[REDACTED\]/);
+});
+
+test("redactProviderError scrubs the literal credential AND unrelated secret patterns, then bounds", () => {
+	const apiKey = "literal-provider-key-that-matches-no-pattern";
+	const body = `denied for ${apiKey}; also saw ${FAKE_OPENAI_KEY} and Bearer tok-123 ` + "z".repeat(400);
+	const output = redactProviderError(body, apiKey, null, undefined);
+	assert.equal(output.includes(apiKey), false);
+	assert.equal(output.includes(FAKE_OPENAI_KEY), false);
+	assert.equal(output.includes("tok-123"), false);
+	assert.match(output, /\[redacted\]/); // credential-source marker for the literal
+	assert.match(output, /\[REDACTED\]/); // pattern marker
+	assert.ok(output.endsWith("…"));
 });
 
 test("redactError truncates before redaction and appends an ellipsis", () => {

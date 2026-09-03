@@ -3,6 +3,7 @@ import { activityMonitor } from "./activity.ts";
 import type { ExtractedContent } from "./extract.ts";
 import type { SearchOptions, SearchResponse } from "./perplexity.ts";
 import { redactCredential } from "./credential-source.ts";
+import { redactProviderError } from "./redact.ts";
 import { getWebSearchConfigPath } from "./utils.ts";
 import { providerHasCredential, providerUrl, resolveProviderKey } from "./provider-endpoints.ts";
 
@@ -192,8 +193,8 @@ export async function searchWithTavily(query: string, options: TavilySearchOptio
 
 	if (!response.ok) {
 		activityMonitor.logComplete(activityId, response.status);
-		const errorText = redactCredential(await response.text(), apiKey);
-		throw new Error(`Tavily API error ${response.status}: ${errorText.slice(0, 300)}`);
+		const errorText = redactProviderError(await response.text(), apiKey);
+		throw new Error(`Tavily API error ${response.status}: ${errorText}`);
 	}
 
 	let data: TavilyResponse;

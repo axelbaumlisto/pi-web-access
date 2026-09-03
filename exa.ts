@@ -5,7 +5,7 @@ import type { SearchOptions, SearchResponse } from "./perplexity.ts";
 import { redactCredential } from "./credential-source.ts";
 import { getWebSearchConfigPath } from "./utils.ts";
 import { providerHasCredential, providerUrl, resolveProviderEndpoint, resolveProviderKey } from "./provider-endpoints.ts";
-import { redactError } from "./redact.ts";
+import { redactError, redactProviderError } from "./redact.ts";
 
 const EXA_DEFAULT_MCP_URL = "https://mcp.exa.ai/mcp";
 
@@ -406,8 +406,8 @@ export async function searchWithExa(query: string, options: ExaSearchOptions = {
 			});
 
 			if (!response.ok) {
-				const errorText = redactCredential(await response.text(), apiKey);
-				throw new Error(`Exa API error ${response.status}: ${redactError(errorText)}`);
+				const errorText = redactProviderError(await response.text(), apiKey);
+				throw new Error(`Exa API error ${response.status}: ${errorText}`);
 			}
 
 			let data: ExaAnswerResponse;
@@ -447,8 +447,8 @@ export async function searchWithExa(query: string, options: ExaSearchOptions = {
 		});
 
 		if (!response.ok) {
-			const errorText = redactCredential(await response.text(), apiKey);
-			throw new Error(`Exa API error ${response.status}: ${redactError(errorText)}`);
+			const errorText = redactProviderError(await response.text(), apiKey);
+			throw new Error(`Exa API error ${response.status}: ${errorText}`);
 		}
 
 		let data: ExaSearchResponse;
