@@ -28,7 +28,7 @@ test("YouTube extraction surfaces Gemini API errors", async () => {
 	assert.equal(child.status, 0, child.stderr || child.stdout);
 	const result = JSON.parse(child.stdout);
 	assert.match(result.error, /Gemini API error 503/);
-	assert.doesNotMatch(result.error, /Sign into Google in Chrome/);
+	assert.doesNotMatch(result.error, /Sign into Google in a supported Chromium browser/);
 });
 
 function buildChildScript(moduleUrl) {

@@ -4,6 +4,8 @@ import { mkdtempSync, readFileSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { test } from "node:test";
+import { Value } from "typebox/value";
+
 import initializeExtension from "../index.ts";
 
 const indexUrl = new URL("../index.ts", import.meta.url).href;
@@ -11,29 +13,46 @@ const indexSrc = readFileSync(new URL("../index.ts", import.meta.url), "utf8");
 const readmeSrc = readFileSync(new URL("../README.md", import.meta.url), "utf8");
 
 function runRegistration(config) {
+	return runRegistrationWithConfig(JSON.stringify(config) + "\n");
+}
+
+function runRegistrationWithConfig(configText) {
 	const root = mkdtempSync(join(tmpdir(), "pi-web-access-tool-names-"));
-	writeFileSync(join(root, "web-search.json"), JSON.stringify(config) + "\n", "utf8");
+	writeFileSync(join(root, "web-search.json"), configText, "utf8");
 	return spawnSync(process.execPath, ["--input-type=module"], {
 		input: `
 			const { default: initializeExtension } = await import(${JSON.stringify(indexUrl)});
 			const tools = [];
+			const commands = [];
 			initializeExtension({
-				registerTool(tool) { tools.push(tool.name); },
-				registerCommand() {},
+				registerTool(tool) { tools.push({ name: tool.name, description: tool.description, promptSnippet: tool.promptSnippet, parameters: tool.parameters }); },
+				registerCommand(name) { commands.push(name); },
 				registerShortcut() {},
 				on() {},
 			});
-			console.log(JSON.stringify(tools));
+			console.log(JSON.stringify({ tools, commands }));
 		`,
 		encoding: "utf8",
 		env: { ...process.env, PI_CODING_AGENT_DIR: root, XDG_CONFIG_HOME: "", HOME: join(root, "home"), USERPROFILE: join(root, "home") },
 	});
 }
 
-function registeredToolNames(config) {
+function registered(config) {
 	const child = runRegistration(config);
 	assert.equal(child.status, 0, child.stderr);
 	return JSON.parse(child.stdout);
+}
+
+function registeredToolNames(config) {
+	return registered(config).tools.map(tool => tool.name);
+}
+
+function registeredTool(config, name) {
+	return registered(config).tools.find(tool => tool.name === name);
+}
+
+function registeredCommandNames(config) {
+	return registered(config).commands;
 }
 
 function registrationError(config) {
@@ -42,18 +61,61 @@ function registrationError(config) {
 	return child.stderr;
 }
 
-test("web_search registration is gated by webSearch.enabled", () => {
-	assert.match(indexSrc, /webSearch\?: \{\n\t\tenabled\?: boolean;\n\t\};/);
-	assert.match(indexSrc, /toolNames\?: Partial<ToolNames>;/);
-	assert.match(indexSrc, /if \(initConfig\.webSearch\?\.enabled !== false\) pi\.registerTool\(\{\n\t\tname: toolNames\.webSearch/);
+test("malformed config falls back during extension registration", () => {
+	const child = runRegistrationWithConfig("{");
+	assert.equal(child.status, 0, child.stderr);
+	const registered = JSON.parse(child.stdout);
+	assert.deepEqual(registered.tools.map(tool => tool.name), ["web_search", "source_check", "fetch_content", "memory_search", "get_search_content"]);
 });
 
-test("fetch tools remain registered outside the web_search gate", () => {
-	const gateIndex = indexSrc.indexOf("if (initConfig.webSearch?.enabled !== false)");
-	const fetchIndex = indexSrc.indexOf("name: toolNames.fetchContent");
-	assert.ok(gateIndex >= 0, "web_search gate not found");
-	assert.ok(fetchIndex > gateIndex, "fetch_content registration should remain after web_search gate");
-	assert.match(indexSrc, /\n\t}\);\n\n\tpi\.registerTool\(\{\n\t\tname: toolNames\.fetchContent/);
+test("search tools constrain numResults to integer values from 1 through 20", () => {
+	for (const name of ["web_search", "source_check"]) {
+		const schema = registeredTool({}, name).parameters.properties.numResults;
+		assert.equal(schema.type, "integer");
+		assert.equal(schema.minimum, 1);
+		assert.equal(schema.maximum, 20);
+		for (const value of [0, -1, 1.5, 21, Number.NaN, Number.POSITIVE_INFINITY]) {
+			assert.equal(Value.Check(schema, value), false, `${name} accepts ${value}`);
+		}
+		for (const value of [1, 5, 20]) {
+			assert.equal(Value.Check(schema, value), true, `${name} rejects ${value}`);
+		}
+	}
+});
+
+test("tool registration gates support legacy and per-tool config", () => {
+	assert.deepEqual(registeredToolNames({ webSearch: { enabled: false } }), ["fetch_content", "memory_search", "get_search_content"]);
+	assert.deepEqual(registeredToolNames({
+		webSearch: { enabled: false },
+		tools: { webSearch: { enabled: true }, sourceCheck: { enabled: true }, fetchContent: { enabled: false } },
+	}), ["web_search", "source_check", "memory_search", "get_search_content"]);
+	assert.deepEqual(registeredToolNames({
+		tools: { sourceCheck: { enabled: false }, getSearchContent: { enabled: false } },
+	}), ["web_search", "fetch_content", "memory_search"]);
+	// Fork: memory_search has its own per-tool gate like every other tool.
+	assert.deepEqual(registeredToolNames({
+		tools: { memorySearch: { enabled: false } },
+	}), ["web_search", "source_check", "fetch_content", "get_search_content"]);
+});
+
+test("command registration gates default to enabled", () => {
+	assert.deepEqual(registeredCommandNames({}), ["websearch", "curator", "google-account", "search"]);
+	assert.deepEqual(registeredCommandNames({
+		commands: { websearch: { enabled: false }, search: { enabled: false } },
+	}), ["curator", "google-account"]);
+});
+
+test("fetch_content schema exposes auth profile opt-in", () => {
+	const schema = registeredTool({}, "fetch_content").parameters.properties.auth;
+	assert.ok(schema);
+	assert.deepEqual(schema.anyOf.map(option => option.type), ["string", "boolean"]);
+});
+
+test("registered tools do not advertise disabled get_search_content", () => {
+	const fetchTool = registeredTool({ tools: { getSearchContent: { enabled: false } } }, "fetch_content");
+	assert.ok(fetchTool);
+	assert.doesNotMatch(fetchTool.description, /get_search_content/);
+	assert.match(fetchTool.description, /retrieval tool is not registered/);
 });
 
 test("web activity shortcut renders through the supported string-array API", async () => {
@@ -84,21 +146,23 @@ test("web activity shortcut renders through the supported string-array API", asy
 });
 
 test("tool names can be configured without changing defaults", () => {
-	// Fork: memory_search is always registered (internal search).
+	// Fork: memory_search (internal search) is registered by default and renamable.
 	assert.deepEqual(registeredToolNames({}), ["web_search", "source_check", "fetch_content", "memory_search", "get_search_content"]);
 	assert.deepEqual(registeredToolNames({
 		toolNames: {
 			webSearch: "research_web",
 			sourceCheck: "verify_sources",
 			fetchContent: "grab_content",
+			memorySearch: "recall_history",
 			getSearchContent: "open_content",
 		},
-	}), ["research_web", "verify_sources", "grab_content", "memory_search", "open_content"]);
+	}), ["research_web", "verify_sources", "grab_content", "recall_history", "open_content"]);
 });
 
 test("tool name config rejects invalid and duplicate registered names", () => {
 	assert.match(registrationError({ toolNames: { webSearch: "1bad" } }), /toolNames\.webSearch/);
 	assert.match(registrationError({ toolNames: { webSearch: "same_name", fetchContent: "same_name" } }), /duplicates/);
+	assert.match(registrationError({ toolNames: { memorySearch: "web_search" } }), /duplicates/);
 });
 
 test("webSearch.enabled false registers only fetch tools and ignores disabled-name duplicates", () => {
@@ -117,8 +181,9 @@ test("webSearch.enabled false registers only fetch tools and ignores disabled-na
 	}), /duplicates/);
 });
 
-test("README documents webSearch.enabled and toolNames", () => {
-	assert.match(readmeSrc, /"webSearch": \{\n    "enabled": true\n  \}/);
-	assert.match(readmeSrc, /webSearch\.enabled` to `false` to unregister the configured search and source-check tools/);
+test("README documents registration gates and toolNames", () => {
+	assert.match(readmeSrc, /"tools": \{/);
+	assert.match(readmeSrc, /"commands": \{/);
+	assert.match(readmeSrc, /Pi restart is required for tool and command registration changes/);
 	assert.match(readmeSrc, /`toolNames` can opt into alternate public tool names/);
 });

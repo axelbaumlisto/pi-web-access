@@ -24,7 +24,7 @@ async function createConfig(config = {
 function runTool(agentDir, provider) {
 	const providerSource = provider === undefined ? "undefined" : JSON.stringify(provider);
 	const childEnv = { ...process.env, PI_CODING_AGENT_DIR: agentDir, OPENAI_API_KEY: "openai-test-key" };
-	for (const key of ["BRAVE_API_KEY", "PARALLEL_API_KEY", "TAVILY_API_KEY", "EXA_API_KEY", "GEMINI_API_KEY", "PERPLEXITY_API_KEY"]) {
+	for (const key of ["BRAVE_API_KEY", "PARALLEL_API_KEY", "TINYFISH_API_KEY", "SEARCH1API_KEY", "SEARCHINFINITY_API_KEY", "QUERIT_API_KEY", "TAVILY_API_KEY", "FIRECRAWL_BASE_URL", "FIRECRAWL_API_KEY", "JINA_API_KEY", "SERPDIVE_API_KEY", "KAGI_API_KEY", "OLLAMA_API_KEY", "SERPBASE_API_KEY", "ANYSEARCH_API_KEY", "XAI_API_KEY", "BRIGHTDATA_API_KEY", "BRIGHTDATA_SERP_ZONE", "SEARXNG_BASE_URL", "EXA_API_KEY", "GEMINI_API_KEY", "PERPLEXITY_API_KEY"]) {
 		delete childEnv[key];
 	}
 	const child = spawnSync(process.execPath, ["--input-type=module"], {
@@ -34,7 +34,10 @@ function runTool(agentDir, provider) {
 			const urlText = String(url);
 			calls.push(urlText);
 			if (urlText === "https://api.openai.com/v1/responses") {
-				return new Response(JSON.stringify({ output: [{ type: "message", content: [{ type: "output_text", text: "openai answer" }] }] }), { status: 200 });
+				return new Response(JSON.stringify({ output: [
+					{ type: "web_search_call", action: { sources: [] } },
+					{ type: "message", content: [{ type: "output_text", text: "openai answer" }] },
+				] }), { status: 200 });
 			}
 			if (urlText === "https://api.perplexity.ai/chat/completions") {
 				return new Response(JSON.stringify({ choices: [{ message: { content: "perplexity answer" } }], citations: ["https://perplexity.example/source"] }), { status: 200 });
@@ -74,9 +77,29 @@ test("configured provider is used when tool omits provider", async () => {
 	assert.deepEqual(calls, ["https://api.perplexity.ai/chat/completions"]);
 });
 
+test("configured provider array is used when the tool omits provider", async () => {
+	const calls = runTool(await createConfig({
+		provider: ["tavily", "perplexity"],
+		perplexityApiKey: "perplexity-test-key",
+		tavilyApiKey: "tavily-test-key",
+	}));
+	assert.deepEqual(calls.sort(), [
+		"https://api.perplexity.ai/chat/completions",
+		"https://api.tavily.com/search",
+	]);
+});
+
 test("explicit named provider overrides configured provider", async () => {
 	const calls = runTool(await createConfig(), "tavily");
 	assert.deepEqual(calls, ["https://api.tavily.com/search"]);
+});
+
+test("explicit provider array overrides configured provider and runs only the selected providers", async () => {
+	const calls = runTool(await createConfig(), ["tavily", "perplexity"]);
+	assert.deepEqual(calls.sort(), [
+		"https://api.perplexity.ai/chat/completions",
+		"https://api.tavily.com/search",
+	]);
 });
 
 test("explicit auto uses configured provider", async () => {
@@ -87,6 +110,50 @@ test("explicit auto uses configured provider", async () => {
 test("auto still uses provider fallback when no provider is configured", async () => {
 	const calls = runTool(await createConfig(null), "auto");
 	assert.deepEqual(calls, ["https://api.openai.com/v1/responses"]);
+});
+
+test("configured explicit-only SerpBase fails instead of falling back", async () => {
+	const agentDir = await createConfig({ provider: "serpbase" });
+	const childEnv = { ...process.env, PI_CODING_AGENT_DIR: agentDir, OPENAI_API_KEY: "openai-test-key" };
+	for (const key of ["BRAVE_API_KEY", "PARALLEL_API_KEY", "TINYFISH_API_KEY", "SEARCH1API_KEY", "SEARCHINFINITY_API_KEY", "QUERIT_API_KEY", "TAVILY_API_KEY", "FIRECRAWL_BASE_URL", "FIRECRAWL_API_KEY", "JINA_API_KEY", "SERPDIVE_API_KEY", "KAGI_API_KEY", "OLLAMA_API_KEY", "SERPBASE_API_KEY", "ANYSEARCH_API_KEY", "XAI_API_KEY", "BRIGHTDATA_API_KEY", "BRIGHTDATA_SERP_ZONE", "SEARXNG_BASE_URL", "EXA_API_KEY", "GEMINI_API_KEY", "PERPLEXITY_API_KEY"]) {
+		delete childEnv[key];
+	}
+	const child = spawnSync(process.execPath, ["--input-type=module"], {
+		input: `
+		globalThis.fetch = async (url) => { throw new Error("Unexpected fallback fetch: " + url); };
+		const tools = [];
+		const pi = {
+			registerTool(tool) { tools.push(tool); },
+			registerShortcut() {},
+			registerCommand() {},
+			on() {},
+			appendEntry() {},
+			sendMessage() {},
+		};
+		const extension = (await import(${JSON.stringify(indexUrl)})).default;
+		extension(pi);
+		const tool = tools.find((candidate) => candidate.name === "web_search");
+		const result = await tool.execute("serpbase-no-fallback-test", { query: "provider precedence", workflow: "none" });
+		console.log(JSON.stringify(result));
+	`,
+		encoding: "utf8",
+		env: childEnv,
+		maxBuffer: 2 * 1024 * 1024,
+	});
+	assert.equal(child.status, 0, child.stderr);
+	const result = JSON.parse(child.stdout.trim());
+	assert.match(result.content[0].text, /SerpBase API key not found/);
+	assert.doesNotMatch(result.content[0].text, /Unexpected fallback fetch/);
+});
+
+test("legacy Gemini Web profile config does not block unrelated configured providers", async () => {
+	const calls = runTool(await createConfig({
+		provider: "tavily",
+		tavilyApiKey: "tavily-test-key",
+		allowBrowserCookies: true,
+		chromeProfile: "Profile 1",
+	}));
+	assert.deepEqual(calls, ["https://api.tavily.com/search"]);
 });
 
 test("malformed config root fails with an explicit object-shape error", async () => {
@@ -151,7 +218,7 @@ test("non-curated search stops after caller cancellation", async () => {
 	});
 	assert.equal(child.status, 0, child.stderr);
 	const output = JSON.parse(child.stdout.trim());
-	assert.equal(output.calls, 1);
+	assert.equal(output.calls, 0);
 	assert.match(output.error, /abort/i);
 });
 

@@ -1,13 +1,16 @@
 import { existsSync, readFileSync } from "node:fs";
+import net from "node:net";
 import { activityMonitor } from "./activity.ts";
 import { redactCredential, resolveCredential } from "./credential-source.ts";
 import type { ExtractedContent, ExtractOptions } from "./extract.ts";
-import { validateRemoteUrl, type Lookup } from "./ssrf-protection.ts";
+import type { SearchOptions, SearchResponse } from "./perplexity.ts";
+import { loadSsrfConfig, validateRemoteUrl, type Lookup } from "./ssrf-protection.ts";
 import { getWebSearchConfigPath } from "./utils.ts";
 
 const CONFIG_PATH = getWebSearchConfigPath();
 const DEFAULT_API_VERSION = "v2";
 const EXTRACT_TIMEOUT_MS = 60_000;
+const SEARCH_TIMEOUT_MS = 60_000;
 const DEFAULT_MAX_REDIRECTS = 5;
 const REDIRECT_STATUSES = new Set([301, 302, 303, 307, 308]);
 const SUPPORTED_API_VERSIONS = ["v1", "v2"] as const;
@@ -22,6 +25,11 @@ export interface FirecrawlExtractOptions extends Pick<ExtractOptions, "timeoutMs
 	ssrf?: FirecrawlSsrfOptions;
 }
 
+interface FirecrawlSearchOptions extends SearchOptions, Pick<ExtractOptions, "timeoutMs" | "lookup"> {
+	includeContent?: boolean;
+	ssrf?: FirecrawlSsrfOptions;
+}
+
 interface FirecrawlConfig {
 	firecrawlBaseUrl?: unknown;
 	firecrawlApiKey?: unknown;
@@ -33,6 +41,25 @@ interface FirecrawlScrapeData {
 	title?: unknown;
 	markdown?: unknown;
 	metadata?: { title?: unknown };
+}
+
+interface FirecrawlSearchItem {
+	title?: unknown;
+	description?: unknown;
+	snippet?: unknown;
+	url?: unknown;
+	markdown?: unknown;
+	metadata?: {
+		title?: unknown;
+		description?: unknown;
+		sourceURL?: unknown;
+		url?: unknown;
+	};
+}
+
+interface DomainFilters {
+	include: string[];
+	exclude: string[];
 }
 
 let cachedConfig: FirecrawlConfig | null = null;
@@ -149,12 +176,27 @@ function isAbortError(err: unknown): boolean {
 	return errorMessage(err).toLowerCase().includes("abort");
 }
 
-function ssrfOptions(options?: FirecrawlExtractOptions): { lookup?: Lookup; allowRanges: string[]; trustEnvProxy: boolean } {
+function ssrfOptions(options?: FirecrawlExtractOptions | FirecrawlSearchOptions): { lookup?: Lookup; allowRanges: string[]; trustEnvProxy: boolean } {
+	const config = loadSsrfConfig();
 	return {
-		allowRanges: options?.ssrf?.allowRanges ?? [],
-		trustEnvProxy: options?.ssrf?.trustEnvProxy ?? false,
+		allowRanges: options?.ssrf?.allowRanges ?? config.allowRanges,
+		trustEnvProxy: options?.ssrf?.trustEnvProxy ?? config.trustEnvProxy,
 		...(options?.lookup ? { lookup: options.lookup } : {}),
 	};
+}
+
+function isLoopbackApiUrl(url: URL): boolean {
+	const hostname = url.hostname.toLowerCase().replace(/^\[|\]$/g, "").replace(/\.$/, "");
+	if (hostname === "localhost" || hostname === "::1") return true;
+	if (net.isIP(hostname) !== 4) return false;
+	return hostname.split(".")[0] === "127";
+}
+
+function firecrawlApiSsrfOptions(
+	options: FirecrawlExtractOptions | FirecrawlSearchOptions | undefined,
+	allowLoopback: boolean,
+): ReturnType<typeof ssrfOptions> & { allowLoopback: boolean } {
+	return { ...ssrfOptions(options), allowLoopback };
 }
 
 function withoutSensitiveHeaders(headers: Record<string, string>): Record<string, string> {
@@ -171,9 +213,10 @@ function withoutSensitiveHeaders(headers: Record<string, string>): Record<string
 async function fetchFirecrawlApi(
 	url: string,
 	init: { method: string; headers: Record<string, string>; body: string; signal: AbortSignal },
-	options: FirecrawlExtractOptions | undefined,
+	options: FirecrawlExtractOptions | FirecrawlSearchOptions | undefined,
 ): Promise<Response> {
-	let current = await validateRemoteUrl(url, ssrfOptions(options));
+	const allowLoopback = isLoopbackApiUrl(new URL(url));
+	let current = await validateRemoteUrl(url, firecrawlApiSsrfOptions(options, allowLoopback));
 	let headers = init.headers;
 	for (let redirects = 0; redirects <= DEFAULT_MAX_REDIRECTS; redirects++) {
 		const response = await fetch(current, { ...init, headers, redirect: "manual" });
@@ -183,7 +226,7 @@ async function fetchFirecrawlApi(
 		if (!location) return response;
 		if (redirects === DEFAULT_MAX_REDIRECTS) throw new Error(`Too many redirects fetching ${current.toString()}`);
 
-		const next = await validateRemoteUrl(new URL(location, current), ssrfOptions(options));
+		const next = await validateRemoteUrl(new URL(location, current), firecrawlApiSsrfOptions(options, allowLoopback));
 		if (next.origin !== current.origin) headers = withoutSensitiveHeaders(headers);
 		current = next;
 	}
@@ -199,11 +242,126 @@ function scrapeBody(url: string): Record<string, unknown> {
 	};
 }
 
+function normalizeCount(value: number | undefined): number {
+	if (typeof value !== "number" || !Number.isFinite(value)) return 5;
+	return Math.max(1, Math.min(Math.floor(value), 20));
+}
+
+function normalizeDomain(value: string): string | null {
+	let input = value.trim().toLowerCase();
+	if (!input) return null;
+	if (input.startsWith("-")) input = input.slice(1).trim();
+	if (!input) return null;
+	try {
+		const parsed = input.includes("://") ? new URL(input) : new URL(`https://${input}`);
+		input = parsed.hostname;
+	} catch {
+		input = input.split("/")[0]?.split(":")[0] ?? "";
+	}
+	input = input.replace(/^\.+|\.+$/g, "");
+	return /^[a-z0-9][a-z0-9.-]*\.[a-z]{2,}$/i.test(input) ? input : null;
+}
+
+function parseDomainFilter(domainFilter: string[] | undefined): DomainFilters {
+	const filters: DomainFilters = { include: [], exclude: [] };
+	for (const raw of domainFilter ?? []) {
+		const domain = normalizeDomain(raw);
+		if (!domain) continue;
+		const target = raw.trim().startsWith("-") ? filters.exclude : filters.include;
+		if (!target.includes(domain)) target.push(domain);
+	}
+	return filters;
+}
+
+function passesDomainFilters(url: string, filters: DomainFilters): boolean {
+	if (filters.include.length === 0 && filters.exclude.length === 0) return true;
+	let hostname: string;
+	try {
+		hostname = new URL(url).hostname.toLowerCase();
+	} catch {
+		return false;
+	}
+	const matches = (domain: string) => hostname === domain || hostname.endsWith(`.${domain}`);
+	if (filters.exclude.some(matches)) return false;
+	return filters.include.length === 0 || filters.include.some(matches);
+}
+
+function mapRecencyFilter(value: SearchOptions["recencyFilter"]): string | undefined {
+	switch (value) {
+		case "day": return "qdr:d";
+		case "week": return "qdr:w";
+		case "month": return "qdr:m";
+		case "year": return "qdr:y";
+		default: return undefined;
+	}
+}
+
+function searchBody(query: string, options: FirecrawlSearchOptions, numResults: number, filters: DomainFilters): Record<string, unknown> {
+	return {
+		query,
+		limit: numResults,
+		sources: ["web"],
+		...(filters.include.length > 0 ? { includeDomains: filters.include } : {}),
+		...(filters.include.length === 0 && filters.exclude.length > 0 ? { excludeDomains: filters.exclude } : {}),
+		...(mapRecencyFilter(options.recencyFilter) ? { tbs: mapRecencyFilter(options.recencyFilter) } : {}),
+		...(options.includeContent ? {
+			scrapeOptions: {
+				formats: ["markdown"],
+				onlyMainContent: true,
+				...(allowFreshScrape() ? {} : { lockdown: true }),
+			},
+		} : {}),
+	};
+}
+
+function firstString(...values: unknown[]): string | null {
+	for (const value of values) {
+		if (typeof value === "string" && value.trim()) return value.trim();
+	}
+	return null;
+}
+
+function buildAnswer(results: SearchResponse["results"]): string {
+	return results.map((result) => {
+		if (result.snippet) return `${result.snippet}\nSource: ${result.title} (${result.url})`;
+		return `Source: ${result.title} (${result.url})`;
+	}).join("\n\n");
+}
+
+function mapSearchResults(data: unknown, numResults: number, filters: DomainFilters): {
+	results: SearchResponse["results"];
+	inlineContent: ExtractedContent[];
+} {
+	const web = Array.isArray(data)
+		? data
+		: data && typeof data === "object" ? (data as Record<string, unknown>).web : undefined;
+	if (!Array.isArray(web)) throw new Error("Firecrawl search returned an unexpected web result shape");
+	const results: SearchResponse["results"] = [];
+	const inlineContent: ExtractedContent[] = [];
+	const seen = new Set<string>();
+	for (const rawItem of web) {
+		if (!rawItem || typeof rawItem !== "object" || Array.isArray(rawItem)) continue;
+		const item = rawItem as FirecrawlSearchItem;
+		const url = firstString(item.url, item.metadata?.sourceURL, item.metadata?.url);
+		if (!url || seen.has(url) || !passesDomainFilters(url, filters)) continue;
+		seen.add(url);
+		const title = firstString(item.title, item.metadata?.title) ?? url;
+		const snippet = firstString(item.description, item.snippet, item.metadata?.description) ?? "";
+		results.push({ title, url, snippet });
+		const markdown = firstString(item.markdown);
+		if (markdown) inlineContent.push({ url, title, content: markdown, error: null });
+		if (results.length >= numResults) break;
+	}
+	return { results, inlineContent };
+}
+
 async function firecrawlFetch(
 	endpoint: string,
 	body: Record<string, unknown>,
 	signal: AbortSignal | undefined,
-	options: FirecrawlExtractOptions | undefined,
+	options: FirecrawlExtractOptions | FirecrawlSearchOptions | undefined,
+	label = endpoint,
+	activity: { type: "api"; query: string } | { type: "fetch"; url: string } | undefined = undefined,
 ): Promise<Record<string, unknown>> {
 	const baseUrl = requireBaseUrl();
 	const version = getApiVersion();
@@ -211,7 +369,7 @@ async function firecrawlFetch(
 	const headers: Record<string, string> = { "Content-Type": "application/json" };
 	if (apiKey) headers.Authorization = `Bearer ${apiKey}`;
 	const requestUrl = `${baseUrl}/${version}/${endpoint}`;
-	const activityId = activityMonitor.logStart({ type: "fetch", url: requestUrl });
+	const activityId = activityMonitor.logStart(activity ?? { type: "fetch", url: requestUrl });
 	try {
 		const response = await fetchFirecrawlApi(requestUrl, {
 			method: "POST",
@@ -221,24 +379,24 @@ async function firecrawlFetch(
 		}, options);
 		if (!response.ok) {
 			const text = await response.text().catch(() => "");
-			throw new Error(`Firecrawl scrape error ${response.status}: ${redactCredential(text.slice(0, 300), apiKey)}`);
+			throw new Error(`Firecrawl ${label} error ${response.status}: ${redactCredential(text.slice(0, 300), apiKey)}`);
 		}
 		let data: unknown;
 		try {
 			data = await response.json();
 		} catch (err) {
-			throw new Error(`Firecrawl scrape returned invalid JSON: ${errorMessage(err)}`);
+			throw new Error(`Firecrawl ${label} returned invalid JSON: ${errorMessage(err)}`);
 		}
 		if (!data || typeof data !== "object" || Array.isArray(data)) {
-			throw new Error("Firecrawl scrape returned an unexpected response shape");
+			throw new Error(`Firecrawl ${label} returned an unexpected response shape`);
 		}
 		const envelope = data as Record<string, unknown>;
 		if (envelope.success === false) {
 			const reason = typeof envelope.error === "string" && envelope.error.trim() ? envelope.error : "unknown error";
-			throw new Error(`Firecrawl scrape unsuccessful: ${redactCredential(reason, apiKey)}`);
+			throw new Error(`Firecrawl ${label} unsuccessful: ${redactCredential(reason, apiKey)}`);
 		}
 		if (envelope.success !== true) {
-			throw new Error("Firecrawl scrape returned an unexpected response shape");
+			throw new Error(`Firecrawl ${label} returned an unexpected response shape`);
 		}
 		activityMonitor.logComplete(activityId, response.status);
 		return envelope;
@@ -251,6 +409,24 @@ async function firecrawlFetch(
 
 export function isFirecrawlAvailable(): boolean {
 	return getBaseUrl() !== null;
+}
+
+export async function searchWithFirecrawl(query: string, options: FirecrawlSearchOptions = {}): Promise<SearchResponse> {
+	requireBaseUrl();
+	const numResults = normalizeCount(options.numResults);
+	const filters = parseDomainFilter(options.domainFilter);
+	const envelope = await firecrawlFetch(
+		"search",
+		searchBody(query, options, numResults, filters),
+		options.signal,
+		{ ...options, timeoutMs: options.timeoutMs ?? SEARCH_TIMEOUT_MS },
+		"search",
+		{ type: "api", query },
+	);
+	const mapped = mapSearchResults(envelope.data, numResults, filters);
+	const response: SearchResponse = { answer: buildAnswer(mapped.results), results: mapped.results };
+	if (options.includeContent && mapped.inlineContent.length > 0) response.inlineContent = mapped.inlineContent;
+	return response;
 }
 
 export async function extractWithFirecrawl(

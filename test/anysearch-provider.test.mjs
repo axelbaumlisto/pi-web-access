@@ -19,7 +19,7 @@ function runChild(script, env) {
 	const childEnv = { ...process.env };
 	for (const key of [
 		"PI_CODING_AGENT_DIR", "XDG_CONFIG_HOME", "ANYSEARCH_API_KEY", "OPENAI_API_KEY", "BRAVE_API_KEY",
-		"PARALLEL_API_KEY", "TAVILY_API_KEY", "SERPDIVE_API_KEY", "SEARXNG_BASE_URL", "EXA_API_KEY",
+		"PARALLEL_API_KEY", "TINYFISH_API_KEY", "TAVILY_API_KEY", "JINA_API_KEY", "SERPDIVE_API_KEY", "KAGI_API_KEY", "OLLAMA_API_KEY", "SERPBASE_API_KEY", "BRIGHTDATA_API_KEY", "BRIGHTDATA_SERP_ZONE", "SEARXNG_BASE_URL", "EXA_API_KEY",
 		"PERPLEXITY_API_KEY", "GEMINI_API_KEY",
 	]) delete childEnv[key];
 	Object.assign(childEnv, env);
@@ -58,6 +58,33 @@ test("AnySearch supports anonymous success with a minimal request and gated cont
 	});
 	assert.equal(output.withoutContent.inlineContent, undefined);
 	assert.deepEqual(output.withContent.inlineContent, [{ url: "https://example.com/result", title: "AnySearch result", content: "full page", error: null }]);
+});
+
+test("AnySearch accepts missing or null result content", async () => {
+	const home = await createHome({});
+	const child = runChild(`
+		globalThis.fetch = async () => new Response(JSON.stringify({ code: 0, data: { results: [
+			{ title: "Missing content", url: "https://example.com/missing", snippet: "missing" },
+			{ title: "Null content", url: "https://example.com/null", snippet: "null", content: null },
+			{ title: "Full content", url: "https://example.com/full", snippet: "full", content: "page body" },
+		], metadata: {} } }), { status: 200 });
+		const { searchWithAnySearch } = await import(${JSON.stringify(anysearchModuleUrl)});
+		console.log(JSON.stringify(await searchWithAnySearch("partial content", { includeContent: true })));
+	`, { PI_CODING_AGENT_DIR: home });
+	assert.equal(child.status, 0, child.stderr);
+	const output = JSON.parse(child.stdout.trim());
+	assert.deepEqual(output.results.map(result => result.url), ["https://example.com/missing", "https://example.com/null", "https://example.com/full"]);
+	assert.deepEqual(output.inlineContent, [{ url: "https://example.com/full", title: "Full content", content: "page body", error: null }]);
+	const invalidChild = runChild(`
+		globalThis.fetch = async () => new Response(JSON.stringify({ code: 0, data: { results: [
+			{ title: "Invalid content", url: "https://example.com/invalid", snippet: "invalid", content: 123 },
+		], metadata: {} } }), { status: 200 });
+		const { searchWithAnySearch } = await import(${JSON.stringify(anysearchModuleUrl)});
+		try { await searchWithAnySearch("invalid content"); console.log(JSON.stringify({ ok: true })); }
+		catch (error) { console.log(JSON.stringify({ ok: false, error: String(error) })); }
+	`, { PI_CODING_AGENT_DIR: home });
+	assert.equal(invalidChild.status, 0, invalidChild.stderr);
+	assert.match(JSON.parse(invalidChild.stdout.trim()).error, /expected data\.results\[0\]\.content string/);
 });
 
 test("AnySearch sends keyed auth and resolves command credentials lazily", async () => {

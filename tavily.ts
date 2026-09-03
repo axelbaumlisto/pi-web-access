@@ -4,17 +4,14 @@ import type { ExtractedContent } from "./extract.ts";
 import type { SearchOptions, SearchResponse } from "./perplexity.ts";
 import { redactCredential } from "./credential-source.ts";
 import { redactProviderError } from "./redact.ts";
-import { getWebSearchConfigPath } from "./utils.ts";
+import { fetchWithCredentialRedirects, getWebSearchConfigPath } from "./utils.ts";
 import { providerHasCredential, providerUrl, resolveProviderKey } from "./provider-endpoints.ts";
-
-// Endpoint override lives in provider-endpoints.ts (env > config > default).
-// kind:"base" — upstream semantics: tavilyBaseUrl is the API base, we append /search.
-const TAVILY_API_URL = () => `${providerUrl("tavily")}/search`;
 const CONFIG_PATH = getWebSearchConfigPath();
 const SEARCH_TIMEOUT_MS = 60_000;
 
 interface WebSearchConfig {
 	tavilyApiKey?: unknown;
+	tavilyBaseUrl?: unknown;
 }
 
 interface TavilyResult {
@@ -60,6 +57,12 @@ async function getApiKey(signal?: AbortSignal): Promise<string | null> {
 		environmentValue: process.env.TAVILY_API_KEY,
 		signal,
 	});
+}
+
+// Endpoint from provider-endpoints.ts (per-provider override > proxy > default),
+// kind:"base": tavilyBaseUrl is the API base, we append /search.
+function getApiUrl(): string {
+	return `${providerUrl("tavily")}/search`;
 }
 
 async function requireApiKey(signal?: AbortSignal): Promise<string> {
@@ -156,6 +159,7 @@ export function isTavilyAvailable(): boolean {
 }
 
 export async function searchWithTavily(query: string, options: TavilySearchOptions = {}): Promise<SearchResponse> {
+	const apiUrl = getApiUrl();
 	const apiKey = await requireApiKey(options.signal);
 	const numResults = normalizeCount(options.numResults);
 	const body: Record<string, unknown> = {
@@ -171,7 +175,7 @@ export async function searchWithTavily(query: string, options: TavilySearchOptio
 	const activityId = activityMonitor.logStart({ type: "api", query });
 	let response: Response;
 	try {
-		response = await fetch(TAVILY_API_URL(), {
+		response = await fetchWithCredentialRedirects(apiUrl, {
 			method: "POST",
 			headers: {
 				"Authorization": `Bearer ${apiKey}`,
@@ -179,7 +183,7 @@ export async function searchWithTavily(query: string, options: TavilySearchOptio
 			},
 			body: JSON.stringify(body),
 			signal: requestSignal(options.signal),
-		});
+		}, ["Authorization"]);
 	} catch (err) {
 		const message = errorMessage(err);
 		const redactedMessage = redactCredential(message, apiKey);
@@ -202,7 +206,7 @@ export async function searchWithTavily(query: string, options: TavilySearchOptio
 		data = await response.json() as TavilyResponse;
 	} catch (err) {
 		activityMonitor.logComplete(activityId, response.status);
-		throw new Error(`Tavily API returned invalid JSON: ${errorMessage(err)}`);
+		throw new Error(`Tavily API returned invalid JSON: ${redactProviderError(errorMessage(err), apiKey)}`);
 	}
 
 	activityMonitor.logComplete(activityId, response.status);

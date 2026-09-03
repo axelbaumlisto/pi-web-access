@@ -1,8 +1,9 @@
 import { execFileSync } from "node:child_process";
 import { existsSync, readFileSync } from "node:fs";
 import { activityMonitor } from "./activity.ts";
+import { canAttachImages } from "./feature-config.ts";
 import { isGeminiWebAvailable, queryWithCookies } from "./gemini-web.ts";
-import { isGeminiApiAvailable, queryGeminiApiWithVideo } from "./gemini-api.ts";
+import { isGeminiApiAvailableWithVideo, queryGeminiApiWithVideo } from "./gemini-api.ts";
 import { isPerplexityAvailable, searchWithPerplexity } from "./perplexity.ts";
 import { extractHeadingTitle, type ExtractedContent, type FrameResult, type VideoFrame } from "./extract.ts";
 import { formatSeconds, readExecError, isTimeoutError, trimErrorText, mapFfmpegError, getWebSearchConfigPath } from "./utils.ts";
@@ -48,7 +49,7 @@ function normalizeEnabled(value: unknown, fallback: boolean): boolean {
 	return typeof value === "boolean" ? value : fallback;
 }
 
-const defaults: YouTubeConfig = { enabled: true, preferredModel: "gemini-3-flash-preview" };
+const defaults: YouTubeConfig = { enabled: true, preferredModel: "gemini-3.6-flash" };
 let cachedConfig: YouTubeConfig | null = null;
 
 function loadYouTubeConfig(): YouTubeConfig {
@@ -116,7 +117,7 @@ export async function extractYouTube(
 
 	if (result) {
 		result.url = url;
-		if (!result.error && videoId) {
+		if (!result.error && videoId && canAttachImages()) {
 			const thumb = await fetchYouTubeThumbnail(videoId);
 			if (thumb) result.thumbnail = thumb;
 		}
@@ -131,7 +132,7 @@ export async function extractYouTube(
 
 	const error = attemptErrors.length > 0
 		? ["Could not extract YouTube video content.", "", ...attemptErrors.map(message => `- ${message}`)].join("\n")
-		: "Could not extract YouTube video content. Sign into Google in Chrome for automatic access, or set GEMINI_API_KEY.";
+		: "Could not extract YouTube video content. Sign into Google in a supported Chromium browser for automatic access, or set GEMINI_API_KEY.";
 	activityMonitor.logError(activityId, error);
 	return { url, title: "", content: "", error };
 }
@@ -239,7 +240,7 @@ async function tryGeminiWeb(
 
 		const text = await queryWithCookies(prompt, cookies, {
 			youtubeUrl: url,
-			model,
+			...(model !== "gemini-3.6-flash" ? { model } : {}),
 			signal,
 			timeoutMs: 120000,
 		});
@@ -265,7 +266,7 @@ async function tryGeminiApi(
 	attemptErrors: string[],
 ): Promise<ExtractedContent | null> {
 	try {
-		if (!isGeminiApiAvailable()) return null;
+		if (!isGeminiApiAvailableWithVideo()) return null;
 
 		if (signal?.aborted) return null;
 
@@ -310,7 +311,7 @@ async function tryPerplexity(
 
 		const content =
 			`# Video Summary (via Perplexity)\n\n${answer}\n\n` +
-			`*Full video understanding requires Gemini access. Set GEMINI_API_KEY or sign into Google in Chrome.*`;
+			`*Full video understanding requires Gemini access. Set GEMINI_API_KEY or sign into Google in a supported Chromium browser.*`;
 
 		return {
 			url,

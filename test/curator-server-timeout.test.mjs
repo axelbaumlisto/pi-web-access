@@ -32,7 +32,7 @@ function baseOptions(timeout = 1) {
 		queries: ["test query"],
 		sessionToken: "test-token",
 		timeout,
-		availableProviders: { openai: false, brave: false, parallel: false, tavily: false, searxng: false, perplexity: false, exa: true, gemini: false },
+		availableProviders: { all: true, openai: false, brave: false, parallel: false, tinyfish: false, search1api: false, searchinfinity: false, querit: false, tavily: false, serpdive: false, searxng: false, perplexity: false, exa: true, gemini: false, kimi: false, anysearch: false },
 		defaultProvider: "exa",
 		searchProvider: "exa",
 		summaryModels: [],
@@ -45,7 +45,8 @@ function baseCallbacks(resolveCancel) {
 		onSubmit: () => {},
 		onCancel: resolveCancel,
 		onProviderChange: () => {},
-		onAddSearch: async () => ({ answer: "", results: [], provider: "exa" }),
+		onAddSearch: async () => [{ answer: "", results: [], provider: "exa" }],
+		onAddSearchResults: () => {},
 		onSummarize: async () => ({
 			summary: "",
 			meta: { model: null, durationMs: 0, tokenEstimate: 0, fallbackUsed: true },
@@ -63,6 +64,25 @@ function withTimeout(promise, label) {
 	]);
 }
 
+async function readEventStreamUntil(response, marker, label) {
+	assert.equal(response.status, 200);
+	const reader = response.body.getReader();
+	const decoder = new TextDecoder();
+	let text = "";
+	try {
+		await withTimeout((async () => {
+			while (!text.includes(marker)) {
+				const chunk = await reader.read();
+				if (chunk.done) break;
+				text += decoder.decode(chunk.value, { stream: true });
+			}
+		})(), label);
+	} finally {
+		await reader.cancel().catch(() => {});
+	}
+	return text;
+}
+
 test("curator times out when searches finish but no browser connects", async () => {
 	const { startCuratorServer } = await loadServer();
 	let resolveCancel;
@@ -75,6 +95,67 @@ test("curator times out when searches finish but no browser connects", async () 
 
 		const reason = await withTimeout(cancelPromise, "no-browser timeout");
 		assert.equal(reason, "timeout");
+	} finally {
+		handle.close();
+	}
+});
+
+test("curator replays search events after SSE reconnect", async () => {
+	const { startCuratorServer } = await loadServer();
+	const handle = await startCuratorServer(baseOptions(20), baseCallbacks(() => {}));
+
+	try {
+		const eventsUrl = new URL("/events", handle.url);
+		eventsUrl.searchParams.set("session", "test-token");
+		const firstResponse = await fetch(eventsUrl);
+		assert.equal(firstResponse.status, 200);
+
+		handle.pushResult(0, { answer: "answer", results: [], provider: "exa" });
+		await firstResponse.body.cancel().catch(() => {});
+
+		const secondResponse = await fetch(eventsUrl);
+		const body = await readEventStreamUntil(secondResponse, "event: result", "sse replay");
+		assert.match(body, /event: result/);
+		assert.match(body, /"answer":"answer"/);
+	} finally {
+		handle.close();
+	}
+});
+
+test("curator add-search indexes do not collide with reserved initial provider results", async () => {
+	const { startCuratorServer } = await loadServer();
+	const handle = await startCuratorServer({
+		...baseOptions(20),
+		queries: ["initial one", "initial two"],
+		initialResultIndexCapacity: 6,
+	}, baseCallbacks(() => {}));
+
+	try {
+		const searchResponse = await fetch(new URL("/search", handle.url), {
+			method: "POST",
+			headers: { "content-type": "application/json" },
+			body: JSON.stringify({ token: "test-token", query: "added search" }),
+		});
+		assert.equal(searchResponse.status, 200);
+		const added = await searchResponse.json();
+		assert.equal(added.queryIndex, 6);
+		assert.notEqual(added.queryIndex, 2);
+
+		// Index 2 is a later provider result for the first initial query. Before
+		// reserving the initial range, the added search also received index 2.
+		handle.pushResult(2, {
+			query: "initial one",
+			slotIndex: 0,
+			answer: "late provider answer",
+			results: [],
+			provider: "brave",
+		});
+		handle.searchesDone();
+
+		const eventsUrl = new URL("/events", handle.url);
+		eventsUrl.searchParams.set("session", "test-token");
+		const events = await readEventStreamUntil(await fetch(eventsUrl), "event: done", "reserved-index replay");
+		assert.match(events, /"query":"initial one"[\s\S]*"queryIndex":2/);
 	} finally {
 		handle.close();
 	}
@@ -102,6 +183,57 @@ test("curator submit rejects contradictory summary metadata", async () => {
 	}
 });
 
+test("curator assigns one selectable result index per provider", async () => {
+	const { startCuratorServer } = await loadServer();
+	const indexedEntries = [];
+	let summarySelection = [];
+	const callbacks = baseCallbacks(() => {});
+	callbacks.onAddSearch = async () => [
+		{
+			answer: "Exa answer",
+			results: [{ title: "Exa", url: "https://example.com/exa", domain: "example.com" }],
+			provider: "exa",
+		},
+		{
+			answer: "Brave answer",
+			results: [{ title: "Brave", url: "https://example.com/brave", domain: "example.com" }],
+			provider: "brave",
+		},
+	];
+	callbacks.onAddSearchResults = (entries) => indexedEntries.push(...entries);
+	callbacks.onSummarize = async (selected) => {
+		summarySelection = selected;
+		return {
+			summary: "Combined summary",
+			meta: { model: null, durationMs: 0, tokenEstimate: 0, fallbackUsed: true },
+		};
+	};
+
+	const handle = await startCuratorServer(baseOptions(20), callbacks);
+	try {
+		const searchResponse = await fetch(new URL("/search", handle.url), {
+			method: "POST",
+			headers: { "Content-Type": "application/json" },
+			body: JSON.stringify({ token: "test-token", query: "combined query", provider: "all" }),
+		});
+		assert.equal(searchResponse.status, 200);
+		const searchBody = await searchResponse.json();
+		assert.deepEqual(searchBody.entries.map(entry => entry.provider), ["exa", "brave"]);
+		assert.deepEqual(searchBody.entries.map(entry => entry.queryIndex), [1, 2]);
+		assert.deepEqual(indexedEntries.map(entry => entry.queryIndex), [1, 2]);
+
+		const summarizeResponse = await fetch(new URL("/summarize", handle.url), {
+			method: "POST",
+			headers: { "Content-Type": "application/json" },
+			body: JSON.stringify({ token: "test-token", selected: [1, 2] }),
+		});
+		assert.equal(summarizeResponse.status, 200);
+		assert.deepEqual(summarySelection, [1, 2]);
+	} finally {
+		handle.close();
+	}
+});
+
 test("curator heartbeat timeout finalizes connected idle browser sessions", async () => {
 	const { startCuratorServer } = await loadServer();
 	let resolveCancel;
@@ -122,6 +254,47 @@ test("curator heartbeat timeout finalizes connected idle browser sessions", asyn
 
 		const reason = await withTimeout(cancelPromise, "idle heartbeat timeout");
 		assert.equal(reason, "timeout");
+	} finally {
+		handle.close();
+	}
+});
+
+test("curator state replay keeps current results and compacts superseded history", async () => {
+	const { startCuratorServer } = await loadServer();
+	const handle = await startCuratorServer(baseOptions(20), baseCallbacks(() => {}));
+
+	try {
+		for (let i = 0; i < 205; i++) {
+			handle.pushResult(i, { answer: `answer ${i}`, results: [], provider: "exa", query: `query ${i}` });
+		}
+		handle.pushError(0, "updated", "exa", { query: "query 0" });
+
+		const response = await fetch(new URL("/state?session=test-token", handle.url));
+		assert.equal(response.status, 200);
+		const body = await response.json();
+		assert.equal(body.events.length, 205);
+		assert.equal(body.events[0].event, "search-error");
+		assert.equal(body.events[0].data.queryIndex, 0);
+		assert.equal(body.events[204].data.queryIndex, 204);
+	} finally {
+		handle.close();
+	}
+});
+
+test("curator state replay keeps all-provider entries that share one slot", async () => {
+	const { startCuratorServer } = await loadServer();
+	const handle = await startCuratorServer(baseOptions(20), baseCallbacks(() => {}));
+
+	try {
+		handle.pushResult(0, { answer: "exa answer", results: [], provider: "exa", query: "query", slotIndex: 0 });
+		handle.pushResult(1, { answer: "brave answer", results: [], provider: "brave", query: "query", slotIndex: 0 });
+
+		const response = await fetch(new URL("/state?session=test-token", handle.url));
+		assert.equal(response.status, 200);
+		const body = await response.json();
+		assert.deepEqual(body.events.map((event) => event.data.provider), ["exa", "brave"]);
+		assert.deepEqual(body.events.map((event) => event.data.queryIndex), [0, 1]);
+		assert.deepEqual(body.events.map((event) => event.data.slotIndex), [0, 0]);
 	} finally {
 		handle.close();
 	}

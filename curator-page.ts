@@ -1,3 +1,5 @@
+import type { ProviderAvailability } from "./gemini-search.ts";
+
 function safeInlineJSON(data: unknown): string {
 	return JSON.stringify(data)
 		.replace(/</g, "\\u003c")
@@ -8,21 +10,41 @@ function safeInlineJSON(data: unknown): string {
 }
 
 function buildProviderButtons(
-	available: { openai: boolean; brave: boolean; parallel: boolean; tavily: boolean; serpdive: boolean; searxng: boolean; perplexity: boolean; exa: boolean; gemini: boolean; anysearch: boolean },
+	available: ProviderAvailability,
 	selected: string,
 	hasInitialQueries: boolean,
 ): string {
 	const providers = [
+		{ value: "all", label: "All", available: available.all },
 		{ value: "openai", label: "OpenAI", available: available.openai },
 		{ value: "exa", label: "Exa", available: available.exa },
 		{ value: "brave", label: "Brave", available: available.brave },
 		{ value: "parallel", label: "Parallel", available: available.parallel },
+		{ value: "parallel-mcp", label: "Parallel MCP", available: available["parallel-mcp"] },
+		{ value: "tinyfish", label: "TinyFish", available: available.tinyfish },
+		{ value: "search1api", label: "Search1API", available: available.search1api },
+		{ value: "searchinfinity", label: "Searchinfinity", available: available.searchinfinity },
+		{ value: "querit", label: "Querit", available: available.querit },
 		{ value: "tavily", label: "Tavily", available: available.tavily },
+		{ value: "firecrawl", label: "Firecrawl", available: available.firecrawl },
+		{ value: "jina", label: "Jina", available: available.jina },
 		{ value: "serpdive", label: "SERPdive", available: available.serpdive },
+		{ value: "kagi", label: "Kagi", available: available.kagi },
+		{ value: "bocha", label: "Bocha", available: available.bocha },
+		{ value: "ollama", label: "Ollama", available: available.ollama },
 		{ value: "searxng", label: "SearXNG", available: available.searxng },
+		{ value: "duckduckgo", label: "DuckDuckGo", available: available.duckduckgo },
 		{ value: "perplexity", label: "Perplexity", available: available.perplexity },
 		{ value: "gemini", label: "Gemini", available: available.gemini },
+		{ value: "kimi", label: "Kimi", available: available.kimi },
 		{ value: "anysearch", label: "AnySearch", available: available.anysearch },
+		{ value: "xcrawl", label: "XCrawl", available: available.xcrawl },
+		{ value: "xai", label: "xAI", available: available.xai },
+		{ value: "mistral", label: "Mistral", available: available.mistral },
+		{ value: "brightdata", label: "Bright Data", available: available.brightdata },
+		{ value: "serpbase", label: "SerpBase", available: available.serpbase },
+		{ value: "serper", label: "Serper", available: available.serper },
+		{ value: "valyu", label: "Valyu", available: available.valyu },
 	];
 
 	return providers
@@ -41,7 +63,7 @@ export function generateCuratorPage(
 	queries: string[],
 	sessionToken: string,
 	timeout: number,
-	availableProviders: { openai: boolean; brave: boolean; parallel: boolean; tavily: boolean; serpdive: boolean; searxng: boolean; perplexity: boolean; exa: boolean; gemini: boolean; anysearch: boolean },
+	availableProviders: ProviderAvailability,
 	defaultProvider: string,
 	searchProvider: string,
 	summaryModels: Array<{ value: string; label: string }>,
@@ -634,6 +656,11 @@ main {
   text-transform: uppercase;
   border: 1px solid transparent;
 }
+.provider-tag.provider-all {
+  color: #f5e0a6;
+  background: rgba(245, 224, 166, 0.14);
+  border-color: rgba(245, 224, 166, 0.3);
+}
 .provider-tag.provider-exa {
   color: #8dd3ff;
   background: rgba(141, 211, 255, 0.14);
@@ -654,6 +681,16 @@ main {
   background: rgba(249, 199, 79, 0.14);
   border-color: rgba(249, 199, 79, 0.3);
 }
+.provider-tag.provider-xcrawl {
+  color: #7dd3ae;
+  background: rgba(125, 211, 174, 0.14);
+  border-color: rgba(125, 211, 174, 0.3);
+}
+.provider-tag.provider-xai {
+  color: #c4b5fd;
+  background: rgba(196, 181, 253, 0.14);
+  border-color: rgba(196, 181, 253, 0.3);
+}
 .provider-tag.provider-openai {
   color: #a6e3a1;
   background: rgba(166, 227, 161, 0.14);
@@ -669,15 +706,45 @@ main {
   background: rgba(137, 220, 235, 0.14);
   border-color: rgba(137, 220, 235, 0.3);
 }
+.provider-tag.provider-tinyfish {
+  color: #74c7ec;
+  background: rgba(116, 199, 236, 0.14);
+  border-color: rgba(116, 199, 236, 0.3);
+}
+.provider-tag.provider-search1api {
+  color: #89b4fa;
+  background: rgba(137, 180, 250, 0.14);
+  border-color: rgba(137, 180, 250, 0.3);
+}
+.provider-tag.provider-searchinfinity {
+  color: #f9e2af;
+  background: rgba(249, 226, 175, 0.14);
+  border-color: rgba(249, 226, 175, 0.3);
+}
+.provider-tag.provider-querit {
+  color: #a6e3a1;
+  background: rgba(166, 227, 161, 0.14);
+  border-color: rgba(166, 227, 161, 0.3);
+}
 .provider-tag.provider-tavily {
   color: #a6e3a1;
   background: rgba(166, 227, 161, 0.14);
   border-color: rgba(166, 227, 161, 0.3);
 }
+.provider-tag.provider-jina {
+  color: #f9e2af;
+  background: rgba(249, 226, 175, 0.14);
+  border-color: rgba(249, 226, 175, 0.3);
+}
 .provider-tag.provider-serpdive {
   color: #94e2d5;
   background: rgba(148, 226, 213, 0.14);
   border-color: rgba(148, 226, 213, 0.3);
+}
+.provider-tag.provider-brightdata {
+  color: #b4befe;
+  background: rgba(180, 190, 254, 0.14);
+  border-color: rgba(180, 190, 254, 0.3);
 }
 .provider-tag.provider-unknown {
   color: var(--fg-muted);
@@ -1402,7 +1469,7 @@ const SCRIPT = `(function() {
   var token = DATA.sessionToken;
   var timeoutSec = DATA.timeout;
   var queries = Array.isArray(DATA.queries) ? DATA.queries : [];
-  var providers = ["openai", "exa", "brave", "parallel", "tavily", "serpdive", "searxng", "perplexity", "gemini", "anysearch"];
+  var providers = ["all", "openai", "exa", "brave", "parallel", "parallel-mcp", "tinyfish", "search1api", "searchinfinity", "querit", "tavily", "firecrawl", "jina", "serpdive", "kagi", "bocha", "ollama", "searxng", "duckduckgo", "perplexity", "gemini", "kimi", "anysearch", "xcrawl", "xai", "mistral", "brightdata", "serpbase", "serper", "valyu"];
   var availProviders = DATA.availableProviders && typeof DATA.availableProviders === "object" ? DATA.availableProviders : {};
   var workflow = "summary-review";
   var initialDefaultProvider = typeof DATA.defaultProvider === "string" ? DATA.defaultProvider : "exa";
@@ -1430,6 +1497,9 @@ const SCRIPT = `(function() {
   var lastInteraction = Date.now();
   var completedCount = 0;
   var es = null;
+  var lastLiveEventAt = Date.now();
+  var stateSyncInFlight = false;
+  var liveUpdateWarning = false;
 
   var allQueries = queries.map(function(query, slotId) { return { slotId: slotId, query: query }; });
   var nextSlotId = queries.length;
@@ -1602,16 +1672,33 @@ const SCRIPT = `(function() {
   }
 
   function providerLabel(provider) {
+    if (provider === "all") return "All";
     if (provider === "openai") return "OpenAI";
     if (provider === "brave") return "Brave";
     if (provider === "parallel") return "Parallel";
+    if (provider === "tinyfish") return "TinyFish";
+    if (provider === "search1api") return "Search1API";
+    if (provider === "searchinfinity") return "Searchinfinity";
+    if (provider === "querit") return "Querit";
     if (provider === "tavily") return "Tavily";
+    if (provider === "firecrawl") return "Firecrawl";
+    if (provider === "jina") return "Jina";
     if (provider === "serpdive") return "SERPdive";
+    if (provider === "kagi") return "Kagi";
+    if (provider === "bocha") return "Bocha";
+    if (provider === "ollama") return "Ollama";
     if (provider === "searxng") return "SearXNG";
+    if (provider === "duckduckgo") return "DuckDuckGo";
     if (provider === "perplexity") return "Perplexity";
     if (provider === "exa") return "Exa";
     if (provider === "gemini") return "Gemini";
+    if (provider === "kimi") return "Kimi";
     if (provider === "anysearch") return "AnySearch";
+    if (provider === "xcrawl") return "XCrawl";
+    if (provider === "xai") return "xAI";
+    if (provider === "mistral") return "Mistral";
+    if (provider === "brightdata") return "Bright Data";
+    if (provider === "serpbase") return "SerpBase";
     return "Unknown";
   }
 
@@ -1887,15 +1974,28 @@ const SCRIPT = `(function() {
   }
 
   function clearError() {
+    liveUpdateWarning = false;
     if (!errorBanner) return;
     errorBanner.hidden = true;
     errorBanner.textContent = "";
   }
 
   function setError(text) {
+    liveUpdateWarning = false;
     if (!errorBanner) return;
     errorBanner.textContent = text;
     errorBanner.hidden = false;
+  }
+
+  function setLiveUpdateWarning(text) {
+    liveUpdateWarning = true;
+    if (!errorBanner) return;
+    errorBanner.textContent = text;
+    errorBanner.hidden = false;
+  }
+
+  function clearLiveUpdateWarning() {
+    if (liveUpdateWarning) clearError();
   }
 
   function updateSummaryGeneratingIndicator() {
@@ -2144,6 +2244,49 @@ const SCRIPT = `(function() {
       '<div class="result-card-body">' + bodyHtml + "</div>";
   }
 
+  function createSearchingCard(queryText, provider) {
+    var card = document.createElement("div");
+    card.className = "result-card searching";
+    card.innerHTML =
+      '<div class="result-card-header">' +
+        '<input type="checkbox" checked disabled>' +
+        '<div class="result-card-info">' +
+          '<div class="result-card-query-row">' +
+            '<div class="result-card-query">' + escHtml(queryText) + "</div>" +
+            providerTagHtml(provider) +
+          "</div>" +
+          '<div class="result-card-meta"><span class="searching-dots">Searching</span></div>' +
+        "</div>" +
+      "</div>" +
+      buildAltChipsHtml(provider, queryText);
+    return card;
+  }
+
+  function insertResultCard(card, slotId, afterCard) {
+    card.dataset.slot = String(slotId);
+    if (afterCard && afterCard.parentNode === resultCardsEl) {
+      resultCardsEl.insertBefore(card, afterCard.nextSibling);
+      return;
+    }
+    var slotCards = resultCardsEl.querySelectorAll('.result-card[data-slot="' + slotId + '"]');
+    var lastCard = slotCards.length > 0 ? slotCards[slotCards.length - 1] : null;
+    if (lastCard) resultCardsEl.insertBefore(card, lastCard.nextSibling);
+    else resultCardsEl.appendChild(card);
+  }
+
+  function applySearchResponseEntries(primaryCard, data, queryText, providerHint, slotId) {
+    var entries = Array.isArray(data && data.entries) && data.entries.length > 0 ? data.entries : [data];
+    var previousCard = primaryCard;
+    for (var entryIndex = 0; entryIndex < entries.length; entryIndex++) {
+      var entry = entries[entryIndex];
+      var entryProvider = normalizeProvider(entry && entry.provider, providerHint);
+      var targetCard = entryIndex === 0 ? primaryCard : createSearchingCard(queryText, entryProvider);
+      if (entryIndex > 0) insertResultCard(targetCard, slotId, previousCard);
+      applyResponseToCard(targetCard, entry, queryText, entryProvider, slotId);
+      previousCard = targetCard;
+    }
+  }
+
   function applyResponseToCard(card, data, queryText, providerHint, slotHint) {
     if (!card || !data) return;
     if (submitted || timerExpired) return;
@@ -2159,6 +2302,9 @@ const SCRIPT = `(function() {
     }
     if (queryIndex !== null && typeof slotId === "number") {
       queryIndexToSlot.set(queryIndex, slotId);
+    }
+    if (typeof slotId === "number") {
+      card.dataset.slot = String(slotId);
     }
 
     var provider = normalizeProvider(data.provider, providerHint);
@@ -2190,7 +2336,7 @@ const SCRIPT = `(function() {
   function resetTimer() { lastInteraction = Date.now(); }
 
   function updateTimer() {
-    var idleSec = Math.floor((Date.now() - lastInteraction) / 1000);
+    var idleSec = searchesDone ? Math.floor((Date.now() - lastInteraction) / 1000) : 0;
     var remaining = Math.max(0, timeoutSec - idleSec);
     timerEl.textContent = formatTime(remaining);
 
@@ -2302,21 +2448,8 @@ const SCRIPT = `(function() {
       var batchCards = [];
       for (var bi = 0; bi < batchQueries.length; bi++) {
         var bq = batchQueries[bi];
-        var card = document.createElement("div");
-        card.className = "result-card searching";
-        card.innerHTML =
-          '<div class="result-card-header">' +
-            '<input type="checkbox" checked disabled>' +
-            '<div class="result-card-info">' +
-              '<div class="result-card-query-row">' +
-                '<div class="result-card-query">' + escHtml(bq.query) + "</div>" +
-                providerTagHtml(provider) +
-              "</div>" +
-              '<div class="result-card-meta"><span class="searching-dots">Searching</span></div>' +
-            "</div>" +
-          "</div>" +
-          buildAltChipsHtml(provider, bq.query);
-        resultCardsEl.appendChild(card);
+        var card = createSearchingCard(bq.query, provider);
+        insertResultCard(card, bq.slotId, null);
         batchCards.push(card);
       }
       updateSummaryText();
@@ -2335,7 +2468,7 @@ const SCRIPT = `(function() {
               }, slot.query, provider, slot.slotId);
               return;
             }
-            applyResponseToCard(searchingCard, data, slot.query, provider, slot.slotId);
+            applySearchResponseEntries(searchingCard, data, slot.query, provider, slot.slotId);
           })
           .catch(function(err) {
             if (submitted || timerExpired) return;
@@ -2384,25 +2517,8 @@ const SCRIPT = `(function() {
       allQueries.push({ slotId: slotId, query: altQuery });
 
       var parentCard = chip.closest(".result-card");
-      var newCard = document.createElement("div");
-      newCard.className = "result-card searching";
-      newCard.innerHTML =
-        '<div class="result-card-header">' +
-          '<input type="checkbox" checked disabled>' +
-          '<div class="result-card-info">' +
-            '<div class="result-card-query-row">' +
-              '<div class="result-card-query">' + escHtml(altQuery) + "</div>" +
-              providerTagHtml(altProvider) +
-            "</div>" +
-            '<div class="result-card-meta"><span class="searching-dots">Searching</span></div>' +
-          "</div>" +
-        "</div>" +
-        buildAltChipsHtml(altProvider, altQuery);
-      if (parentCard && parentCard.nextSibling) {
-        resultCardsEl.insertBefore(newCard, parentCard.nextSibling);
-      } else {
-        resultCardsEl.appendChild(newCard);
-      }
+      var newCard = createSearchingCard(altQuery, altProvider);
+      insertResultCard(newCard, slotId, parentCard);
       updateSummaryText();
 
       postJson("/search", { query: altQuery, provider: altProvider })
@@ -2416,7 +2532,7 @@ const SCRIPT = `(function() {
             }, altQuery, altProvider, slotId);
             return;
           }
-          applyResponseToCard(newCard, data, altQuery, altProvider, slotId);
+          applySearchResponseEntries(newCard, data, altQuery, altProvider, slotId);
         })
         .catch(function(err) {
           removeSlot(slotId);
@@ -2491,21 +2607,8 @@ const SCRIPT = `(function() {
     var requestedProvider = currentSearchProvider;
     var displayProvider = currentProvider;
 
-    var card = document.createElement("div");
-    card.className = "result-card searching";
-    card.innerHTML =
-      '<div class="result-card-header">' +
-        '<input type="checkbox" checked disabled>' +
-        '<div class="result-card-info">' +
-          '<div class="result-card-query-row">' +
-            '<div class="result-card-query">' + escHtml(text) + "</div>" +
-            providerTagHtml(displayProvider) +
-          "</div>" +
-          '<div class="result-card-meta"><span class="searching-dots">Searching</span></div>' +
-        "</div>" +
-      "</div>" +
-      buildAltChipsHtml(displayProvider, text);
-    resultCardsEl.appendChild(card);
+    var card = createSearchingCard(text, displayProvider);
+    insertResultCard(card, slotId, null);
     updateSummaryText();
     resetTimer();
 
@@ -2525,7 +2628,7 @@ const SCRIPT = `(function() {
 
         if (submitted || timerExpired) return;
 
-        applyResponseToCard(card, data, text, displayProvider, slotId);
+        applySearchResponseEntries(card, data, text, displayProvider, slotId);
       })
       .catch(function(err) {
         removeSlot(slotId);
@@ -2668,22 +2771,9 @@ const SCRIPT = `(function() {
   } else {
     for (var i = 0; i < queries.length; i++) {
       queryIndexToSlot.set(i, i);
-      var card = document.createElement("div");
-      card.className = "result-card searching";
+      var card = createSearchingCard(queries[i], initialDefaultProvider);
       card.dataset.qi = i;
-      card.innerHTML =
-        '<div class="result-card-header">' +
-          '<input type="checkbox" checked disabled>' +
-          '<div class="result-card-info">' +
-            '<div class="result-card-query-row">' +
-              '<div class="result-card-query">' + escHtml(queries[i]) + "</div>" +
-              providerTagHtml(initialDefaultProvider) +
-            "</div>" +
-            '<div class="result-card-meta"><span class="searching-dots">Searching</span></div>' +
-          "</div>" +
-        "</div>" +
-        buildAltChipsHtml(initialDefaultProvider, queries[i]);
-      resultCardsEl.appendChild(card);
+      insertResultCard(card, i, null);
     }
   }
 
@@ -2704,37 +2794,54 @@ const SCRIPT = `(function() {
     }
   }
 
-  es.addEventListener("result", function(e) {
-    var data = parseSseEventData("result", e);
+  function applyResultEvent(data) {
     if (!data) return;
+    lastLiveEventAt = Date.now();
+    clearLiveUpdateWarning();
 
-    var card = resultCardsEl.querySelector('.result-card[data-qi="' + data.queryIndex + '"]');
-    if (!card) return;
-
-    var slotId = queryIndexToSlot.get(data.queryIndex);
+    var queryText = data.query || queries[data.queryIndex] || "";
+    var slotId = typeof data.slotIndex === "number" ? data.slotIndex : queryIndexToSlot.get(data.queryIndex);
     if (typeof slotId !== "number") slotId = data.queryIndex;
-    applyResponseToCard(card, data, data.query || queries[data.queryIndex], data.provider, slotId);
-  });
+    var card = resultCardsEl.querySelector('.result-card[data-qi="' + data.queryIndex + '"]');
+    if (!card) {
+      card = createSearchingCard(queryText, data.provider);
+      card.dataset.qi = data.queryIndex;
+      insertResultCard(card, slotId, null);
+    } else if (card.dataset.completed === "true") {
+      return;
+    }
+    applyResponseToCard(card, data, queryText, data.provider, slotId);
+  }
 
-  es.addEventListener("search-error", function(e) {
-    var data = parseSseEventData("search-error", e);
+  function applySearchErrorEvent(data) {
     if (!data) return;
+    lastLiveEventAt = Date.now();
+    clearLiveUpdateWarning();
 
-    var card = resultCardsEl.querySelector('.result-card[data-qi="' + data.queryIndex + '"]');
-    if (!card) return;
-
-    var slotId = queryIndexToSlot.get(data.queryIndex);
+    var queryText = data.query || queries[data.queryIndex] || "";
+    var slotId = typeof data.slotIndex === "number" ? data.slotIndex : queryIndexToSlot.get(data.queryIndex);
     if (typeof slotId !== "number") slotId = data.queryIndex;
+    var card = resultCardsEl.querySelector('.result-card[data-qi="' + data.queryIndex + '"]');
+    if (!card) {
+      card = createSearchingCard(queryText, data.provider);
+      card.dataset.qi = data.queryIndex;
+      insertResultCard(card, slotId, null);
+    } else if (card.dataset.completed === "true") {
+      return;
+    }
     applyResponseToCard(card, {
       queryIndex: data.queryIndex,
       answer: "",
       results: [],
       error: data.error || "Search failed",
       provider: data.provider,
-    }, data.query || queries[data.queryIndex], data.provider, slotId);
-  });
+    }, queryText, data.provider, slotId);
+  }
 
-  es.addEventListener("done", function() {
+  function applyDoneEvent() {
+    var wasSearchesDone = searchesDone;
+    lastLiveEventAt = Date.now();
+    clearLiveUpdateWarning();
     searchesDone = true;
     initialStreamDone = true;
     if (completedCount > 0) {
@@ -2744,12 +2851,77 @@ const SCRIPT = `(function() {
     recomputeProviderStates();
     updateStageUI();
     maybeAutoGenerateSummary();
-    resetTimer();
+    if (!wasSearchesDone) resetTimer();
+  }
+
+  function applyStoredLiveEvent(item) {
+    if (!item || typeof item !== "object") return;
+    if (item.event === "result") applyResultEvent(item.data);
+    if (item.event === "search-error") applySearchErrorEvent(item.data);
+  }
+
+  function syncStateFromServer(showWarning) {
+    if (stateSyncInFlight || submitted || timerExpired || searchesDone) return;
+    stateSyncInFlight = true;
+    fetch("/state?session=" + encodeURIComponent(token), { cache: "no-store" })
+      .then(function(res) {
+        return res.text().then(function(raw) {
+          var data = raw ? JSON.parse(raw) : null;
+          if (!res.ok || !data || data.ok === false) {
+            throw new Error(extractServerError(data) || ("HTTP " + res.status));
+          }
+          return data;
+        });
+      })
+      .then(function(data) {
+        if (Array.isArray(data.events)) {
+          data.events.forEach(applyStoredLiveEvent);
+        }
+        if (data.done) applyDoneEvent();
+        if (showWarning && !searchesDone) {
+          setLiveUpdateWarning("Live search updates disconnected. Reconnecting and polling for results.");
+        }
+      })
+      .catch(function(err) {
+        if (!showWarning || submitted || timerExpired) return;
+        var message = err instanceof Error ? err.message : String(err);
+        setLiveUpdateWarning("Live search updates disconnected. Retrying: " + (message || "unknown error"));
+      })
+      .finally(function() {
+        stateSyncInFlight = false;
+      });
+  }
+
+  es.addEventListener("open", function() {
+    lastLiveEventAt = Date.now();
+    clearLiveUpdateWarning();
+    syncStateFromServer(false);
+  });
+
+  es.addEventListener("result", function(e) {
+    var data = parseSseEventData("result", e);
+    applyResultEvent(data);
+  });
+
+  es.addEventListener("search-error", function(e) {
+    var data = parseSseEventData("search-error", e);
+    applySearchErrorEvent(data);
+  });
+
+  es.addEventListener("done", function() {
+    applyDoneEvent();
   });
 
   es.onerror = function() {
-    // EventSource reconnects automatically.
+    if (submitted || timerExpired || searchesDone) return;
+    syncStateFromServer(true);
   };
+
+  setInterval(function() {
+    if (submitted || timerExpired || searchesDone || initialStreamDone) return;
+    if (Date.now() - lastLiveEventAt <= 5000) return;
+    syncStateFromServer(false);
+  }, 5000);
 
   function setupCardInteraction(card) {
     var header = card.querySelector(".result-card-header");

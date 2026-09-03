@@ -1,11 +1,20 @@
-import { complete, type Api, type Message, type Model } from "@earendil-works/pi-ai/compat";
+import { clampThinkingLevel, type ModelThinkingLevel, type ThinkingLevel } from "@earendil-works/pi-ai";
+import { complete, completeSimple, type Api, type Message, type Model } from "@earendil-works/pi-ai/compat";
 import type { ExtensionContext } from "@earendil-works/pi-coding-agent";
-import { loadEnabledModelPatterns, modelMatchesEnabledPatterns } from "./summary-model-scope.ts";
+import { findModelWithProviderRouting, loadEnabledModelPatterns, modelMatchesEnabledPatterns, splitThinkingSuffix, type SummaryThinkingLevel } from "./summary-model-scope.ts";
 import type { QueryResultData } from "./storage.ts";
+
+type ProviderHeaders = Record<string, string | null>;
+type CompleteFunction = typeof complete;
+type SummaryModelRegistry = SummaryGenerationContext["modelRegistry"] & { complete?: CompleteFunction };
 
 const PREFERRED_SUMMARY_MODELS = [
 	{ provider: "anthropic", id: "claude-haiku-4-5" },
-	{ provider: "openai-codex", id: "gpt-5.3-codex-spark" },
+	{ provider: "openai-codex", id: "gpt-5.6-luna" },
+	{ provider: "openai-codex", id: "gpt-5.6-terra" },
+	{ provider: "google", id: "gemini-3.6-flash" },
+	{ provider: "openai", id: "gpt-5-mini" },
+	{ provider: "deepseek", id: "deepseek-v4-flash" },
 ] as const;
 
 export const SUMMARY_GENERATION_DEADLINE_MS = 30_000;
@@ -182,28 +191,35 @@ export function buildDeterministicSummary(results: QueryResultData[]): { summary
 	};
 }
 
-function parseModelSelector(value: string): { provider: string; id: string } {
-	const slashIndex = value.indexOf("/");
-	if (slashIndex <= 0 || slashIndex >= value.length - 1) {
+function parseModelSelector(value: string): { provider: string; id: string; thinkingLevel?: SummaryThinkingLevel } {
+	const selector = splitThinkingSuffix(value);
+	const slashIndex = selector.value.indexOf("/");
+	if (slashIndex <= 0 || slashIndex >= selector.value.length - 1) {
 		throw new Error(`Invalid summary model: ${value}. Use provider/model-id.`);
 	}
 	return {
-		provider: value.slice(0, slashIndex),
-		id: value.slice(slashIndex + 1),
+		provider: selector.value.slice(0, slashIndex),
+		id: selector.value.slice(slashIndex + 1),
+		thinkingLevel: selector.thinkingLevel,
 	};
+}
+
+function resolveThinkingLevel(model: Model<Api>, requested?: SummaryThinkingLevel): ModelThinkingLevel | undefined {
+	if (!requested) return undefined;
+	return clampThinkingLevel(model, requested as ModelThinkingLevel);
 }
 
 async function resolveSummaryModelCandidates(
 	ctx: SummaryGenerationContext,
 	modelOverride?: string,
-): Promise<{ candidates: Array<{ model: Model<Api>; apiKey: string; headers?: Record<string, string> }>; errors: string[] }> {
+): Promise<{ candidates: Array<{ model: Model<Api>; apiKey?: string; headers?: ProviderHeaders; thinkingLevel?: SummaryThinkingLevel }>; errors: string[] }> {
 	const enabledModelPatterns = loadEnabledModelPatterns(ctx);
-	const specs: Array<{ provider: string; id: string }> = [];
+	const specs: Array<{ provider: string; id: string; thinkingLevel?: SummaryThinkingLevel }> = [];
 	const normalizedOverride = typeof modelOverride === "string" ? modelOverride.trim() : "";
 	if (normalizedOverride.length > 0) specs.push(parseModelSelector(normalizedOverride));
 	specs.push(...PREFERRED_SUMMARY_MODELS);
 
-	const candidates: Array<{ model: Model<Api>; apiKey: string; headers?: Record<string, string> }> = [];
+	const candidates: Array<{ model: Model<Api>; apiKey?: string; headers?: ProviderHeaders; thinkingLevel?: SummaryThinkingLevel }> = [];
 	const errors: string[] = [];
 	const seen = new Set<string>();
 	for (const spec of specs) {
@@ -211,7 +227,7 @@ async function resolveSummaryModelCandidates(
 		if (seen.has(value)) continue;
 		seen.add(value);
 
-		const model = ctx.modelRegistry.find(spec.provider, spec.id);
+		const model = findModelWithProviderRouting(ctx.modelRegistry, spec.provider, spec.id);
 		if (!model) {
 			errors.push(`Summary model not found: ${value}`);
 			continue;
@@ -221,11 +237,11 @@ async function resolveSummaryModelCandidates(
 			continue;
 		}
 		const auth = await ctx.modelRegistry.getApiKeyAndHeaders(model);
-		if (!auth.ok || !auth.apiKey) {
+		if (!auth.ok) {
 			errors.push(`No API key available for summary model ${value}`);
 			continue;
 		}
-		candidates.push({ model, apiKey: auth.apiKey, headers: auth.headers });
+		candidates.push({ model, apiKey: auth.apiKey, headers: auth.headers, thinkingLevel: spec.thinkingLevel });
 	}
 	return { candidates, errors };
 }
@@ -273,12 +289,17 @@ export async function generateSummaryDraft(
 	signal?: AbortSignal,
 	modelOverride?: string,
 	feedback?: string,
-	completeFn: typeof complete = complete,
+	completeFn?: CompleteFunction,
 	deadlineMs = SUMMARY_GENERATION_DEADLINE_MS,
 ): Promise<{ summary: string; meta: SummaryMeta }> {
 	if (!ctx || !ctx.modelRegistry) {
 		throw new Error("Summary generation context unavailable");
 	}
+
+	const registry = ctx.modelRegistry as SummaryModelRegistry;
+	const customCompleteFn = completeFn !== undefined;
+	const usesRegistryComplete = !customCompleteFn && typeof registry.complete === "function";
+	completeFn ??= usesRegistryComplete ? registry.complete!.bind(registry) as CompleteFunction : complete;
 
 	const generationStartedAt = Date.now();
 	const deadlineController = new AbortController();
@@ -335,7 +356,7 @@ export async function generateSummaryDraft(
 		}
 
 		let lastError = resolved.errors.at(-1);
-		for (const { model, apiKey, headers } of resolved.candidates) {
+		for (const { model, apiKey, headers, thinkingLevel } of resolved.candidates) {
 			const startedAt = Date.now();
 			try {
 				const userMessage: Message = {
@@ -343,25 +364,34 @@ export async function generateSummaryDraft(
 					content: [{ type: "text", text: prompt }],
 					timestamp: Date.now(),
 				};
+				const requestedThinkingLevel = resolveThinkingLevel(model, thinkingLevel);
+				const enabledThinkingLevel = requestedThinkingLevel && requestedThinkingLevel !== "off"
+					? requestedThinkingLevel as ThinkingLevel
+					: undefined;
+				const completionOptions = {
+					...(usesRegistryComplete ? {} : { apiKey, headers }),
+					signal: completionSignal,
+					...(requestedThinkingLevel ? { reasoning: requestedThinkingLevel } : {}),
+					...(enabledThinkingLevel ? { reasoningEffort: enabledThinkingLevel } : {}),
+				};
+				const completion = thinkingLevel !== undefined && !customCompleteFn && !usesRegistryComplete
+					? completeSimple(model, { messages: [userMessage] }, { apiKey, headers, signal: completionSignal, ...(enabledThinkingLevel ? { reasoning: enabledThinkingLevel } : {}) })
+					: completeFn(model, { messages: [userMessage] }, completionOptions);
 
-				const response = await raceSummaryOperation(Promise.resolve(completeFn(
-					model,
-					{ messages: [userMessage] },
-					{ apiKey, headers, signal: completionSignal },
-				)));
+				const response = await raceSummaryOperation(Promise.resolve(completion));
 				if (response.stopReason === "aborted") {
 					throw new Error("Aborted");
 				}
 
 				const contentParts = Array.isArray(response.content) ? response.content : [];
 				const summary = contentParts
-					.map(part => getTextFromContentPart(part))
-					.filter(text => text.trim().length > 0)
+					.map((part: unknown) => getTextFromContentPart(part))
+					.filter((text: string) => text.trim().length > 0)
 					.join("\n")
 					.trim();
 
 				if (summary.length === 0) {
-					const partTypes = contentParts.map(part => getContentPartType(part));
+					const partTypes = contentParts.map((part: unknown) => getContentPartType(part));
 					const typesLabel = partTypes.length > 0 ? partTypes.join(", ") : "none";
 					throw new Error(`Summary model returned empty response (content parts: ${typesLabel})`);
 				}

@@ -79,7 +79,10 @@ const driver = `
 			citations: ["https://example.com/"],
 			choices: [{ message: { content: "ok" } }],
 			web: { results: [{ title: "t", url: "https://example.com/", description: "d" }] },
-			output: [{ type: "message", content: [{ type: "output_text", text: "ok" }] }],
+			output: [
+				{ type: "web_search_call", action: { sources: [{ title: "t", url: "https://example.com/" }] } },
+				{ type: "message", content: [{ type: "output_text", text: "ok" }] },
+			],
 			candidates: [{ content: { parts: [{ text: "ok" }] } }],
 		}), { status: 200, headers: { "content-type": "application/json" } });
 	};

@@ -1,16 +1,56 @@
 import { lookup as dnsLookup } from "node:dns/promises";
-import { existsSync, readFileSync } from "node:fs";
+import { existsSync, readFileSync, statSync } from "node:fs";
 import net from "node:net";
-import { getWebSearchConfigPath } from "./utils.ts";
+import { getActiveProxy, getWebSearchConfigPath, hasScopedProxyDecision, isProxyBypassedUrl } from "./utils.ts";
 
 const DEFAULT_MAX_REDIRECTS = 5;
 const REDIRECT_STATUSES = new Set([301, 302, 303, 307, 308]);
+const LOOPBACK_ALLOW_RANGES = ["127.0.0.0/8", "::1", "::ffff:127.0.0.0/104"];
 
 export type LookupAddress = { address: string; family: number };
 export type Lookup = (hostname: string) => Promise<LookupAddress[]>;
 type Fetch = typeof fetch;
 
 const WEB_SEARCH_CONFIG_PATH = getWebSearchConfigPath();
+
+let cachedConfigRoot: { signature: string; value: Record<string, unknown> | null } | null = null;
+
+function loadConfigRoot(): Record<string, unknown> | null {
+	if (!existsSync(WEB_SEARCH_CONFIG_PATH)) return null;
+
+	let signature: string;
+	try {
+		const stat = statSync(WEB_SEARCH_CONFIG_PATH);
+		signature = `${stat.mtimeMs}:${stat.size}`;
+	} catch {
+		return null;
+	}
+
+	if (cachedConfigRoot?.signature === signature) return cachedConfigRoot.value;
+
+	let raw: string;
+	try {
+		raw = readFileSync(WEB_SEARCH_CONFIG_PATH, "utf-8");
+	} catch {
+		// Do not memoize read failures: a chmod fix changes neither mtime nor size,
+		// so a cached failure would permanently fail-open the domain policy.
+		return null;
+	}
+
+	let parsed: unknown;
+	try {
+		parsed = JSON.parse(raw);
+	} catch (err) {
+		const message = err instanceof Error ? err.message : String(err);
+		throw new Error(`Failed to parse ${WEB_SEARCH_CONFIG_PATH}: ${message}`);
+	}
+
+	const value = parsed && typeof parsed === "object" && !Array.isArray(parsed)
+		? parsed as Record<string, unknown>
+		: null;
+	cachedConfigRoot = { signature, value };
+	return value;
+}
 
 export interface SsrfConfig {
 	allowRanges: string[];
@@ -25,24 +65,9 @@ export interface DomainPolicy {
 const DEFAULT_DOMAIN_POLICY: DomainPolicy = { allow: [], deny: [] };
 
 export function loadFetchContentDomainPolicy(): DomainPolicy {
-	if (!existsSync(WEB_SEARCH_CONFIG_PATH)) return { ...DEFAULT_DOMAIN_POLICY };
-	let raw: string;
-	try {
-		raw = readFileSync(WEB_SEARCH_CONFIG_PATH, "utf-8");
-	} catch {
-		return { ...DEFAULT_DOMAIN_POLICY };
-	}
-	let parsed: unknown;
-	try {
-		parsed = JSON.parse(raw);
-	} catch (err) {
-		const message = err instanceof Error ? err.message : String(err);
-		throw new Error(`Failed to parse ${WEB_SEARCH_CONFIG_PATH}: ${message}`);
-	}
-	if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) {
-		return { ...DEFAULT_DOMAIN_POLICY };
-	}
-	const fetchContent = (parsed as { fetchContent?: unknown }).fetchContent;
+	const parsed = loadConfigRoot();
+	if (!parsed) return { ...DEFAULT_DOMAIN_POLICY };
+	const fetchContent = parsed.fetchContent;
 	if (fetchContent === undefined || fetchContent === null) return { ...DEFAULT_DOMAIN_POLICY };
 	if (typeof fetchContent !== "object" || Array.isArray(fetchContent)) {
 		throw new Error(`fetchContent in ${WEB_SEARCH_CONFIG_PATH} must be an object`);
@@ -85,24 +110,9 @@ function normalizeDomainEntry(entry: string): string | null {
 }
 
 export function loadSsrfConfig(): SsrfConfig {
-	if (!existsSync(WEB_SEARCH_CONFIG_PATH)) return { allowRanges: [], trustEnvProxy: false };
-	let raw: string;
-	try {
-		raw = readFileSync(WEB_SEARCH_CONFIG_PATH, "utf-8");
-	} catch {
-		return { allowRanges: [], trustEnvProxy: false };
-	}
-	let parsed: unknown;
-	try {
-		parsed = JSON.parse(raw);
-	} catch (err) {
-		const message = err instanceof Error ? err.message : String(err);
-		throw new Error(`Failed to parse ${WEB_SEARCH_CONFIG_PATH}: ${message}`);
-	}
-	if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) {
-		return { allowRanges: [], trustEnvProxy: false };
-	}
-	const ssrf = (parsed as { ssrf?: unknown }).ssrf;
+	const parsed = loadConfigRoot();
+	if (!parsed) return { allowRanges: [], trustEnvProxy: false };
+	const ssrf = parsed.ssrf;
 	if (ssrf === undefined || ssrf === null) return { allowRanges: [], trustEnvProxy: false };
 	if (typeof ssrf !== "object" || Array.isArray(ssrf)) {
 		throw new Error(`ssrf in ${WEB_SEARCH_CONFIG_PATH} must be an object`);
@@ -143,6 +153,8 @@ interface ValidationOptions {
 	 * the local SSRF preflight. This does not configure proxy transport.
 	 */
 	trustEnvProxy?: boolean;
+	/** Allow loopback URLs for explicit provider base endpoints, not fetched targets. */
+	allowLoopback?: boolean;
 }
 
 /** Parsed entry from `allowRanges`: a network address (4 or 16 bytes) + prefix length. */
@@ -151,9 +163,17 @@ interface ParsedCidr {
 	prefix: number;
 }
 
+interface RedirectRequestInitArgs {
+	from: URL;
+	to: URL;
+	init: RequestInit;
+	response: Response;
+}
+
 interface FetchRemoteOptions extends ValidationOptions {
 	fetch?: Fetch;
 	maxRedirects?: number;
+	onRedirect?: (args: RedirectRequestInitArgs) => RequestInit;
 }
 
 async function defaultLookup(hostname: string): Promise<LookupAddress[]> {
@@ -168,7 +188,11 @@ export async function validateRemoteUrl(rawUrl: string | URL, options: Validatio
 
 	const hostname = normalizeHostname(url.hostname);
 	if (!hostname) throw new Error("URL must include a hostname");
-	if (hostname === "localhost" || hostname.endsWith(".localhost")) {
+	if (hostname === "localhost") {
+		if (options.allowLoopback === true) return url;
+		throw new Error(`Blocked internal hostname: ${hostname}`);
+	}
+	if (hostname.endsWith(".localhost")) {
 		throw new Error(`Blocked internal hostname: ${hostname}`);
 	}
 
@@ -176,7 +200,10 @@ export async function validateRemoteUrl(rawUrl: string | URL, options: Validatio
 	assertDomainPolicy(hostname, options.domainPolicy);
 
 	if (net.isIP(hostname)) {
-		assertPublicAddress(hostname, hostname, allowRanges);
+		const addressAllowRanges = options.allowLoopback === true
+			? [...allowRanges, ...parseAllowRanges(LOOPBACK_ALLOW_RANGES)]
+			: allowRanges;
+		assertPublicAddress(hostname, hostname, addressAllowRanges);
 		return url;
 	}
 
@@ -215,11 +242,13 @@ export async function fetchRemoteUrl(
 		if (!location) return response;
 		if (redirects === maxRedirects) throw new Error(`Too many redirects fetching ${current.toString()}`);
 
+		const from = current;
 		current = await validateRemoteUrl(new URL(location, current), options);
 		if (response.status === 303 || ((response.status === 301 || response.status === 302) && requestInit.method?.toUpperCase() === "POST")) {
 			const { body: _body, ...nextInit } = requestInit;
 			requestInit = { ...nextInit, method: "GET" };
 		}
+		if (options.onRedirect) requestInit = options.onRedirect({ from, to: current, init: requestInit, response });
 	}
 
 	throw new Error(`Too many redirects fetching ${current.toString()}`);
@@ -300,6 +329,9 @@ function hostnameMatchesNoProxy(hostname: string, port: string, entry: string): 
 
 function shouldTrustEnvProxy(url: URL, enabled: boolean): boolean {
 	if (!enabled || !getProxyForProtocol(url.protocol)) return false;
+	if (hasScopedProxyDecision()) return false;
+	const activeProxy = getActiveProxy();
+	if (activeProxy && !isProxyBypassedUrl(url)) return false;
 	const hostname = normalizeHostname(url.hostname);
 	const port = url.port || (url.protocol === "https:" ? "443" : "80");
 	const noProxy = process.env.NO_PROXY || process.env.no_proxy || "";

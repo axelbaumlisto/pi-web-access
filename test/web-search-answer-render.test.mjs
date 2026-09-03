@@ -15,7 +15,9 @@ function runChild(script, env) {
 		"OPENAI_API_KEY",
 		"BRAVE_API_KEY",
 		"PARALLEL_API_KEY",
+		"TINYFISH_API_KEY",
 		"TAVILY_API_KEY",
+		"JINA_API_KEY",
 		"EXA_API_KEY",
 		"PERPLEXITY_API_KEY",
 		"GEMINI_API_KEY",
@@ -35,10 +37,13 @@ test("web_search preserves OpenAI answers even when no sources are returned", as
 	const home = await mkdtemp(join(tmpdir(), "pi-web-access-openai-answer-"));
 	const child = runChild(`
 		globalThis.fetch = async () => new Response(JSON.stringify({
-			output: [{
-				type: "message",
-				content: [{ type: "output_text", text: "Direct answer without citations." }],
-			}],
+			output: [
+				{ type: "web_search_call", action: { sources: [] } },
+				{
+					type: "message",
+					content: [{ type: "output_text", text: "Direct answer without citations." }],
+				},
+			],
 		}), { status: 200, headers: { "content-type": "application/json" } });
 
 		const { default: initializeExtension } = await import(${JSON.stringify(indexUrl)});

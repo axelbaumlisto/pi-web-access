@@ -1,7 +1,7 @@
 import { readFileSync } from "node:fs";
 import { basename } from "node:path";
-import { getLastGoogleCookieDiagnostic, type CookieMap, getGoogleCookies } from "./chrome-cookies.ts";
-import { getChromeProfileFromConfig, isBrowserCookieAccessAllowed, normalizeChromeProfile } from "./gemini-web-config.ts";
+import { getLastGoogleCookieDiagnostic, getLastGoogleCookieDiagnosticDetails, type BrowserCookieDiagnosticDetails, type CookieMap, getGoogleCookies } from "./chrome-cookies.ts";
+import { getBrowserCookieSelectionFromConfig, isBrowserCookieAccessAllowed, normalizeChromeProfile } from "./gemini-web-config.ts";
 
 const GEMINI_APP_URL = "https://gemini.google.com/app";
 const GEMINI_STREAM_GENERATE_URL =
@@ -15,13 +15,79 @@ const USER_AGENT =
 	"Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36";
 
 const MODEL_HEADER_NAME = "x-goog-ext-525001261-jspb";
+export const DEFAULT_GEMINI_WEB_MODEL = "gemini-3.1-pro";
 const MODEL_HEADERS: Record<string, string> = {
-	"gemini-3-pro": '[1,null,null,null,"9d8ca3786ebdfbea",null,null,0,[4]]',
+	[DEFAULT_GEMINI_WEB_MODEL]: '[1,null,null,null,"9d8ca3786ebdfbea",null,null,0,[4]]',
 	"gemini-2.5-pro": '[1,null,null,null,"4af6c7f5da75d65d",null,null,0,[4]]',
 	"gemini-2.5-flash": '[1,null,null,null,"9ec249fc9ad08861",null,null,0,[4]]',
 };
 
 const REQUIRED_COOKIES = ["__Secure-1PSID", "__Secure-1PSIDTS"];
+
+// Gemini Web talks to Google's frontend inside the host agent (pi), whose
+// global undici dispatcher runs HTTP/1.1 with undici's default 16 KiB
+// maxHeaderSize. Google's gemini.google.com /app response headers routinely
+// exceed that budget over HTTP/1.1, so cookie-bearing requests fail with
+// UND_ERR_HEADERS_OVERFLOW surfaced as "fetch failed". Route these requests
+// through a dedicated undici Agent with a larger header budget instead; fall
+// back to the ambient global fetch when undici is not resolvable (e.g.
+// standalone test environments).
+let geminiFetchImpl: typeof fetch | null = null;
+
+// Test-only hook: lets tests inject a simulated transport instead of patching
+// globalThis.fetch. Gemini Web deliberately bypasses the ambient global fetch
+// (inside the pi host agent it is constrained to undici's 16 KiB
+// maxHeaderSize and cannot serve Google's /app page over HTTP/1.1), so
+// globalThis.fetch patching is no longer a reliable way to intercept these
+// requests.
+export function setGeminiFetchOverrideForTests(fetchImpl: typeof fetch | null): void {
+	geminiFetchOverride = fetchImpl;
+}
+
+let geminiFetchOverride: typeof fetch | null = null;
+
+// The header budget Gemini Web needs for Google frontend responses.
+// Google's /app page exceeds undici's default 16 KiB maxHeaderSize when
+// served over HTTP/1.1, which is how pi's global dispatcher operates.
+export const GEMINI_MAX_HEADER_SIZE = 4 * 1024 * 1024;
+
+// Build a fetch that routes through a dedicated undici Agent with a larger
+// header budget than the host agent's global dispatcher allows. Exported for
+// tests so the agent configuration can be asserted without network access.
+export function createGeminiFetch(undiciImpl: typeof import("undici")): typeof fetch {
+	const agent = new undiciImpl.EnvHttpProxyAgent({
+		allowH2: false,
+		connectTimeout: 30_000,
+		maxHeaderSize: GEMINI_MAX_HEADER_SIZE,
+		pipelining: 1,
+	});
+	// undici 8 types its fetch request/response structurally differently from
+	// the DOM lib types (duplex/textStream on Request, Symbol.dispose on
+	// Headers); the shape this module uses (status, ok, headers.get, text) is
+	// identical, so bridge the two.
+	type UndiciFetch = typeof undiciImpl.fetch;
+	return (input, init) =>
+		undiciImpl.fetch(
+			input as unknown as Parameters<UndiciFetch>[0],
+			{ ...init, dispatcher: agent } as unknown as Parameters<UndiciFetch>[1],
+		) as unknown as Promise<Response>;
+}
+
+export async function resolveGeminiFetch(): Promise<typeof fetch> {
+	if (geminiFetchOverride) return geminiFetchOverride;
+	if (geminiFetchImpl) return geminiFetchImpl;
+
+	let undici: typeof import("undici");
+	try {
+		undici = await import("undici");
+	} catch {
+		geminiFetchImpl = fetch;
+		return geminiFetchImpl;
+	}
+
+	geminiFetchImpl = createGeminiFetch(undici);
+	return geminiFetchImpl;
+}
 
 export interface GeminiWebOptions {
 	youtubeUrl?: string;
@@ -34,8 +100,10 @@ export interface GeminiWebOptions {
 export async function isGeminiWebAvailable(chromeProfile?: string): Promise<CookieMap | null> {
 	if (!isBrowserCookieAccessAllowed()) return null;
 
+	const configured = getBrowserCookieSelectionFromConfig();
 	const result = await getGoogleCookies({
-		profile: normalizeChromeProfile(chromeProfile) ?? getChromeProfileFromConfig(),
+		browser: configured.browser,
+		profile: normalizeChromeProfile(chromeProfile) ?? configured.profile,
 		requiredCookies: REQUIRED_COOKIES,
 	});
 	if (!result) return null;
@@ -44,6 +112,10 @@ export async function isGeminiWebAvailable(chromeProfile?: string): Promise<Cook
 
 export function getGeminiWebAvailabilityDiagnostic(): string | null {
 	return isBrowserCookieAccessAllowed() ? getLastGoogleCookieDiagnostic() : null;
+}
+
+export function getGeminiWebAvailabilityDiagnosticDetails(): BrowserCookieDiagnosticDetails | null {
+	return isBrowserCookieAccessAllowed() ? getLastGoogleCookieDiagnosticDetails() : null;
 }
 
 export async function getActiveGoogleEmail(cookies: CookieMap): Promise<string | null> {
@@ -80,7 +152,10 @@ export async function queryWithCookies(
 	cookieMap: CookieMap,
 	options: GeminiWebOptions = {},
 ): Promise<string> {
-	const model = options.model && MODEL_HEADERS[options.model] ? options.model : "gemini-2.5-flash";
+	const model = options.model ?? DEFAULT_GEMINI_WEB_MODEL;
+	if (!MODEL_HEADERS[model]) {
+		throw new Error(`Gemini Web does not support model ${model}; configure Gemini API or choose a supported Gemini Web model.`);
+	}
 	const timeoutMs = options.timeoutMs ?? 120000;
 
 	let fullPrompt = prompt;
@@ -89,13 +164,6 @@ export async function queryWithCookies(
 	}
 
 	const result = await runGeminiWebOnce(fullPrompt, cookieMap, model, options.files, timeoutMs, options.signal);
-
-	if (isModelUnavailable(result.errorCode) && model !== "gemini-2.5-flash") {
-		const fallback = await runGeminiWebOnce(fullPrompt, cookieMap, "gemini-2.5-flash", options.files, timeoutMs, options.signal);
-		if (fallback.errorMessage) throw new Error(fallback.errorMessage);
-		if (!fallback.text) throw new Error("Gemini Web returned empty response (fallback model)");
-		return fallback.text;
-	}
 
 	if (result.errorMessage) throw new Error(result.errorMessage);
 	if (!result.text) throw new Error("Gemini Web returned empty response");
@@ -132,7 +200,7 @@ async function runGeminiWebOnce(
 	params.set("at", accessToken);
 	params.set("f.req", fReq);
 
-	const res = await fetch(GEMINI_STREAM_GENERATE_URL, {
+	const res = await (await resolveGeminiFetch())(GEMINI_STREAM_GENERATE_URL, {
 		method: "POST",
 		redirect: "error",
 		headers: {
@@ -195,7 +263,7 @@ async function fetchWithCookieRedirects(
 	let current = url;
 	const allowedOrigin = new URL(url).origin;
 	for (let i = 0; i <= maxRedirects; i++) {
-		const res = await fetch(current, {
+		const res = await (await resolveGeminiFetch())(current, {
 			headers: { "user-agent": USER_AGENT, cookie: cookieHeader },
 			redirect: "manual",
 			signal,
@@ -305,7 +373,7 @@ async function uploadFile(
 		Buffer.from(footer, "utf-8"),
 	]);
 
-	const res = await fetch(GEMINI_UPLOAD_URL, {
+	const res = await (await resolveGeminiFetch())(GEMINI_UPLOAD_URL, {
 		method: "POST",
 		redirect: "error",
 		headers: {
@@ -372,10 +440,6 @@ function trimJsonEnvelope(text: string): string {
 function extractErrorCode(responseJson: unknown): number | undefined {
 	const code = getNestedValue(responseJson, [0, 5, 2, 0, 1, 0]);
 	return typeof code === "number" && code >= 0 ? code : undefined;
-}
-
-function isModelUnavailable(errorCode: number | undefined): boolean {
-	return errorCode === 1052;
 }
 
 function extractCandidateText(candidate: unknown): string {

@@ -6,18 +6,21 @@ import { test } from "node:test";
 
 // Hermetic: never pick up the developer's real ~/.pi/web-search.json (e.g. a
 // unified-proxy config would reroute the mocked fetch assertions below).
+// Static imports are hoisted above this assignment, and utils.ts caches the
+// config dir on first use, so the project modules are imported dynamically
+// AFTER the env var is set.
 process.env.PI_CODING_AGENT_DIR = mkdtempSync(join(tmpdir(), "pi-web-access-source-check-"));
 
-import initializeExtension from "../index.ts";
-import {
+const { default: initializeExtension } = await import("../index.ts");
+const {
   assessClaim,
   buildResearchArtifact,
   buildPassages,
   getResearchArtifact,
   hashContent,
   storeResearchArtifact,
-} from "../source-check.ts";
-import { clearResults } from "../storage.ts";
+} = await import("../source-check.ts");
+const { clearResults } = await import("../storage.ts");
 
 const result = (url, snippet, rank = 1) => ({ url, title: "Example", snippet, rank });
 

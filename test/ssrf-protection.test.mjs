@@ -2,6 +2,7 @@ import assert from "node:assert/strict";
 import { test } from "node:test";
 
 import { fetchRemoteUrl, validateRemoteUrl } from "../ssrf-protection.ts";
+import { runWithProxy } from "../utils.ts";
 
 const publicLookup = async () => [{ address: "93.184.216.34", family: 4 }];
 
@@ -47,6 +48,16 @@ test("validateRemoteUrl blocks hostnames that resolve to private addresses", asy
 			lookup: async () => [{ address: "93.184.216.34", family: 4 }, { address: "fd00::1", family: 6 }],
 		}),
 		/Blocked internal address for example\.test: fd00::1/,
+	);
+});
+
+test("loopback opt-in does not allow arbitrary hostnames that resolve to loopback", async () => {
+	await assert.rejects(
+		validateRemoteUrl("https://example.test/", {
+			allowLoopback: true,
+			lookup: async () => [{ address: "127.0.0.1", family: 4 }],
+		}),
+		/Blocked internal address for example\.test: 127\.0\.0\.1/,
 	);
 });
 
@@ -311,6 +322,66 @@ test("trustEnvProxy skips hostname DNS only for a configured proxy", async () =>
 			validateRemoteUrl("https://localhost/", { trustEnvProxy: true, lookup }),
 			/Blocked internal hostname/,
 		);
+	} finally {
+		for (const [key, value] of Object.entries(previous)) {
+			if (value === undefined) delete process.env[key];
+			else process.env[key] = value;
+		}
+	}
+});
+
+test("trustEnvProxy still validates DNS when a curl proxy is active", async () => {
+	const previous = {
+		HTTPS_PROXY: process.env.HTTPS_PROXY,
+		NO_PROXY: process.env.NO_PROXY,
+		no_proxy: process.env.no_proxy,
+	};
+	try {
+		process.env.HTTPS_PROXY = "http://env-proxy.example.test:8080";
+		delete process.env.NO_PROXY;
+		delete process.env.no_proxy;
+		let lookups = 0;
+		await assert.rejects(
+			runWithProxy("http://curl-proxy.example.test:8080", () => validateRemoteUrl("https://public.example.test/", {
+				trustEnvProxy: true,
+				lookup: async () => {
+					lookups++;
+					return [{ address: "10.0.0.10", family: 4 }];
+				},
+			})),
+			/Blocked internal address/,
+		);
+		assert.equal(lookups, 1);
+	} finally {
+		for (const [key, value] of Object.entries(previous)) {
+			if (value === undefined) delete process.env[key];
+			else process.env[key] = value;
+		}
+	}
+});
+
+test("trustEnvProxy still validates DNS when empty proxy forces direct access", async () => {
+	const previous = {
+		HTTPS_PROXY: process.env.HTTPS_PROXY,
+		NO_PROXY: process.env.NO_PROXY,
+		no_proxy: process.env.no_proxy,
+	};
+	try {
+		process.env.HTTPS_PROXY = "http://env-proxy.example.test:8080";
+		delete process.env.NO_PROXY;
+		delete process.env.no_proxy;
+		let lookups = 0;
+		await assert.rejects(
+			runWithProxy("", () => validateRemoteUrl("https://public.example.test/", {
+				trustEnvProxy: true,
+				lookup: async () => {
+					lookups++;
+					return [{ address: "10.0.0.10", family: 4 }];
+				},
+			})),
+			/Blocked internal address/,
+		);
+		assert.equal(lookups, 1);
 	} finally {
 		for (const [key, value] of Object.entries(previous)) {
 			if (value === undefined) delete process.env[key];

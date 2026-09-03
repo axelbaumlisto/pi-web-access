@@ -1,33 +1,51 @@
 import http, { type IncomingMessage, type ServerResponse } from "node:http";
 import { generateCuratorPage } from "./curator-page.ts";
+import type { ProviderAvailability } from "./gemini-search.ts";
 import type { SummaryMeta } from "./summary-review.ts";
+import { resolveCuratorNetworkConfig } from "./utils.ts";
 
 const STALE_THRESHOLD_MS = 30000;
 const WATCHDOG_INTERVAL_MS = 1000;
 const MAX_BODY_SIZE = 64 * 1024;
 
 type ServerState = "SEARCHING" | "RESULT_SELECTION" | "COMPLETED";
+type CuratorResultEventData = IndexedCuratorSearchEntry & { slotIndex?: number };
+type CuratorSearchErrorEventData = { queryIndex: number; query: string; error: string; provider?: string; slotIndex?: number };
+type CuratorStoredEvent =
+	| { event: "result"; data: CuratorResultEventData }
+	| { event: "search-error"; data: CuratorSearchErrorEventData };
 
 export interface CuratorServerOptions {
 	queries: string[];
+	/** First index available to searches added while initial results are still streaming. */
+	initialResultIndexCapacity?: number;
 	sessionToken: string;
 	timeout: number;
-	availableProviders: { openai: boolean; brave: boolean; parallel: boolean; tavily: boolean; serpdive: boolean; searxng: boolean; perplexity: boolean; exa: boolean; gemini: boolean; anysearch: boolean };
+	availableProviders: ProviderAvailability;
 	defaultProvider: string;
 	searchProvider: string;
 	summaryModels: Array<{ value: string; label: string }>;
 	defaultSummaryModel: string | null;
 }
 
+export interface CuratorSearchEntry {
+	answer: string;
+	results: Array<{ title: string; url: string; domain: string; snippet?: string }>;
+	provider: string;
+	error?: string;
+}
+
+export interface IndexedCuratorSearchEntry extends CuratorSearchEntry {
+	queryIndex: number;
+	query: string;
+}
+
 export interface CuratorServerCallbacks {
 	onSubmit: (payload: { selectedQueryIndices: number[]; summary?: string; summaryMeta?: SummaryMeta; rawResults?: boolean }) => void;
 	onCancel: (reason: "user" | "timeout" | "stale") => void;
 	onProviderChange: (provider: string) => void;
-	onAddSearch: (query: string, queryIndex: number, provider?: string) => Promise<{
-		answer: string;
-		results: Array<{ title: string; url: string; domain: string }>;
-		provider: string;
-	}>;
+	onAddSearch: (query: string, provider?: string) => Promise<CuratorSearchEntry[]>;
+	onAddSearchResults: (entries: IndexedCuratorSearchEntry[]) => void;
 	onSummarize: (
 		selectedQueryIndices: number[],
 		signal: AbortSignal,
@@ -41,8 +59,8 @@ export interface CuratorServerHandle {
 	server: http.Server;
 	url: string;
 	close: () => void;
-	pushResult: (queryIndex: number, data: { answer: string; results: Array<{ title: string; url: string; domain: string }>; provider: string }) => void;
-	pushError: (queryIndex: number, error: string, provider?: string) => void;
+	pushResult: (queryIndex: number, data: CuratorSearchEntry & { query?: string; slotIndex?: number }) => void;
+	pushError: (queryIndex: number, error: string, provider?: string, meta?: { query?: string; slotIndex?: number }) => void;
 	searchesDone: () => void;
 	/** Reports browser connection state so a cancelled search can surface WHY it
 	 * went stale (e.g. the browser never connected). */
@@ -178,6 +196,7 @@ export function startCuratorServer(
 ): Promise<CuratorServerHandle> {
 	const {
 		queries,
+		initialResultIndexCapacity,
 		sessionToken,
 		timeout,
 		availableProviders,
@@ -195,8 +214,9 @@ export function startCuratorServer(
 	let watchdog: NodeJS.Timeout | null = null;
 	let state: ServerState = "SEARCHING";
 	let sseResponse: ServerResponse | null = null;
-	const sseBuffer: string[] = [];
-	let nextQueryIndex = queries.length;
+	const streamedEventsByResultIndex = new Map<number, CuratorStoredEvent>();
+	let searchStreamDone = queries.length === 0;
+	let nextQueryIndex = Math.max(queries.length, initialResultIndexCapacity ?? queries.length);
 	let summarizeAbortController: AbortController | null = null;
 	let summarizeRequestSeq = 0;
 
@@ -255,26 +275,68 @@ export function startCuratorServer(
 	}
 
 	function isAvailableProvider(provider: string): boolean {
+		if (provider === "all") return availableProviders.all;
 		if (provider === "openai") return availableProviders.openai;
 		if (provider === "brave") return availableProviders.brave;
 		if (provider === "parallel") return availableProviders.parallel;
+		if (provider === "parallel-mcp") return availableProviders["parallel-mcp"];
+		if (provider === "tinyfish") return availableProviders.tinyfish;
+		if (provider === "search1api") return availableProviders.search1api;
+		if (provider === "searchinfinity") return availableProviders.searchinfinity;
+		if (provider === "querit") return availableProviders.querit;
 		if (provider === "tavily") return availableProviders.tavily;
+		if (provider === "firecrawl") return availableProviders.firecrawl;
+		if (provider === "jina") return availableProviders.jina;
 		if (provider === "serpdive") return availableProviders.serpdive;
+		if (provider === "kagi") return availableProviders.kagi;
+		if (provider === "bocha") return availableProviders.bocha;
+		if (provider === "ollama") return availableProviders.ollama;
 		if (provider === "searxng") return availableProviders.searxng;
+		if (provider === "duckduckgo") return availableProviders.duckduckgo;
 		if (provider === "perplexity") return availableProviders.perplexity;
 		if (provider === "exa") return availableProviders.exa;
 		if (provider === "gemini") return availableProviders.gemini;
+		if (provider === "kimi") return availableProviders.kimi;
 		if (provider === "anysearch") return availableProviders.anysearch;
+		if (provider === "xcrawl") return availableProviders.xcrawl;
+		if (provider === "xai") return availableProviders.xai;
+		if (provider === "mistral") return availableProviders.mistral;
+		if (provider === "brightdata") return availableProviders.brightdata;
+		if (provider === "serpbase") return availableProviders.serpbase;
+		if (provider === "serper") return availableProviders.serper;
+		if (provider === "valyu") return availableProviders.valyu;
 		return false;
 	}
 
-	function sendSSE(event: string, data: unknown): void {
+	function writeSSE(res: ServerResponse, event: string, data: unknown): boolean {
 		const payload = `event: ${event}\ndata: ${JSON.stringify(data)}\n\n`;
-		const res = sseResponse;
-		if (res && !res.writableEnded && res.socket && !res.socket.destroyed) {
-			try { res.write(payload); return; } catch {}
+		try {
+			res.write(payload);
+			return true;
+		} catch {
+			return false;
 		}
-		sseBuffer.push(payload);
+	}
+
+	function sendSSE(event: string, data: unknown): void {
+		const res = sseResponse;
+		if (res && !res.writableEnded && res.socket && !res.socket.destroyed && writeSSE(res, event, data)) return;
+		if (sseResponse === res) sseResponse = null;
+	}
+
+	function retainStreamedEvent(event: CuratorStoredEvent): void {
+		streamedEventsByResultIndex.set(event.data.queryIndex, event);
+	}
+
+	function getStreamedEvents(): CuratorStoredEvent[] {
+		return [...streamedEventsByResultIndex.values()];
+	}
+
+	function replaySSE(res: ServerResponse): void {
+		for (const item of getStreamedEvents()) {
+			if (!writeSSE(res, item.event, item.data)) return;
+		}
+		if (searchStreamDone) writeSSE(res, "done", {});
 	}
 
 	const pageHtml = generateCuratorPage(
@@ -332,18 +394,7 @@ export function startCuratorServer(
 				res.flushHeaders();
 				if (res.socket) res.socket.setNoDelay(true);
 				sseResponse = res;
-				if (sseBuffer.length > 0) {
-					const pending = sseBuffer.splice(0, sseBuffer.length);
-					for (let i = 0; i < pending.length; i++) {
-						const msg = pending[i];
-						try {
-							res.write(msg);
-						} catch {
-							sseBuffer.unshift(...pending.slice(i));
-							break;
-						}
-					}
-				}
+				replaySSE(res);
 				if (sseKeepalive) clearInterval(sseKeepalive);
 				sseKeepalive = setInterval(() => {
 					if (sseResponse) {
@@ -353,6 +404,17 @@ export function startCuratorServer(
 				req.on("close", () => {
 					if (sseResponse === res) sseResponse = null;
 				});
+				return;
+			}
+
+			if (method === "GET" && url.pathname === "/state") {
+				const token = url.searchParams.get("session");
+				if (token !== sessionToken) {
+					sendJson(res, 403, { ok: false, error: "Invalid session" });
+					return;
+				}
+				touchHeartbeat();
+				sendJson(res, 200, { ok: true, events: getStreamedEvents(), done: searchStreamDone });
 				return;
 			}
 
@@ -418,24 +480,30 @@ export function startCuratorServer(
 					}
 				}
 				const qi = nextQueryIndex++;
+				const trimmedQuery = query.trim();
 				touchHeartbeat();
 				try {
-					const result = await callbacks.onAddSearch(query.trim(), qi, provider);
-					sendJson(res, 200, {
-						ok: true,
-						queryIndex: qi,
-						answer: result.answer,
-						results: result.results,
-						provider: result.provider,
-					});
+					const results = await callbacks.onAddSearch(trimmedQuery, provider);
+					if (results.length === 0) throw new Error("Search returned no provider results");
+					const entries = results.map((result, index): IndexedCuratorSearchEntry => ({
+						...result,
+						queryIndex: index === 0 ? qi : nextQueryIndex++,
+						query: trimmedQuery,
+					}));
+					callbacks.onAddSearchResults(entries);
+					sendJson(res, 200, { ok: true, ...entries[0], entries });
 				} catch (err) {
 					const message = err instanceof Error ? err.message : "Search failed";
-					sendJson(res, 200, {
-						ok: true,
+					const entry: IndexedCuratorSearchEntry = {
 						queryIndex: qi,
+						query: trimmedQuery,
+						answer: "",
+						results: [],
 						error: message,
-						...(typeof provider === "string" && provider.length > 0 ? { provider } : {}),
-					});
+						provider: typeof provider === "string" && provider.length > 0 ? provider : defaultProvider,
+					};
+					callbacks.onAddSearchResults([entry]);
+					sendJson(res, 200, { ok: true, ...entry, entries: [entry] });
 				}
 				return;
 			}
@@ -612,15 +680,17 @@ export function startCuratorServer(
 			reject(new Error(`Curator server failed to start: ${err.message}`));
 		};
 
+		const networkConfig = resolveCuratorNetworkConfig();
+
 		server.once("error", onError);
-		server.listen(0, "127.0.0.1", () => {
+		server.listen(0, networkConfig.bind, () => {
 			server.off("error", onError);
 			const addr = server.address();
 			if (!addr || typeof addr === "string") {
 				reject(new Error("Curator server: invalid address"));
 				return;
 			}
-			const url = `http://localhost:${addr.port}/?session=${sessionToken}`;
+			const url = `http://${networkConfig.host}:${addr.port}/?session=${sessionToken}`;
 
 			watchdog = setInterval(() => {
 				if (completed) return;
@@ -655,14 +725,21 @@ export function startCuratorServer(
 				},
 				pushResult: (queryIndex, data) => {
 					if (completed) return;
-					sendSSE("result", { queryIndex, query: queries[queryIndex] ?? "", ...data });
+					nextQueryIndex = Math.max(nextQueryIndex, queryIndex + 1);
+					const eventData: CuratorResultEventData = { ...data, queryIndex, query: data.query ?? queries[queryIndex] ?? "" };
+					retainStreamedEvent({ event: "result", data: eventData });
+					sendSSE("result", eventData);
 				},
-				pushError: (queryIndex, error, provider) => {
+				pushError: (queryIndex, error, provider, meta) => {
 					if (completed) return;
-					sendSSE("search-error", { queryIndex, query: queries[queryIndex] ?? "", error, provider });
+					nextQueryIndex = Math.max(nextQueryIndex, queryIndex + 1);
+					const eventData: CuratorSearchErrorEventData = { queryIndex, query: meta?.query ?? queries[queryIndex] ?? "", error, provider, slotIndex: meta?.slotIndex };
+					retainStreamedEvent({ event: "search-error", data: eventData });
+					sendSSE("search-error", eventData);
 				},
 				searchesDone: () => {
 					if (completed) return;
+					searchStreamDone = true;
 					sendSSE("done", {});
 					state = "RESULT_SELECTION";
 					stateChangedAt = Date.now();

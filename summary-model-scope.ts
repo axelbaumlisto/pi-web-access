@@ -2,16 +2,47 @@ import { existsSync, readFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
 
-const THINKING_LEVELS = new Set(["off", "minimal", "low", "medium", "high", "xhigh"]);
+const THINKING_LEVELS = new Set(["off", "minimal", "low", "medium", "high", "xhigh", "max"]);
+
+export type SummaryThinkingLevel = "off" | "minimal" | "low" | "medium" | "high" | "xhigh" | "max";
 
 interface SummaryModelScopeContext {
 	cwd: string;
 	isProjectTrusted(): boolean;
 }
 
-interface ModelLike {
+export interface ModelLike {
 	provider: string;
 	id: string;
+}
+
+export interface ModelRegistryLike<T extends ModelLike = ModelLike> {
+	find(provider: string, id: string): T | undefined;
+	getAvailable(): readonly T[];
+}
+
+/**
+ * Resolve a model through its native provider or a provider that routes that model ID.
+ *
+ * The direct registry fallback preserves explicit/native model resolution when a
+ * provider's availability snapshot does not include the configured model. Callers
+ * continue to apply their existing enabled-model and authentication checks.
+ */
+export function findModelWithProviderRouting<T extends ModelLike>(
+	registry: ModelRegistryLike<T>,
+	provider: string,
+	id: string,
+): T | undefined {
+	const available = registry.getAvailable();
+	const direct = available.find(model => model.provider === provider && model.id === id);
+	if (direct) return direct;
+
+	const routedId = `${provider}/${id}`;
+	// If multiple routers expose the same model ID, Pi's available-model ordering
+	// determines which route is selected. An explicit provider/model selector can
+	// select a specific route when that distinction matters.
+	const routed = available.find(model => model.id === routedId);
+	return routed ?? registry.find(provider, id);
 }
 
 function getAgentDir(): string {
@@ -49,11 +80,17 @@ export function summaryModelValue(model: ModelLike): string {
 	return `${model.provider}/${model.id}`;
 }
 
+export function splitThinkingSuffix(value: string): { value: string; thinkingLevel?: SummaryThinkingLevel } {
+	const index = value.lastIndexOf(":");
+	if (index < 0) return { value };
+	const suffix = value.slice(index + 1);
+	return THINKING_LEVELS.has(suffix)
+		? { value: value.slice(0, index), thinkingLevel: suffix as SummaryThinkingLevel }
+		: { value };
+}
+
 function stripThinkingSuffix(pattern: string): string {
-	const index = pattern.lastIndexOf(":");
-	if (index < 0) return pattern;
-	const suffix = pattern.slice(index + 1);
-	return THINKING_LEVELS.has(suffix) ? pattern.slice(0, index) : pattern;
+ return splitThinkingSuffix(pattern).value;
 }
 
 function globToRegExp(pattern: string): RegExp {

@@ -38,7 +38,9 @@ function inspectOpenAIAuth(registryResult) {
 		let registryCalls = 0;
 		const ctx = {
 			modelRegistry: {
-				find: (provider, modelId) => ({ provider, id: modelId }),
+				// upstream 0.27: resolvePiAuth lists models via getAll() and picks the
+				// newest non-pro/ultra id ("terra" tier preferred).
+				getAll: () => [{ provider: "openai-codex", id: "gpt-5.6-terra" }, { provider: "openai", id: "gpt-5.6-terra" }],
 				getApiKeyAndHeaders: async () => {
 					registryCalls += 1;
 					return ${JSON.stringify(registryResult)};

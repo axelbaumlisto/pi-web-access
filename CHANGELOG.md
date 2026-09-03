@@ -4,6 +4,51 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+## [pi-ext-int-search 1.2.0] - 2026-09-03 (fork release)
+
+Merged upstream `nicobailon/pi-web-access` **v0.14.0 → v0.27.0** (180 commits, 13 releases; see the
+entries below for everything inherited: 17 new search providers incl. keyless DuckDuckGo and
+self-hosted SearXNG/Firecrawl, `provider:"all"` / provider arrays, `fetch_content` `mode:"raw"|"answer"`,
+`get_search_content findText`, GitHub PR/issue specialization, Gemini ADC + PDF→Markdown, external
+fetch cache, transport `proxy` via curl, per-provider `*BaseUrl` overrides with redirect credential stripping).
+
+### Breaking (fork users)
+- `braveBaseUrl` / `tavilyBaseUrl` / `exaBaseUrl` are now **API bases** (upstream 0.24 semantics: the provider
+  appends `/web/search`, `/search`, …). In 1.1.0 brave/tavily were full endpoint URLs. A config like
+  `"braveBaseUrl": "https://gw/v1/brave/search"` must become `"https://gw/res/v1"`-style. Unified proxy
+  (`proxyBaseUrl`) users are unaffected — the gateway routes are unchanged (`/v1/brave/search` stays full).
+- Per-provider `*BaseUrl` / `*_BASE_URL` and `proxyBaseUrl` / `WEB_SEARCH_PROXY_URL` are now validated:
+  absolute **HTTPS**, no embedded credentials, no query/fragment. `openaiResponsesUrl` is HTTPS-only
+  (upstream accepts `http:`). An explicitly empty `*_BASE_URL=""` is an error, not "unset".
+
+### Fixed (security)
+- **Destination-first key binding now branches on destination, not on key presence.** A proxied destination
+  with a missing `proxyApiKey` is *unavailable*; it never falls back to a personal key (env / `$ENV` / `!cmd`
+  / model-registry). Previously `WEB_SEARCH_PROXY_URL` set + key missing sent the personal key to the gateway.
+- `proxyBaseUrl` itself is validated (it was the one URL receiving every key and had no HTTPS/credential check).
+- Redirect credential stripping extended to Perplexity, OpenAI and **Gemini** (`x-goog-api-key` /
+  `cf-aig-authorization` are custom headers undici does not strip cross-origin); upstream covers brave/exa/tavily.
+- Direct-Google detection for the ambient `GEMINI_API_KEY` now requires `https:`.
+- Model-registry OpenAI/Codex tokens are still gated to OpenAI-owned origins (`isOpenAIAuthOrigin`) — upstream
+  sends them to any `openaiResponsesUrl`; a JWT-shaped proxy key is never redirected to chatgpt.com.
+
+### Changed
+- `provider-endpoints.ts` v2: `kind: "base" | "full"` + `overrideSuffix`; `resolveProviderKey()` /
+  `providerHasCredential()` / `isProxiedDestination()` are the only proxy-aware helpers — providers hold no
+  proxy logic. Dead sync `providerApiKey` / `providerProxyApiKey` / `normalizeBaseUrl` removed.
+- Auto-mode empty-result fallback (`nonEmptyOrThrow` / `EmptyResultError`) now covers **every** auto provider
+  (18), not the 9 that predate the merge; explicit / `all` / routing modes stay strict.
+- Pattern redaction (`redactError`) applied at the auto-chain aggregation point, so every provider's error text
+  is scrubbed, not only the five with per-provider `redactProviderError`.
+- `memory_search` registers through upstream's tool-gate machinery: `tools.memorySearch.enabled`,
+  `toolNames.memorySearch` (participates in rename + duplicate detection).
+- Tests are hermetic by default (`node --import ./test/hermetic-env.mjs --test`): a developer's real
+  `~/.pi/web-search.json` can no longer reroute mocked-fetch assertions. New `provider-endpoints` (15) and
+  `proxy-key-binding` (3 configurations × 6 providers) suites.
+- Dropped the fork's "keep every Perplexity citation" patch in favour of upstream's `citationsToKeep`
+  (keeps up to `max(numResults, highest cited [n])`, capped at 20).
+- Removed dead `.npmignore` (`files[]` governs the tarball); demo mp4 no longer shipped (referenced by URL).
+
 ## [pi-ext-int-search 1.1.0] - 2026-07-26 (fork release)
 
 Merged upstream `nicobailon/pi-web-access` v0.14.0 (see the 0.14.0 entry below
@@ -30,6 +75,267 @@ search routing, fetch-content domain policy, configurable tool names).
   packaging.
 - Made `source_check` tests hermetic (they no longer pick up the developer's
   real `~/.pi/web-search.json`).
+
+## [Unreleased — upstream]
+
+### Added
+
+- Documented the Linux `xdg-utils` dependency for automatic curator browser launch and the manual URL fallback. Thanks to [@wickedTangent](https://github.com/wickedTangent) for issue #336 and PR #337.
+- Added opt-in xAI Agent Tools `x_search` support alongside `web_search`, with validated `xaiSearchTools` configuration and defensive citation handling. Thanks to [@Jerry2003sky](https://github.com/Jerry2003sky) for issue #342.
+- Added explicit-only Mistral Conversations web search over direct HTTP, with `mistralApiKey` / `MISTRAL_API_KEY` credentials and opt-in `web_search_premium` support. Thanks to [@jaudiger](https://github.com/jaudiger) for issue #346.
+
+### Changed
+
+- Run batch `web_search` queries with bounded concurrency while preserving query order and sequential provider fallback within each query. Thanks to [@Noir-Lime](https://github.com/Noir-Lime) for PR #345.
+
+### Fixed
+
+- Retained citations referenced in Perplexity answers even when they fall beyond `numResults`, while preserving the result-count limit for answers without citation markers. Thanks to [@schlessera](https://github.com/schlessera) for issue #340 and PR #341.
+- Scoped configured proxy transport to web-tool operations so unrelated Pi requests retain their existing transport. Thanks to [@alexei-ciobanu](https://github.com/alexei-ciobanu) for PR #339 and [@mystery4f](https://github.com/mystery4f) for PR #343.
+- Cleaned stale GitHub clone runtime directories after a crashed process when the owner can be proven dead, while preserving runtimes with unknown or live owners. Thanks to [@yazanabuashour](https://github.com/yazanabuashour) for issue #331.
+- Kept an existing legacy `~/.pi/web-search.json` in use when `XDG_CONFIG_HOME` is set but its XDG config file is absent. Thanks to [@hu3rror](https://github.com/hu3rror) for issue #333.
+
+## [0.27.0] - 2026-08-28
+
+### Highlights
+
+- `fetch_content` now lets you tune direct HTTP and Jina Reader timeouts from config.
+- Answer mode can use a configured default model while still allowing per-call overrides.
+- HTML fallback parsing is quieter for pages with relative canonical links.
+- GitHub repository fetching is safer when more than one Pi process is running.
+
+### Added
+
+- Added opt-in `fetch.timeout` configuration in seconds for the direct HTTP and Jina Reader `fetch_content` paths, with per-call timeout overrides taking precedence. Thanks to [@linuxtextadventurer](https://github.com/linuxtextadventurer) for PR #327.
+- Added opt-in `fetch.answerProvider` and `fetch.answerModel` defaults for `fetch_content` answer mode, with per-call `answerModel` overrides taking precedence. Thanks to [@linuxtextadventurer](https://github.com/linuxtextadventurer) for PR #328.
+
+### Fixed
+
+- Set the Defuddle fallback document URL before parsing pages with relative canonical links, preventing `ERR_INVALID_URL` warnings. Thanks to [@bin115885](https://github.com/bin115885) for issue #322.
+- Isolated GitHub clone workdirs per extension runtime so cleanup in one process cannot delete another process's clone. Thanks to [@MDGChamomile](https://github.com/MDGChamomile) for PR #323.
+
+
+## [0.26.0] - 2026-08-28
+
+### Highlights
+- `web_search` now includes XCrawl as an explicit search provider.
+- XCrawl results now produce safer clickable links, including relative redirect links from the API.
+- Local models can send multiple web-search queries as a JSON string and still get separate searches.
+- HTML fallback extraction is quieter and more accurate when Defuddle cannot process a page.
+
+### Added
+
+- Added XCrawl as an explicit-only search provider (`provider: "xcrawl"`) with `xcrawlApiKey` / `XCRAWL_API_KEY` credentials, client-side domain filtering, fallback titles, and retriable provider-timeout errors. Thanks to [@zeroicey](https://github.com/zeroicey) for #312 and #313.
+
+### Changed
+
+- Refined the XCrawl provider docs, parser shape, availability metadata, and focused tests.
+
+### Fixed
+
+- Expanded JSON-array strings supplied in the singular `web_search` `query` field into independent searches, with a clear no-query error for empty arrays. Thanks to [@alex-rs](https://github.com/alex-rs) for #317 and [@zeroicey](https://github.com/zeroicey) for PR #319.
+- Kept Defuddle selector-processing failures out of the Pi console and stopped treating the raw page body as a successful extraction. Thanks to [@riabiy](https://github.com/riabiy) for #315.
+- Resolved API-origin-relative XCrawl result links to absolute URLs and rejected blank result links instead of emitting fabricated source URLs. Thanks to [@zeroicey](https://github.com/zeroicey) for #318.
+
+## [0.25.0] - 2026-08-25
+
+### Highlights
+- `web_search`, `source_check`, and `fetch_content` can now use an explicit HTTP(S) proxy for restricted networks.
+- `fetch_content` now gives useful GitHub PR and issue summaries, including comments, review threads, anchors, and truncation markers.
+- Gemini users can choose browser cookie profiles more predictably and can use Google Application Default Credentials for Gemini generate-content calls.
+- Kimi Code Plan users can run explicit Kimi web searches through Pi's `kimi-coding` login.
+- HTML extraction, missing-page guidance, and stored-content lookup are more reliable.
+
+### Added
+- Added an optional `proxy` parameter to `web_search`, `source_check`, and `fetch_content`. When set, search APIs, page fetches, and content extraction use `curl` through that proxy. Localhost and `NO_PROXY` hosts still bypass the proxy. A default proxy can also be set with `"proxy"` in `~/.pi/web-search.json`. Thanks to [@mystery4f](https://github.com/mystery4f) for PR #307.
+- Added deterministic Chromium cookie selection with `browserCookies.browser` and `browserCookies.profile`; arbitrary profile paths remain unsupported. Thanks to [@lmilojevicc](https://github.com/lmilojevicc) for issue #297.
+- Added GitHub PR and issue specialization in `fetch_content`, with `gh`-first metadata, bounded REST fallback, comment anchors, review threads, truncation markers, and the `githubPrIssue.enabled` opt-out (#294).
+- Added explicit-only Kimi Code Plan search using Pi's refreshed `kimi-coding` OAuth credentials. Thanks to [@lushangkan](https://github.com/lushangkan) for PR #275.
+- Added opt-in `searchRouting.useCurrentModel` routing for automatic searches. Official OpenAI GPT Responses models can now fund Hosted Search with their current endpoint, credentials, and headers before configured fallbacks. Thanks to [@nyankosama](https://github.com/nyankosama) for PR #293.
+- Added strict Hosted Search response validation and better fallback classification for unsupported Hosted Search tools.
+- Added current-model Hosted Search routing for official `openai-codex` GPT Responses models through the Codex Responses endpoint.
+- Added Google Application Default Credentials support for Gemini generate-content calls with `geminiAuth: "adc"`. This covers Gemini search, URL context, PDF, and inline-data extraction through Vertex AI. YouTube and local video analysis still require `GEMINI_API_KEY` because they use the Gemini Files API. Thanks to [@smazurov](https://github.com/smazurov) for PR #301.
+
+### Fixed
+- Added Defuddle as a local fallback when Readability and RSC extraction cannot recover useful HTML content. Thanks to [@tobru](https://github.com/tobru) for issue #300.
+- Kept Gemini ADC config and credential errors, GitHub PR/issue REST fallback failures, and Defuddle fallback failures visible instead of silently downgrading them.
+- Pointed definitive `fetch_content` 404/410 failures to search guidance instead of provider configuration. Thanks to [@Daniishkhan](https://github.com/Daniishkhan) for PR #308.
+- Improved Gemini Web browser-cookie diagnostics so `/google-account` shows sanitized attempted browser/profile entries and distinguishes missing required cookies, password-store access, and decryption failures. Thanks to [@lmilojevicc](https://github.com/lmilojevicc) for issue #296.
+- Made `get_search_content` tolerate bridge defaults when `findText` is supplied, while preserving ordinary pagination. Thanks to [@ZacharyQin](https://github.com/ZacharyQin) for PR #295.
+
+## [0.24.2] - 2026-08-22
+
+### Highlights
+- `auto` search now uses Codex-backed OpenAI search when Pi is running a Codex model.
+- Non-Codex sessions still prefer Exa first, so zero-config search keeps its fast keyless path.
+- Gemini Web browser-cookie access is more reliable on Windows Chrome and Edge profiles.
+
+### Changed
+- Prefer Codex-backed OpenAI search in `auto` mode when the active Pi model is `openai-codex`; otherwise prefer Exa before OpenAI.
+
+### Fixed
+- Fixed Windows Gemini Web browser-cookie extraction when Chromium cookie expiry values are too large for JavaScript numbers or PowerShell DPAPI key unprotect needs encoded command transport. Thanks to [@laixuanthoi](https://github.com/laixuanthoi) for issue #290.
+
+## [0.24.1] - 2026-08-21
+
+### Added
+- Added `pdf.maxPages` to limit Datalab, Gemini, and local PDF extraction to the first N pages. Thanks to [@jaudiger](https://github.com/jaudiger) for issue #277.
+- Added optional `openaiSearchProviders` config to choose which Pi model providers fund OpenAI `web_search`, in priority order. Thanks to [@hank-warren](https://github.com/hank-warren) for PR #276.
+- Added Windows Chrome and Edge browser-cookie support for Gemini Web. Thanks to [@laixuanthoi](https://github.com/laixuanthoi) for issue #286.
+
+### Fixed
+- Hardened GitHub clone cache path handling. Thanks to [@spikelab](https://github.com/spikelab) for the responsible disclosure.
+- Updated the local `fetch_content` HTTP User-Agent for wider compatible content retrieval. Thanks to [@_can1357](https://x.com/_can1357) for [the User-Agent observation](https://x.com/_can1357/status/2090837707069014224).
+- Replaced inline RFC 2397 `data:` URIs in extracted page content with explicit bounded omission markers (MIME type, encoding, encoded/decoded byte counts, SHA-256 digest, `retrieval=not-retained`) before content reaches tool results, the fetch cache, or session persistence. Readable prose and Markdown image alt text are preserved; typed thumbnail/frame image blocks are unaffected. Thanks to [@bbbRye007](https://github.com/bbbRye007) for #281 and #282.
+- Detached Linux curator browser launches so `xdg-open` cannot block `web_search` until the browser exits. Thanks to [@nguyenphivn](https://github.com/nguyenphivn) for issue #279.
+- Allowed configured Firecrawl API base URLs to use loopback addresses without opening loopback for submitted fetch targets. Thanks to [@ackalker](https://github.com/ackalker) for issue #280.
+
+## [0.24.0] - 2026-08-18
+
+### Highlights
+- Added more provider choices, including Parallel Search MCP, Valyu, and Serper.
+- Made `fetch_content` recover useful article text from more Next.js and React Server Components pages.
+- Updated summary and query rewrite model defaults to newer fast models.
+- Made nested summary and rewrite model calls follow Pi's model registry routing.
+- Added more control over summary thinking levels and provider API base URLs.
+
+### Added
+- Added `summaryModel` thinking-level suffix support. Thanks to [@pkos98](https://github.com/pkos98) for issue #264.
+- Added explicit-only Parallel Search MCP support for keyless search and opt-in hosted fetch. Thanks to [@happytomatoe](https://github.com/happytomatoe) for #257.
+- Added explicit-only Valyu and Serper search providers. Thanks to [@mikhel01](https://github.com/mikhel01) for issues #259 and #260.
+- Added configurable API base URLs for Brave, keyed Exa, and Tavily requests, with credential stripping across redirect origins. Thanks to [@XWIlluDelu](https://github.com/XWIlluDelu) for #265.
+
+### Changed
+- Refreshed default summary and query rewrite model preferences. Thanks to [@hyein-cbio](https://github.com/hyein-cbio) for #266.
+
+### Fixed
+- Route nested model calls through Pi's model registry. Thanks to [@rany2](https://github.com/rany2) for #263.
+- Recover useful Next.js RSC content when Readability only extracts a loading shell, and report full, partial, or failed background content fetches accurately (#272, #273).
+- Keep valid AnySearch results when the API omits or nulls result content. Thanks to [@mikhel01](https://github.com/mikhel01) for #258.
+
+## [0.23.0] - 2026-08-15
+
+### Added
+- Added opt-in `authFetch` profiles for local browser-cookie `fetch_content` requests. Thanks Luka (`@lmilojevicc`) for issue #254.
+- Added Firecrawl as a `web_search` provider using the existing Firecrawl configuration. Thanks Andrés Sanabria (`@andy-spike`) for issue #246.
+- Added macOS Brave profile support for opt-in Gemini Web browser-cookie access. Thanks Rajyavardhan Singh (`@imrajyavardhan12`) for PR #248.
+
+### Changed
+- Made local-video detection use an explicit result state in extraction code.
+
+### Fixed
+- Preserve summary draft completion routing through the model registry. Thanks `@limwa` for PR #249.
+- Constrain numeric tool parameters to supported integer ranges. Thanks `@jaudiger` for issue #250 and PR #251.
+
+## [0.22.0] - 2026-08-11
+
+### Added
+- Added Bocha web search provider support. Thanks @jingyulong for PR #243.
+- Added `maxInlineContentChars` to configure the direct content and stored-content slice limit, with a 200,000-character maximum. Thanks @be4zad for issue #244.
+
+### Fixed
+- Hardened the fetched-content cache against symlink traversal and unsafe permissions, and bounded it to 128 entries and 128 MiB with oldest-entry eviction. Thanks `@HerbertGao` for issue #240 and PR #241.
+
+## [0.21.0] - 2026-08-10
+
+### Added
+- Added per-tool and per-command registration gates plus image and PDF extraction gates. Thanks @jaudiger for issue #234.
+- Added `summaryGenerationDeadlineMs` to configure the summary model deadline for curator and auto-summary workflows. Thanks @cataldoc for issue #237.
+
+### Fixed
+- Store full fetched content in an external cache instead of embedding it in session JSONL entries, preventing large search-heavy sessions from ballooning on restore. Thanks Igor Samokhovets (`@samohovets`) for issue #236.
+- Document `get_search_content` parameter constraints in the tool schema. Thanks `@iwangjie` for PR #233.
+
+## [0.20.0] - 2026-08-10
+
+### Added
+- Added keyless DuckDuckGo HTML search as an explicit and routing provider. Thanks @lmilojevicc for issue #228.
+- Added Datalab hosted PDF-to-Markdown extraction as an optional PDF provider. Thanks José Antonio Galiano Sandoval (`@jagaliano`) for PR #226.
+
+### Changed
+- Tightened Datalab JSON response validation and Gemini Web fetch initialization internals.
+
+### Fixed
+- Fix Gemini Web "fetch failed" (`UND_ERR_HEADERS_OVERFLOW`) when running inside a host agent whose global undici dispatcher uses HTTP/1.1 with the default 16 KiB `maxHeaderSize`: Google's `/app` page exceeds that budget. Gemini Web requests now use a dedicated undici agent with a 4 MiB header budget. Thanks José Antonio Galiano Sandoval (`@jagaliano`) for PR #230.
+- Preserve collapsed `web_search` result background padding. Thanks `@SheffeyG` for PR #224.
+
+## [0.19.0] - 2026-08-08
+
+### Added
+- Added Jina Search as a normal configured `web_search` provider with `jinaApiKey` / `JINA_API_KEY`, explicit/auto/routing/all-provider support, domain and recency constraints, optional inline page content, and Curator integration. Thanks Orbio Agent (`@Gabrielgvl`) for PR #214.
+
+### Fixed
+- Added a tracked npm lockfile for reproducible contributor installs, and updated model-registry auth header typing for current Pi peer packages. Thanks `@dougEfresh` for PR #218.
+- Keep manual `/websearch` curator pages in sync if the live SSE stream disconnects or misses events while searches are still running. Thanks `@Whisperfall` for issue #215.
+- Updated Kagi Search and Extract requests for the current v1 API contracts. Thanks `@mattgaff` for PR #217.
+- Recognize `:max` thinking suffixes when matching scoped summary models. Thanks `@justin8ty` for PR #219.
+- Route local video Gemini upload, polling, and deletion requests through configured `geminiBaseUrl` / `GOOGLE_GEMINI_BASE_URL` relays. Thanks Mr. (`@Liemo99`) for PR #213.
+- Classify xAI `403` spending-limit and quota-exhaustion responses as quota errors so configured search routing can fall back, while preserving ordinary `403` responses as authentication errors. Thanks `@0xmarcinz` for PR #212.
+
+## [0.18.0] - 2026-08-03
+
+### Added
+- `fetch_content` can now return the original text response with `mode: "raw"`, which is useful for JSON APIs, error pages, and debugging what a server actually sent.
+- `fetch_content` can now answer a question about a single fetched page with `mode: "answer"`, while still saving the original page text so you can inspect it later.
+- Direct image links now work for PNG, JPEG, WebP, and GIF files. The tool downloads them safely, resizes large images, and returns an inline image result.
+- `get_search_content` now accepts `findText` and `findMode`, so you can search saved content for the passage you need instead of paging through a long page by hand. Inspired by `@xl0`'s `pi-lovely-web` project.
+- Added optional `searxngHeaders` so self-hosted SearXNG requests can carry reverse-proxy or Zero Trust auth headers. Thanks `@preinpost` for PR #202.
+- Added explicit-only xAI/Grok search with `xaiApiKey` / `XAI_API_KEY`, Pi model-registry auth, and optional `xaiSearchModel`. Thanks `@join3r` for PR #196.
+- Added explicit-only Bright Data SERP search with `brightdataApiKey` / `BRIGHTDATA_API_KEY` credentials and a required `brightdataSerpZone` / `BRIGHTDATA_SERP_ZONE` zone of Bright Data type `serp`. Bright Data is never chosen by `auto` and never participates in `provider: "all"`. Thanks `@mo-root` for PR #198.
+- Added Bright Data Web Unlocker as a paid `fetch_content` extraction fallback with `brightdataApiKey` / `BRIGHTDATA_API_KEY` credentials and a required `brightdataUnlockerZone` / `BRIGHTDATA_UNLOCKER_ZONE` zone of Bright Data type `unblocker`. Thanks `@mo-root` for PR #199.
+- Added Kagi Search API support with `kagiApiKey` / `KAGI_API_KEY`, plus Kagi Extract as a `fetch_content` fallback. Thanks `@imlonghao` for issue #197.
+- Added Ollama Cloud Web Search support with `ollamaApiKey` / `OLLAMA_API_KEY`, plus Ollama Web Fetch as a `fetch_content` fallback. Thanks `@bradley-holt` for issue #203.
+- Added explicit-only SerpBase Google SERP search with `serpbaseApiKey` / `SERPBASE_API_KEY`, domain filters as `site:` clauses, and recency mapped to Google `tbs`. Thanks `@gefsikatsinelou` for issue #195.
+
+### Changed
+- Long `fetch_content` results are easier to continue reading. The first response now stops on cleaner line boundaries and tells you the character, byte, and line totals plus the exact offset to request next.
+
+### Fixed
+- Fixed the `fetch_content` call header showing `fetch (no URL)` when Pi supplied `url` together with an empty `urls` array. Thanks `@Vergil824` for issue #192.
+- Resolve preferred summary and query-rewrite models through routed provider registrations such as OpenRouter, preserving the registered provider and model ID instead of falling back when the native provider is unavailable. Thanks `@robzolkos` for issue #200 and PR #201.
+- GitHub clone subprocesses now disable interactive credential prompts and terminate their process trees on timeout or cancellation, preventing orphaned Git helpers from capturing terminal input. Thanks `@MDGChamomile` for PR #193.
+
+
+## [0.17.1] - 2026-07-31
+
+### Fixed
+- Removed the unsupported JSON Schema `uniqueItems` keyword from provider-array tool schemas so Gemini-compatible tool validators can register pi-web-access tools. Thanks `@akmaldira` for PR #191.
+
+## [0.17.0] - 2026-07-30
+
+### Added
+- Added Gemini API PDF-to-Markdown conversion before local `unpdf` fallback, with inline PDF upload, page-marker validation, configurable `pdf.maxSizeMB`, and streamed size enforcement. Thanks José Antonio Galiano Sandoval (`@jagaliano`) for PR #180.
+- Added Searchinfinity (Byteplus Searchinfinity / 豆包搜索 Global edition) as a search provider with `searchinfinityApiKey` / `SEARCHINFINITY_API_KEY` credentials, native domain and recency filters, model-generated result summaries, HTTP-semantics mapping for business error codes, provider-array/all-provider routing, and curator selection. Thanks `@cyzlmh` for PR #186.
+- Added Querit as a search and hosted content provider with `queritApiKey` / `QUERIT_API_KEY` credentials, native domain and recency filters, optional inline Contents retrieval, provider-array/all-provider routing, curator selection, and a `fetch_content` fallback. Thanks `@MCapricorns` for PR #185.
+
+### Changed
+- The 5MB `fetch_content` response size limit is now enforced while streaming the decoded body, not just via the `Content-Length` header. Chunked or compressed pages whose decoded content exceeds 5MB now fail with `Response too large (5MB)` instead of being buffered unbounded and parsed. Shared config parsing for SSRF and fetch-content domain policy loaders also removes duplicate reads on the fetch hot path.
+
+### Fixed
+- Fixed filtered zero-config Exa search silently losing its request options: the default keyless MCP tool (`web_search_exa`) only accepts `query` and `numResults`, so `type`, `livecrawl`, and `contextMaxCharacters` were dropped server-side and `includeContent` never returned page text. Filtered or content-carrying keyless searches now use `web_search_advanced_exa` — served by the same keyless free tier — which applies `includeDomains`/`excludeDomains`, `startPublishedDate`, highlights, and text limits as real parameters instead of `site:` / "past week" strings appended to the semantic query. Plain searches stay on `web_search_exa`, and the advanced path falls back to it if it is unavailable.
+- Stopped requesting citation text on keyed Exa `/answer` calls, which was fetched and then discarded, and stopped requesting page text on keyed `/search` calls that do not ask for content.
+- Exa MCP rate-limit responses (429) now explain that adding `exaApiKey` to `~/.pi/web-search.json` removes the free-tier limit, instead of surfacing a bare status code. Thanks `@kesku` for PR #187.
+
+## [0.16.0] - 2026-07-30
+
+### Added
+- Added Search1API as a first-class search and extraction provider with `search1apiApiKey` / `SEARCH1API_KEY` credentials, native domain and recency filters, opt-in Deep Search inline content, provider-array/all-provider routing, curator selection, and a hosted `fetch_content` fallback through the Crawl API. Thanks `@fatwang2` for PR #176.
+
+### Fixed
+- Standardized Gemini API defaults on `gemini-3.6-flash` for search, URL context, YouTube, and local video paths, set Gemini Web’s separate browser-cookie default to `gemini-3.1-pro`, and stopped unsupported Web models from silently falling back to 2.5 Flash. Thanks `@jagaliano` for issue #181.
+- Accept explicit provider arrays for `web_search` and `source_check`, running only the selected providers concurrently while preserving `auto`, `all`, and sequential routing behavior. Thanks `@XWIlluDelu` for PR #179.
+- Added `curatorRemote` and `autoOpenBrowser` controls for remote-accessible curator sessions, defaulting remote mode to a printed manual URL unless browser auto-open is explicitly requested. Thanks `@tylerdavis` for PR #178.
+- Resolve the OpenAI search model from Pi’s model registry, with an `openaiSearchModel` override and preserved API-key fallback for partial registries. Thanks `@ahalekelly` for PR #182.
+- Surfaced RFC Link / HTML discovery relations (`service-desc`, `service-doc`, `service-meta`, `api-catalog`, `describedby`) from HTTP `Link` headers and matching `link`/`a[rel]` markup during `fetch_content` HTML extraction, including empty SPA shells, without broad `/docs` URL heuristics. Thanks `@XWIlluDelu` for PR #175.
+- Expand leading `~` and `$HOME`-style environment variables in `githubClone.clonePath` before cloning repositories. Thanks `@unship` for PR #184.
+- Write extracted PDF markdown to a temporary `pi-web-pdf` directory by default instead of `~/Downloads`, while preserving explicit output directories. Thanks `@ahalekelly` for PR #183.
+
+## [0.15.0] - 2026-07-28
+
+### Added
+- Added `openaiResponsesUrl` for routing OpenAI `web_search` and `source_check` calls through third-party Responses-compatible gateways while keeping the official OpenAI endpoint as the default. Thanks The Loki (`@the-loki`) for issue #174.
+- Added `provider: "all"` to search every available provider except AnySearch simultaneously, render one independently selectable Curator card per provider before the final summary, deduplicate sources and inline content, and preserve partial successes with per-provider diagnostics. Thanks José Antonio Galiano Sandoval (`@jagaliano`) for PR #173.
+- Added TinyFish as a first-class search and extraction provider with `tinyfishApiKey` / `TINYFISH_API_KEY` credentials, domain and recency filters, paginated result counts, batched inline content, ordered routing, curator selection, and a hosted `fetch_content` fallback before Parallel. Thanks José Antonio Galiano Sandoval (`@jagaliano`) for PR #172.
 
 ## [0.14.0] - 2026-07-25
 

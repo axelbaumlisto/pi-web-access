@@ -2,14 +2,9 @@ import { existsSync, readFileSync } from "node:fs";
 import { activityMonitor } from "./activity.ts";
 import type { SearchOptions, SearchResult, SearchResponse } from "./perplexity.ts";
 import { redactCredential } from "./credential-source.ts";
-import { getWebSearchConfigPath } from "./utils.ts";
+import { fetchWithCredentialRedirects, getWebSearchConfigPath } from "./utils.ts";
 import { providerHasCredential, providerUrl, resolveProviderKey } from "./provider-endpoints.ts";
 import { redactError, redactProviderError } from "./redact.ts";
-
-// kind:"full" — provider-endpoints.ts returns the complete search endpoint in
-// every mode (default, `braveBaseUrl` base + /web/search, or proxy route);
-// only query params are appended here.
-const getBraveUrl = () => providerUrl("brave");
 const CONFIG_PATH = getWebSearchConfigPath();
 const SEARCH_TIMEOUT_MS = 30_000;
 
@@ -50,6 +45,13 @@ async function getApiKey(signal?: AbortSignal): Promise<string | null> {
 		environmentValue: process.env.BRAVE_API_KEY,
 		signal,
 	});
+}
+
+// kind:"full" — provider-endpoints.ts returns the complete search endpoint in
+// every mode (default, `braveBaseUrl` base + /web/search, or the gateway's
+// /v1/brave/search route under proxy); only query params are appended here.
+function getApiUrl(): string {
+	return providerUrl("brave");
 }
 
 function normalizeCount(value: number | undefined): number {
@@ -164,6 +166,7 @@ export async function searchWithBrave(
 	query: string,
 	options: SearchOptions = {},
 ): Promise<SearchResponse> {
+	const apiUrl = getApiUrl();
 	const apiKey = await getApiKey(options.signal);
 	if (!apiKey) {
 		throw new Error(
@@ -195,7 +198,7 @@ export async function searchWithBrave(
 	}
 
 	try {
-		const response = await fetch(`${getBraveUrl()}?${params.toString()}`, {
+		const response = await fetchWithCredentialRedirects(`${apiUrl}?${params.toString()}`, {
 			method: "GET",
 			headers: {
 				"X-Subscription-Token": apiKey,
@@ -205,7 +208,7 @@ export async function searchWithBrave(
 			signal: options.signal
 				? AbortSignal.any([AbortSignal.timeout(SEARCH_TIMEOUT_MS), options.signal])
 				: AbortSignal.timeout(SEARCH_TIMEOUT_MS),
-		});
+		}, ["X-Subscription-Token"]);
 
 		if (!response.ok) {
 			activityMonitor.logError(activityId, `HTTP ${response.status}`);

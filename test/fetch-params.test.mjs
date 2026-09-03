@@ -27,13 +27,13 @@ test("fetch_content params ignore blank optional strings and blank urls", () => 
 		urls: ["", " https://example.com/two ", "https://example.com/one"],
 		prompt: "",
 		timestamp: "   ",
-		model: " gemini-3-flash-preview ",
+		model: " gemini-3.6-flash ",
 	});
 
 	assert.deepEqual(normalized.urlList, ["https://example.com/two", "https://example.com/one"]);
 	assert.equal(normalized.options.prompt, undefined);
 	assert.equal(normalized.options.timestamp, undefined);
-	assert.equal(normalized.options.model, "gemini-3-flash-preview");
+	assert.equal(normalized.options.model, "gemini-3.6-flash");
 	assert.equal(normalizeFetchContentParams({ model: "" }).options.model, undefined);
 });
 
@@ -43,7 +43,8 @@ test("fetch_content params preserve forceClone only for boolean values", () => {
 	assert.equal(normalizeFetchContentParams({ forceClone: "true" }).options.forceClone, undefined);
 });
 
-test("fetch_content params drop non-positive and non-integer frames", () => {
+test("fetch_content params drop out-of-range, non-positive, and non-integer frames", () => {
+	assert.equal(normalizeFetchContentParams({ frames: 13, timestamp: "1:23" }).options.frames, undefined);
 	assert.equal(normalizeFetchContentParams({ frames: 0, timestamp: "1:23" }).options.frames, undefined);
 	assert.equal(normalizeFetchContentParams({ frames: -1, timestamp: "1:23" }).options.frames, undefined);
 	assert.equal(normalizeFetchContentParams({ frames: 1.5, timestamp: "1:23" }).options.frames, undefined);
@@ -65,4 +66,21 @@ test("fetch_content params ignore bridge-filled default frames for ordinary page
 test("fetch_content params preserve explicit video frame options", () => {
 	assert.equal(normalizeFetchContentParams({ url: "https://youtu.be/demo", frames: 1, timestamp: "1:23" }).options.frames, 1);
 	assert.equal(normalizeFetchContentParams({ url: "https://youtu.be/demo", frames: 2 }).options.frames, 2);
+});
+
+test("fetch_content params validate fetch and answer modes", () => {
+	assert.deepEqual(
+		normalizeFetchContentParams({ mode: "answer", answerModel: " test/page-model " }).options,
+		{ mode: "answer", answerModel: "test/page-model" },
+	);
+	assert.throws(() => normalizeFetchContentParams({ mode: "invalid" }), /mode must be/);
+});
+
+
+test("fetch_content params validate auth profile input", () => {
+	assert.equal(normalizeFetchContentParams({ auth: true }).options.auth, true);
+	assert.equal(normalizeFetchContentParams({ auth: " work " }).options.auth, "work");
+	assert.equal(normalizeFetchContentParams({ auth: false }).options.auth, undefined);
+	assert.throws(() => normalizeFetchContentParams({ auth: " " }), /auth must be/);
+	assert.throws(() => normalizeFetchContentParams({ auth: 1 }), /auth must be/);
 });

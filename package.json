@@ -1,10 +1,10 @@
 {
   "name": "pi-ext-int-search",
-  "version": "1.1.0",
-  "description": "Hardened fork of nicobailon/pi-web-access (synced to v0.14.0) with our own settings + added internal search. External + internal search for the Pi coding agent. EXTERNAL: web_search across OpenAI, Brave, Parallel, Tavily, SERPdive, AnySearch, SearXNG, Exa, Perplexity, Gemini (with URL fetch, GitHub clone, PDF, YouTube/video understanding, Firecrawl extraction). INTERNAL: memory_search over your own pi chat sessions, claude-recall memories, project docs, and git history.",
+  "version": "1.2.0",
+  "description": "Hardened fork of nicobailon/pi-web-access (synced to v0.27.0) with unified proxy mode + destination-first key binding + added internal search. EXTERNAL: web_search across OpenAI, Brave, Parallel, TinyFish, Search1API, Searchinfinity, Querit, Tavily, Firecrawl, Jina, SERPdive, Kagi, Ollama, AnySearch, Bright Data, SerpBase, SearXNG, Exa, Perplexity, Gemini, Kimi, Mistral (URL fetch raw/answer modes, GitHub clone + PR/issue, PDF, YouTube/video, source_check). INTERNAL: memory_search over your own pi chat sessions, claude-recall memories, project docs, and git history.",
   "type": "module",
   "scripts": {
-    "test": "node --test",
+    "test": "node --import ./test/hermetic-env.mjs --test",
     "typecheck": "tsc",
     "audit:runtime": "npm audit --omit=dev --omit=peer"
   },
@@ -17,6 +17,10 @@
     "memory-search",
     "internal-search",
     "external-search",
+    "tinyfish",
+    "search1api",
+    "searchinfinity",
+    "querit",
     "perplexity",
     "exa",
     "gemini",
@@ -46,12 +50,14 @@
   },
   "dependencies": {
     "@mozilla/readability": "^0.6.0",
+    "defuddle": "0.19.3",
     "linkedom": "^0.16.0",
     "p-limit": "^6.1.0",
     "promise.try": "^2.0.1",
     "turndown": "^7.2.0",
     "typebox": "^1.1.38",
-    "unpdf": "^1.6.2"
+    "unpdf": "^1.6.2",
+    "undici": "^8.9.0"
   },
   "peerDependencies": {
     "@earendil-works/pi-ai": "*",

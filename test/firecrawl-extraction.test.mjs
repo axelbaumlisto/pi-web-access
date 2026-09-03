@@ -7,12 +7,14 @@ import { test } from "node:test";
 
 const firecrawlModuleUrl = new URL("../firecrawl.ts", import.meta.url).href;
 const extractModuleUrl = new URL("../extract.ts", import.meta.url).href;
+const searchModuleUrl = new URL("../gemini-search.ts", import.meta.url).href;
 
 function runChild(script, env = {}) {
 	const childEnv = { ...process.env };
 	for (const key of [
 		"PI_CODING_AGENT_DIR", "XDG_CONFIG_HOME", "FIRECRAWL_BASE_URL", "FIRECRAWL_API_KEY",
-		"FIRECRAWL_API_VERSION", "FIRECRAWL_FRESH_SCRAPE", "PARALLEL_API_KEY", "GEMINI_API_KEY",
+		"FIRECRAWL_API_VERSION", "FIRECRAWL_FRESH_SCRAPE", "PARALLEL_API_KEY", "TINYFISH_API_KEY", "GEMINI_API_KEY",
+		"BRIGHTDATA_API_KEY", "KAGI_API_KEY", "OLLAMA_API_KEY", "BRIGHTDATA_UNLOCKER_ZONE",
 	]) delete childEnv[key];
 	Object.assign(childEnv, env);
 	return spawnSync(process.execPath, ["--input-type=module"], {
@@ -50,6 +52,109 @@ test("Firecrawl extraction maps markdown, uses credentials, and defaults to lock
 	assert.equal(output.captured.headers.authorization, "Bearer fc-test-key");
 	assert.deepEqual(output.captured.body, { url: "https://example.com/article", formats: ["markdown"], onlyMainContent: true, lockdown: true });
 	assert.deepEqual(output.result, { url: "https://example.com/article", title: "Title", content: "# Body", error: null });
+});
+
+test("Firecrawl search maps shared options and inline Markdown", async () => {
+	const child = runChild(`
+		let captured = null;
+		globalThis.fetch = async (url, init) => {
+			captured = { url: String(url), headers: Object.fromEntries(new Headers(init.headers)), body: JSON.parse(init.body) };
+			return new Response(JSON.stringify({
+				success: true,
+				data: { web: [
+					{ title: "Docs", description: "Firecrawl docs", url: "https://docs.firecrawl.dev/search", markdown: "# Firecrawl Search" },
+					{ title: "Blocked", description: "Blocked", url: "https://spam.example/result", markdown: "spam" },
+				] },
+			}), { status: 200 });
+		};
+		const { search } = await import(${JSON.stringify(searchModuleUrl)});
+		const result = await search("firecrawl docs", {
+			provider: "firecrawl",
+			domainFilter: ["https://docs.firecrawl.dev/search", "-spam.example"],
+			recencyFilter: "week",
+			numResults: 4,
+			includeContent: true,
+			lookup: ${PUBLIC_LOOKUP},
+		});
+		console.log(JSON.stringify({ captured, result }));
+	`, { FIRECRAWL_BASE_URL: "https://crawl.example.com/", FIRECRAWL_API_KEY: "fc-test-key" });
+	assert.equal(child.status, 0, child.stderr);
+	const output = JSON.parse(child.stdout.trim());
+	assert.equal(output.captured.url, "https://crawl.example.com/v2/search");
+	assert.equal(output.captured.headers.authorization, "Bearer fc-test-key");
+	assert.deepEqual(output.captured.body, {
+		query: "firecrawl docs",
+		limit: 4,
+		sources: ["web"],
+		includeDomains: ["docs.firecrawl.dev"],
+		tbs: "qdr:w",
+		scrapeOptions: { formats: ["markdown"], onlyMainContent: true, lockdown: true },
+	});
+	assert.equal(output.result.provider, "firecrawl");
+	assert.deepEqual(output.result.results, [{ title: "Docs", url: "https://docs.firecrawl.dev/search", snippet: "Firecrawl docs" }]);
+	assert.deepEqual(output.result.inlineContent, [{ url: "https://docs.firecrawl.dev/search", title: "Docs", content: "# Firecrawl Search", error: null }]);
+});
+
+test("Firecrawl search accepts v1 flat result arrays", async () => {
+	const child = runChild(`
+		let capturedUrl = "";
+		globalThis.fetch = async (url) => {
+			capturedUrl = String(url);
+			return new Response(JSON.stringify({
+				success: true,
+				data: [{ title: "V1 result", description: "V1 snippet", url: "https://example.com/v1", markdown: "# V1" }],
+			}), { status: 200 });
+		};
+		const { search } = await import(${JSON.stringify(searchModuleUrl)});
+		const result = await search("v1 firecrawl", { provider: "firecrawl", includeContent: true, lookup: ${PUBLIC_LOOKUP} });
+		console.log(JSON.stringify({ capturedUrl, result }));
+	`, { FIRECRAWL_BASE_URL: "https://crawl.example.com/", FIRECRAWL_API_VERSION: "v1" });
+	assert.equal(child.status, 0, child.stderr);
+	const output = JSON.parse(child.stdout.trim());
+	assert.equal(output.capturedUrl, "https://crawl.example.com/v1/search");
+	assert.deepEqual(output.result.results, [{ title: "V1 result", url: "https://example.com/v1", snippet: "V1 snippet" }]);
+	assert.deepEqual(output.result.inlineContent, [{ url: "https://example.com/v1", title: "V1 result", content: "# V1", error: null }]);
+});
+
+test("Firecrawl API base allows configured loopback without global SSRF allow ranges", async () => {
+	for (const firecrawlBaseUrl of ["http://localhost:3002", "http://127.0.0.1:3002"]) {
+		const home = await configHome({ firecrawlBaseUrl });
+		const child = runChild(`
+			let calls = [];
+			globalThis.fetch = async (url) => {
+				calls.push(String(url));
+				return new Response(JSON.stringify({ success: true, data: { web: [{ title: "Local", url: "https://example.com/local", description: "local" }] } }), { status: 200 });
+			};
+			const { search } = await import(${JSON.stringify(searchModuleUrl)});
+			const result = await search("local firecrawl", { provider: "firecrawl" });
+			console.log(JSON.stringify({ calls, result }));
+		`, { HOME: home, USERPROFILE: home, PI_CODING_AGENT_DIR: home });
+		assert.equal(child.status, 0, child.stderr);
+		const output = JSON.parse(child.stdout.trim());
+		assert.deepEqual(output.calls, [`${firecrawlBaseUrl}/v2/search`]);
+		assert.deepEqual(output.result.results, [{ title: "Local", url: "https://example.com/local", snippet: "local" }]);
+	}
+});
+
+test("Firecrawl search honors configured SSRF allow ranges", async () => {
+	const home = await configHome({
+		firecrawlBaseUrl: "http://127.0.0.1:3002",
+		ssrf: { allowRanges: ["127.0.0.0/8"] },
+	});
+	const child = runChild(`
+		let calls = [];
+		globalThis.fetch = async (url) => {
+			calls.push(String(url));
+			return new Response(JSON.stringify({ success: true, data: { web: [{ title: "Local", url: "https://example.com/local", description: "local" }] } }), { status: 200 });
+		};
+		const { search } = await import(${JSON.stringify(searchModuleUrl)});
+		const result = await search("local firecrawl", { provider: "firecrawl" });
+		console.log(JSON.stringify({ calls, result }));
+	`, { HOME: home, USERPROFILE: home, PI_CODING_AGENT_DIR: home });
+	assert.equal(child.status, 0, child.stderr);
+	const output = JSON.parse(child.stdout.trim());
+	assert.deepEqual(output.calls, ["http://127.0.0.1:3002/v2/search"]);
+	assert.deepEqual(output.result.results, [{ title: "Local", url: "https://example.com/local", snippet: "local" }]);
 });
 
 test("Firecrawl fresh scraping is explicit opt-in", async () => {
