@@ -20,7 +20,7 @@
 import { existsSync, readdirSync, readFileSync, statSync } from "node:fs";
 import { homedir } from "node:os";
 import { basename, join } from "node:path";
-import { execFile, execFileSync } from "node:child_process";
+import { execFile, execFileSync, spawn } from "node:child_process";
 
 export type MemoryScope = "current" | "all";
 export type MemorySource = "sessions" | "memory" | "docs" | "git";
@@ -85,6 +85,9 @@ const QUERY_STOPWORDS = new Set<string>([
 	"наш", "наша", "наше", "мой", "мне", "ты", "он", "она", "оно", "они", "или",
 	"решили", "решали", "обсуждали", "говорили", "сказал", "помнишь", "помню",
 	"вспомни", "поищи", "найди", "покажи", "переписке", "памяти", "истории",
+	"какой", "какая", "какое", "какие", "каком", "какую", "который", "которая",
+	"которые", "когда", "где", "куда", "почему", "зачем", "чем", "кто", "кого",
+	"нашей", "нашем", "наших", "нас", "нам", "вы", "вас", "вам",
 ]);
 
 function tokenize(q: string): string[] {
@@ -149,6 +152,8 @@ interface ExecResult {
 	status: number | undefined;
 	/** True when the process was killed (timeout/abort) or failed to spawn. */
 	broken: boolean;
+	/** True when output was cut at the caller's byte budget (streaming exec only). */
+	budgetHit?: boolean;
 }
 
 /**
@@ -178,6 +183,61 @@ function execFileAsync(
 				resolve({ stdout: stdout ?? "", status, broken: status === undefined });
 			},
 		);
+	});
+}
+
+/**
+ * Like execFileAsync, but reads stdout incrementally and STOPS the child once
+ * `budgetBytes` have arrived, keeping only whole lines. Callers order their
+ * inputs newest-first, so hitting the budget drops the oldest data, never the
+ * newest — the property a bounded history search needs. Never throws.
+ */
+function execFileStreaming(
+	cmd: string,
+	args: string[],
+	budgetBytes: number,
+	signal?: AbortSignal,
+): Promise<ExecResult> {
+	return new Promise((resolve) => {
+		let child: ReturnType<typeof spawn>;
+		try {
+			child = spawn(cmd, args, { stdio: ["ignore", "pipe", "ignore"], signal });
+		} catch {
+			resolve({ stdout: "", status: undefined, broken: true });
+			return;
+		}
+		const chunks: Buffer[] = [];
+		let received = 0;
+		let budgetHit = false;
+		let settled = false;
+		const timer = setTimeout(() => child.kill("SIGKILL"), EXEC_TIMEOUT_MS);
+		const finish = (status: number | undefined, broken: boolean) => {
+			if (settled) return;
+			settled = true;
+			clearTimeout(timer);
+			let out = Buffer.concat(chunks).toString("utf-8");
+			if (budgetHit) {
+				// Drop the trailing partial line so every kept row is parseable.
+				const lastNl = out.lastIndexOf("\n");
+				out = lastNl === -1 ? "" : out.slice(0, lastNl + 1);
+			}
+			resolve({ stdout: out, status, broken, budgetHit });
+		};
+		child.stdout?.on("data", (chunk: Buffer) => {
+			if (budgetHit) return;
+			chunks.push(chunk);
+			received += chunk.length;
+			if (received >= budgetBytes) {
+				budgetHit = true;
+				child.kill("SIGKILL");
+			}
+		});
+		child.on("error", () => finish(undefined, true));
+		child.on("close", (code, sig) => {
+			// A kill WE issued for the budget is a successful, complete-enough read.
+			if (budgetHit) finish(0, false);
+			else finish(code ?? undefined, code === null && sig !== null);
+		});
 	});
 }
 
@@ -285,6 +345,85 @@ function extractMessageText(evt: unknown): { role: string; text: string } | null
 	return { role, text };
 }
 
+/**
+ * Byte budget for the discriminator pass. Files are fed newest-first, so when
+ * the budget is hit only OLD sessions are cut. 160 MB ≈ the measured worst case
+ * for a 3 000-file discriminator on a 15 GB corpus with the line cap below.
+ */
+const SESSIONS_SCAN_BUDGET_BYTES = 192 * 1024 * 1024;
+/**
+ * Longest line rg will print. Measured on 256K assistant lines / 60 days of
+ * real transcripts: p99.9 = 22 KB, max = 72 KB, none above 100 KB; the
+ * multi-MB lines are all toolResult dumps (file contents, fetched pages).
+ * 100 KB keeps every conversation turn intact and elides only dumps. Volume
+ * is bounded separately by SESSIONS_SCAN_BUDGET_BYTES (newest-first).
+ */
+const SESSIONS_MAX_LINE_CHARS = 100_000;
+/** Hard cap on files handed to the second pass (argv length). Work is bounded by bytes, not files. */
+const SESSIONS_MAX_FILES = 6_000;
+
+interface SessionScanPlan {
+	/** The query token present in the fewest files — the best line filter. */
+	discriminator: string;
+	/** Files containing the discriminator, newest first. */
+	files: string[];
+}
+
+/**
+ * Pass 1 of the sessions funnel: one `rg --files-with-matches` per token, in
+ * parallel. Output is file names only, so it is cheap regardless of line size.
+ * Returns null when no token matches any file. A token that fails to scan
+ * (rg killed / missing) is skipped; if EVERY token fails the source is marked
+ * failed, so "no matches" is never confused with "no scan".
+ */
+async function planSessionScan(
+	tokens: string[],
+	searchDirs: string[],
+	status: Partial<Record<MemorySource, SourceStatus>>,
+	signal?: AbortSignal,
+): Promise<SessionScanPlan | null> {
+	const perToken = await Promise.all(
+		tokens.map(async (t) => {
+			const r = await execFileAsync(
+				"rg",
+				["-i", "-F", "--files-with-matches", "--glob", "*.jsonl", "-e", t, "--", ...searchDirs],
+				64 * 1024 * 1024,
+				signal,
+			);
+			if (r.status === 1) return { token: t, files: [] as string[], ok: true };
+			if (r.status !== 0 && !r.stdout) return { token: t, files: [] as string[], ok: false };
+			return { token: t, files: r.stdout.split("\n").filter(Boolean), ok: true };
+		}),
+	);
+	if (perToken.every((p) => !p.ok)) {
+		status.sessions = "failed";
+		return null;
+	}
+	const present = perToken.filter((p) => p.ok && p.files.length > 0);
+	if (present.length === 0) return null;
+	// Rarest token wins, but a bare number ("27" from "v0.27.0") is never a good
+	// line filter even when rare — prefer any word token over any numeric one.
+	const isNumeric = (t: string) => /^\d+$/.test(t);
+	present.sort((a, b) => Number(isNumeric(a.token)) - Number(isNumeric(b.token)) || a.files.length - b.files.length);
+	const discriminator = present[0];
+
+	// Newest first: a bounded second pass then drops OLD data, never today's.
+	const mtimeOf = new Map<string, number>();
+	for (const f of discriminator.files) {
+		try {
+			mtimeOf.set(f, statSync(f).mtimeMs);
+		} catch {
+			mtimeOf.set(f, 0);
+		}
+	}
+	const files = [...discriminator.files].sort((a, b) => (mtimeOf.get(b) ?? 0) - (mtimeOf.get(a) ?? 0));
+	if (files.length > SESSIONS_MAX_FILES) {
+		status.sessions = "partial";
+		files.length = SESSIONS_MAX_FILES;
+	}
+	return { discriminator: discriminator.token, files };
+}
+
 async function searchSessions(
 	tokens: string[],
 	scope: MemoryScope,
@@ -306,27 +445,33 @@ async function searchSessions(
 			: [SESSIONS_ROOT];
 	if (searchDirs.length === 0) return [];
 
-	// Use ripgrep to find matching LINES fast (scans 8GB in ~1.5s vs ~40s in JS).
-	// We OR the tokens as a fixed-string alternation, case-insensitive, and get
-	// back `file:linetext`. Then JSON.parse only the matched lines.
-	const pattern = tokens.map(escapeRe).join("|");
-	const res = await execFileAsync(
+	// Two-pass funnel. A session line is a whole API message (often 100 KB–1 MB)
+	// and corpus-wide words like "model"/"error" sit on >50 % of lines, so an OR
+	// of every token used to make rg emit the *entire* corpus (10.8 GB measured
+	// on 15 GB of transcripts) — Node killed it at maxBuffer and kept whatever 2 %
+	// came first on disk, never the newest session. Instead:
+	//   1. rg --files-with-matches per token → file-set per token (KB of output).
+	//      The token in the FEWEST files is the discriminator.
+	//   2. rg for the discriminator only, over its files newest-first with a
+	//      per-file cap, so if the buffer ever fills it is old data that is cut.
+	const plan = await planSessionScan(tokens, searchDirs, status, signal);
+	if (!plan) return [];
+	const res = await execFileStreaming(
 		"rg",
 		[
 			"-i",
+			"-F",
 			"--no-heading",
 			"--no-line-number",
 			"--with-filename",
-			"--glob",
-			"*.jsonl",
 			"--max-columns",
-			"1000000",
+			String(SESSIONS_MAX_LINE_CHARS),
 			"-e",
-			pattern,
+			plan.discriminator,
 			"--",
-			...searchDirs,
+			...plan.files,
 		],
-		256 * 1024 * 1024,
+		SESSIONS_SCAN_BUDGET_BYTES,
 		signal,
 	);
 	// rg exits 1 when no matches — that's not an error. On any other non-zero
@@ -344,6 +489,7 @@ async function searchSessions(
 		// Partial stdout survived (exit 2 / timeout / ENOBUFS kill) — label it.
 		status.sessions = "partial";
 	}
+	if (res.budgetHit) status.sessions = "partial";
 
 	const mtimeCache = new Map<string, number>();
 	const hits: MemoryHit[] = [];
