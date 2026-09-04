@@ -4,6 +4,25 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+## [pi-ext-int-search 1.3.0] - 2026-09-04 (fork release)
+
+### Fixed
+- **`memory_search` sessions source silently dropped ~97 % of matches.** The scan OR-ed every query token; corpus-wide
+  words ("model", "error") match >50 % of transcript lines and a line is a whole API message (toolResult dumps up to
+  2.7 MB), so rg emitted 10.8 GB for one query, Node killed it at the output buffer and kept whatever came first on disk —
+  never the newest session. A question whose answer was in the same day's transcript came back `partial` with no relevant
+  hit. Now a two-pass funnel: the rarest content token filters lines, scanned newest-first under a byte budget, so a cut
+  drops OLD data and is reported. Russian question words (`какой/когда/почему…`) and bare numbers never become the filter.
+- `web_search` now prints the stored `responseId` so the model can call `get_search_content` on search results
+  (upstream PR #354).
+
+### Changed
+- **Sessions are searched through a text-only digest cache** (`~/.pi/agent/memory-search-cache/sessions/`): one small
+  file per session with `{ts, role, text}` of user/assistant turns — 2 % of raw transcript size (toolResult dumps are
+  never searchable and are not stored). Rebuilt incrementally by size/mtime; cold start is budgeted per call, newest-first,
+  and labelled `partial` until complete (~12 min for 15 GB). Warm searches: 8–20 s → ~1–3 s, no truncation.
+- Upstream test races fixed (upstream PR #353).
+
 ## [pi-ext-int-search 1.2.0] - 2026-09-03 (fork release)
 
 Merged upstream `nicobailon/pi-web-access` **v0.14.0 → v0.27.0** (180 commits, 13 releases; see the

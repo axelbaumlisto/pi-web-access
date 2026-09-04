@@ -253,6 +253,12 @@ time phrase like "за месяц"/"last week" lists ALL commits in the window).
 notes any source that failed or was truncated, so "no matches" is never confused
 with "the scan broke".
 
+**Cache.** Sessions are searched through a text-only digest in `~/.pi/agent/memory-search-cache/sessions/` — one
+small file per transcript holding just the user/assistant turns (`{ts, role, text}`, ~2 % of raw size; tool-result
+dumps are never searchable and are not stored). It is rebuilt incrementally by file size/mtime, so after the first
+build only the live session is re-digested. The first searches on a large history digest newest-first within a
+per-call budget and report `sessions: partial` until the cache is complete. Safe to delete at any time.
+
 Config: `tools.memorySearch.enabled` (default `true`) hides the tool; `toolNames.memorySearch` renames it — the same
 mechanism as the upstream tools, so renames participate in duplicate detection.
 
