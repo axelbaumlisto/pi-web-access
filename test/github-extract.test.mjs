@@ -905,7 +905,9 @@ test("GitHub clones disable interactive credential prompts", { skip: process.pla
 			console.log(JSON.stringify(result !== null));
 		`,
 		encoding: "utf8",
-		timeout: 5000,
+		// Outer budget must cover child Node boot + fake gh probe boot + fake git boot
+		// + the 4 s clone ceiling with real margin (each shim boot is ~1 s on a loaded host).
+		timeout: 15_000,
 		env: {
 			...process.env,
 			CLONE_ENV_FILE: envFile,
