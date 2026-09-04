@@ -21,6 +21,7 @@ import { existsSync, readdirSync, readFileSync, statSync } from "node:fs";
 import { homedir } from "node:os";
 import { basename, join } from "node:path";
 import { execFile, execFileSync, spawn } from "node:child_process";
+import { refreshSessionDigest, sessionDigestFiles, sessionSourceForDigest } from "./session-digest.ts";
 
 export type MemoryScope = "current" | "all";
 export type MemorySource = "sessions" | "memory" | "docs" | "git";
@@ -321,29 +322,6 @@ function projectFromFolder(folder: string): string {
 
 // ── source: sessions ─────────────────────────────────────────────────────────
 
-function extractMessageText(evt: unknown): { role: string; text: string } | null {
-	if (typeof evt !== "object" || evt === null) return null;
-	const e = evt as Record<string, unknown>;
-	if (e.type !== "message") return null;
-	const m = e.message as Record<string, unknown> | undefined;
-	if (!m) return null;
-	const role = String(m.role ?? "?");
-	const content = m.content;
-	let text = "";
-	if (typeof content === "string") {
-		text = content;
-	} else if (Array.isArray(content)) {
-		for (const block of content) {
-			if (block && typeof block === "object" && (block as Record<string, unknown>).type === "text") {
-				text += `${String((block as Record<string, unknown>).text ?? "")} `;
-			}
-		}
-	}
-	text = text.trim();
-	// Skip empty / tool-only turns and giant tool dumps we don't want to surface.
-	if (!text || role === "toolResult") return null;
-	return { role, text };
-}
 
 /**
  * Byte budget for the discriminator pass. Files are fed newest-first, so when
@@ -352,18 +330,16 @@ function extractMessageText(evt: unknown): { role: string; text: string } | null
  */
 const SESSIONS_SCAN_BUDGET_BYTES = 192 * 1024 * 1024;
 /**
- * Longest line rg will print. Measured on 256K assistant lines / 60 days of
- * real transcripts: p99.9 = 22 KB, max = 72 KB, none above 100 KB; the
- * multi-MB lines are all toolResult dumps (file contents, fetched pages).
- * 100 KB keeps every conversation turn intact and elides only dumps. Volume
- * is bounded separately by SESSIONS_SCAN_BUDGET_BYTES (newest-first).
+ * Per-call budget for bringing the digest up to date. After the cold start this
+ * is a ~200 ms stat sweep plus the live session's delta; on a cold cache each
+ * call digests newest-first for this long and searches what exists so far.
  */
-const SESSIONS_MAX_LINE_CHARS = 100_000;
+const SESSIONS_DIGEST_BUDGET_MS = 6_000;
 /** Hard cap on files handed to the second pass (argv length). Work is bounded by bytes, not files. */
 const SESSIONS_MAX_FILES = 6_000;
 
 interface SessionScanPlan {
-	/** The query token present in the fewest files — the best line filter. */
+	/** The query token on the fewest lines — the cheapest pass-2 filter. */
 	discriminator: string;
 	/** Files containing the discriminator, newest first. */
 	files: string[];
@@ -378,21 +354,31 @@ interface SessionScanPlan {
  */
 async function planSessionScan(
 	tokens: string[],
-	searchDirs: string[],
+	searchFiles: string[],
 	status: Partial<Record<MemorySource, SourceStatus>>,
 	signal?: AbortSignal,
 ): Promise<SessionScanPlan | null> {
 	const perToken = await Promise.all(
 		tokens.map(async (t) => {
-			const r = await execFileAsync(
-				"rg",
-				["-i", "-F", "--files-with-matches", "--glob", "*.jsonl", "-e", t, "--", ...searchDirs],
-				64 * 1024 * 1024,
-				signal,
-			);
-			if (r.status === 1) return { token: t, files: [] as string[], ok: true };
-			if (r.status !== 0 && !r.stdout) return { token: t, files: [] as string[], ok: false };
-			return { token: t, files: r.stdout.split("\n").filter(Boolean), ok: true };
+			// `-c` prints `file:count` for files with ≥1 match — same cost as
+			// --files-with-matches, but the LINE count is what pass 2 will pay for
+			// (each line is JSON.parsed + scored). A token in few files but many
+			// lines per file ("proxy": 1 439 files / 15 446 lines) is a worse
+			// filter than one in more files but fewer lines ("destination": 2 388
+			// files / 2 508 lines) — 6x less pass-2 work.
+			const r = await execFileAsync("rg", ["-i", "-F", "-c", "--with-filename", "-e", t, "--", ...searchFiles], 64 * 1024 * 1024, signal);
+			if (r.status === 1) return { token: t, files: [] as string[], lines: 0, ok: true };
+			if (r.status !== 0 && !r.stdout) return { token: t, files: [] as string[], lines: 0, ok: false };
+			const files: string[] = [];
+			let lines = 0;
+			for (const row of r.stdout.split("\n")) {
+				if (!row) continue;
+				const sep = row.lastIndexOf(":");
+				if (sep === -1) continue;
+				files.push(row.slice(0, sep));
+				lines += Number(row.slice(sep + 1)) || 0;
+			}
+			return { token: t, files, lines, ok: true };
 		}),
 	);
 	if (perToken.every((p) => !p.ok)) {
@@ -401,22 +387,18 @@ async function planSessionScan(
 	}
 	const present = perToken.filter((p) => p.ok && p.files.length > 0);
 	if (present.length === 0) return null;
-	// Rarest token wins, but a bare number ("27" from "v0.27.0") is never a good
-	// line filter even when rare — prefer any word token over any numeric one.
+	// Fewest matching LINES wins (that is the pass-2 cost), but a bare number
+	// ("27" from "v0.27.0") is never a good line filter even when rare — prefer
+	// any word token over any numeric one.
 	const isNumeric = (t: string) => /^\d+$/.test(t);
-	present.sort((a, b) => Number(isNumeric(a.token)) - Number(isNumeric(b.token)) || a.files.length - b.files.length);
+	present.sort((a, b) => Number(isNumeric(a.token)) - Number(isNumeric(b.token)) || a.lines - b.lines);
 	const discriminator = present[0];
 
-	// Newest first: a bounded second pass then drops OLD data, never today's.
-	const mtimeOf = new Map<string, number>();
-	for (const f of discriminator.files) {
-		try {
-			mtimeOf.set(f, statSync(f).mtimeMs);
-		} catch {
-			mtimeOf.set(f, 0);
-		}
-	}
-	const files = [...discriminator.files].sort((a, b) => (mtimeOf.get(b) ?? 0) - (mtimeOf.get(a) ?? 0));
+	// Newest first: `searchFiles` arrives ordered by SOURCE mtime (digest file
+	// mtimes are meaningless — they are all "just written"). Preserve that order
+	// so a bounded second pass drops OLD data, never today's.
+	const matched = new Set(discriminator.files);
+	const files = searchFiles.filter((f) => matched.has(f));
 	if (files.length > SESSIONS_MAX_FILES) {
 		status.sessions = "partial";
 		files.length = SESSIONS_MAX_FILES;
@@ -439,101 +421,92 @@ async function searchSessions(
 		status.sessions = "skipped";
 		return [];
 	}
-	const searchDirs =
-		scope === "current"
-			? [join(SESSIONS_ROOT, sessionFolderForCwd(cwd))].filter((d) => existsSync(d))
-			: [SESSIONS_ROOT];
-	if (searchDirs.length === 0) return [];
 
-	// Two-pass funnel. A session line is a whole API message (often 100 KB–1 MB)
-	// and corpus-wide words like "model"/"error" sit on >50 % of lines, so an OR
-	// of every token used to make rg emit the *entire* corpus (10.8 GB measured
-	// on 15 GB of transcripts) — Node killed it at maxBuffer and kept whatever 2 %
-	// came first on disk, never the newest session. Instead:
-	//   1. rg --files-with-matches per token → file-set per token (KB of output).
-	//      The token in the FEWEST files is the discriminator.
-	//   2. rg for the discriminator only, over its files newest-first with a
-	//      per-file cap, so if the buffer ever fills it is old data that is cut.
-	const plan = await planSessionScan(tokens, searchDirs, status, signal);
+	// Search the text-only digest (session-digest.ts), not the raw 15 GB tree:
+	// 98.8 % of raw transcript bytes are toolResult dumps this search never
+	// surfaces. Refresh first — a no-op stat sweep when nothing changed; on a
+	// cold cache it digests newest-first within the budget and we search what
+	// exists so far, labelled partial.
+	const refresh = await refreshSessionDigest({ budgetMs: SESSIONS_DIGEST_BUDGET_MS, signal });
+	if (!refresh.complete) status.sessions = "partial";
+
+	const wantFolder = scope === "current" ? sessionFolderForCwd(cwd) : undefined;
+	const files = sessionDigestFiles().filter((f) => {
+		if (!wantFolder) return true;
+		const src = sessionSourceForDigest(f);
+		return src !== undefined && src.startsWith(join(SESSIONS_ROOT, wantFolder) + "/");
+	});
+	if (files.length === 0) return [];
+
+	// Two-pass funnel (see planSessionScan): the rarest content token filters
+	// lines; its files are scanned newest-first under a byte budget so a cut
+	// drops OLD data, never today's.
+	const plan = await planSessionScan(tokens, files, status, signal);
 	if (!plan) return [];
 	const res = await execFileStreaming(
 		"rg",
-		[
-			"-i",
-			"-F",
-			"--no-heading",
-			"--no-line-number",
-			"--with-filename",
-			"--max-columns",
-			String(SESSIONS_MAX_LINE_CHARS),
-			"-e",
-			plan.discriminator,
-			"--",
-			...plan.files,
-		],
+		["-i", "-F", "--no-heading", "--no-line-number", "--with-filename", "-e", plan.discriminator, "--", ...plan.files],
 		SESSIONS_SCAN_BUDGET_BYTES,
 		signal,
 	);
 	// rg exits 1 when no matches — that's not an error. On any other non-zero
-	// exit (e.g. 2 = permission-denied subdir) rg still PRINTED the matches it
-	// found, so keep partial stdout instead of discarding it (B2 — match docs).
+	// exit rg still PRINTED the matches it found, so keep partial stdout.
 	if (res.status === 1) return [];
 	const out = res.stdout;
 	if (res.status !== 0) {
 		if (!out) {
-			// ENOENT (rg missing) / timeout with nothing printed — source is broken,
+			// ENOENT (rg missing) / killed with nothing printed — source is broken,
 			// not empty. Surfacing this distinguishes 'no matches' from 'no scan'.
 			status.sessions = "failed";
 			return [];
 		}
-		// Partial stdout survived (exit 2 / timeout / ENOBUFS kill) — label it.
 		status.sessions = "partial";
 	}
 	if (res.budgetHit) status.sessions = "partial";
 
-	const mtimeCache = new Map<string, number>();
+	const sourceCache = new Map<string, { rel: string; project: string; mtime: number }>();
 	const hits: MemoryHit[] = [];
 	for (const row of out.split("\n")) {
 		if (!row) continue;
-		// rg output is `path:linecontent`; the path ends at the first `.jsonl:`.
+		// rg output is `digestpath:linecontent`; the path ends at the first `.jsonl:`.
 		const sep = row.indexOf(".jsonl:");
 		if (sep === -1) continue;
-		const full = row.slice(0, sep + 6);
+		const digestPath = row.slice(0, sep + 6);
 		const line = row.slice(sep + 7);
 		if (!line) continue;
 
-		let mtime = mtimeCache.get(full);
-		if (mtime === undefined) {
+		let src = sourceCache.get(digestPath);
+		if (!src) {
+			const full = sessionSourceForDigest(digestPath) ?? digestPath;
+			const rel = full.startsWith(SESSIONS_ROOT) ? full.slice(SESSIONS_ROOT.length + 1) : full;
+			let mtime = 0;
 			try {
 				mtime = statSync(full).mtimeMs;
 			} catch {
-				mtime = 0;
+				/* source vanished since refresh */
 			}
-			mtimeCache.set(full, mtime);
+			src = { rel, project: projectFromFolder(rel.split("/")[0] ?? ""), mtime };
+			sourceCache.set(digestPath, src);
 		}
 
-		let evt: unknown;
+		let turn: { ts?: string; role?: string; text?: string };
 		try {
-			evt = JSON.parse(line);
+			turn = JSON.parse(line);
 		} catch {
 			continue;
 		}
-		const msg = extractMessageText(evt);
-		if (!msg) continue;
-		const s = keywordScore(msg.text, tokens);
+		if (!turn.text) continue;
+		const s = keywordScore(turn.text, tokens);
 		if (s <= 0) continue;
-		const ts = parseTimestamp((evt as Record<string, unknown>).timestamp, mtime);
+		const ts = parseTimestamp(turn.ts, src.mtime);
 		if (sinceMs !== undefined && ts < now - sinceMs) continue;
 
-		const rel = full.startsWith(SESSIONS_ROOT) ? full.slice(SESSIONS_ROOT.length + 1) : full;
-		const folder = rel.split("/")[0] ?? "";
-		const project = projectFromFolder(folder);
 		hits.push({
 			source: "sessions",
-			label: msg.role,
-			snippet: makeSnippet(msg.text, tokens),
-			location: rel,
-			project,
+			label: turn.role ?? "?",
+			snippet: makeSnippet(turn.text, tokens),
+			location: src.rel,
+			project: src.project,
 			timestamp: ts,
 			score: s * recencyBoost(ts, now),
 		});
