@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { spawnSync } from "node:child_process";
-import { mkdtempSync, writeFileSync } from "node:fs";
+import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { test } from "node:test";
@@ -11,6 +11,14 @@ const indexUrl = new URL("../index.ts", import.meta.url).href;
 // objects in a child process with an isolated config dir and a mocked fetch.
 function runWebSearchThenRetrieve(config, { retrieveWith }) {
 	const dir = mkdtempSync(join(tmpdir(), "pi-web-access-response-id-"));
+	try {
+		return runInConfigDir(dir, config, retrieveWith);
+	} finally {
+		rmSync(dir, { recursive: true, force: true });
+	}
+}
+
+function runInConfigDir(dir, config, retrieveWith) {
 	writeFileSync(join(dir, "web-search.json"), JSON.stringify(config));
 	const child = spawnSync(process.execPath, ["--input-type=module"], {
 		input: `
