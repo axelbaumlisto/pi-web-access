@@ -1416,6 +1416,11 @@ export default function (pi: ExtensionAPI) {
 
 		const searchId = storeAndPublishSearch(opts.results);
 		const isBackgroundFetch = fetchId !== null && !hasInlineReady;
+		// The model only sees `content`, not `details`: surface the id it needs to
+		// call get_search_content, the same way fetch_content does.
+		if (getSearchContentEnabled && !hasApprovedSummary) {
+			output += `\n---\nResults stored as responseId "${searchId}". Use ${toolNames.getSearchContent}({ responseId: "${searchId}", queryIndex: 0 }) to retrieve them.`;
+		}
 
 		return {
 			content: [{ type: "text", text: output.trim() }],
