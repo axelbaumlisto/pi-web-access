@@ -16,6 +16,7 @@ All notable changes to this project will be documented in this file.
 
 ### Fixed
 
+- Surfaced the stored `responseId` in `web_search` output so the model can call `get_search_content` on search results; previously the id lived only in `details`, which the model never sees. Thanks to [@axelbaumlisto](https://github.com/axelbaumlisto) for PR #354.
 - Improved Node-startup race test reliability by widening cold-boot test timeouts. Thanks to [@axelbaumlisto](https://github.com/axelbaumlisto) for PR #353.
 - Retained citations referenced in Perplexity answers even when they fall beyond `numResults`, while preserving the result-count limit for answers without citation markers. Thanks to [@schlessera](https://github.com/schlessera) for issue #340 and PR #341.
 - Scoped configured proxy transport to web-tool operations so unrelated Pi requests retain their existing transport. Thanks to [@alexei-ciobanu](https://github.com/alexei-ciobanu) for PR #339 and [@mystery4f](https://github.com/mystery4f) for PR #343.
