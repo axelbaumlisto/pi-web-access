@@ -254,8 +254,10 @@ test("Gemini command source is lazy, overrides stale env, rotates, and uses head
 		const { isGeminiApiAvailable, queryGeminiApiWithVideo } = await import(${JSON.stringify(geminiApiUrl)});
 		const available = isGeminiApiAvailable();
 		const lazy = !existsSync(${JSON.stringify(counterPath)});
-		await queryGeminiApiWithVideo("first", "files/one", { timeoutMs: 1000 });
-		await queryGeminiApiWithVideo("second", "files/two", { timeoutMs: 1000 });
+		// fetch is mocked, so timeoutMs only bounds the two "!command" shell spawns;
+		// keep it generous so a slow CI host cannot abort credential resolution.
+		await queryGeminiApiWithVideo("first", "files/one", { timeoutMs: 15_000 });
+		await queryGeminiApiWithVideo("second", "files/two", { timeoutMs: 15_000 });
 		console.log(JSON.stringify({ available, lazy, requests }));
 	`, {
 		PI_CODING_AGENT_DIR: agentDir,

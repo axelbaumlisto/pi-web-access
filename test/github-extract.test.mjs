@@ -875,7 +875,9 @@ test("GitHub clones disable interactive credential prompts", { skip: process.pla
 	await mkdir(binDir, { recursive: true });
 	await writeFile(
 		join(agentDir, "web-search.json"),
-		JSON.stringify({ githubClone: { clonePath, cloneTimeoutSeconds: 1 } }),
+		// Not a timeout test: the fake git (a Node shim) must *finish* its fake
+		// clone. Give it room for a cold Node boot on a slow CI host.
+		JSON.stringify({ githubClone: { clonePath, cloneTimeoutSeconds: 4 } }),
 		"utf8",
 	);
 	await writeFakeExecutable(binDir, "gh", "process.exit(1);");
@@ -903,7 +905,9 @@ test("GitHub clones disable interactive credential prompts", { skip: process.pla
 			console.log(JSON.stringify(result !== null));
 		`,
 		encoding: "utf8",
-		timeout: 5000,
+		// Outer budget must cover child Node boot + fake gh probe boot + fake git boot
+		// + the 4 s clone ceiling with real margin (each shim boot is ~1 s on a loaded host).
+		timeout: 15_000,
 		env: {
 			...process.env,
 			CLONE_ENV_FILE: envFile,
@@ -930,7 +934,10 @@ test("GitHub clone timeout force-kills the SIGTERM-resistant process group", { s
 	await mkdir(binDir, { recursive: true });
 	await writeFile(
 		join(agentDir, "web-search.json"),
-		JSON.stringify({ githubClone: { clonePath: join(root, "repos"), cloneTimeoutSeconds: 0.5 } }),
+		// The fake git is a "#!/usr/bin/env node" shim: the timeout must outlast a
+		// cold Node boot on a slow CI host, or the tree is killed before the shim
+		// has recorded its pids (ENOENT below). 3 s is still a fast test.
+		JSON.stringify({ githubClone: { clonePath: join(root, "repos"), cloneTimeoutSeconds: 3 } }),
 		"utf8",
 	);
 	await writeFakeExecutable(binDir, "gh", "process.exit(1);");
@@ -939,17 +946,20 @@ test("GitHub clone timeout force-kills the SIGTERM-resistant process group", { s
 		"git",
 		`
 			const { spawn } = require("node:child_process");
+			const { writeFileSync } = require("node:fs");
 			process.on("SIGTERM", () => {});
 			const helperSource = ${JSON.stringify(`
-				const { writeFileSync } = require("node:fs");
 				process.on("SIGTERM", () => {});
-				writeFileSync(process.env.CLONE_PROCESS_PID_FILE, JSON.stringify({
-					rootPid: process.ppid,
-					helperPid: process.pid,
-				}));
 				setInterval(() => {}, 1000);
 			`)};
-			spawn(process.execPath, ["-e", helperSource], { stdio: "ignore" });
+			const helper = spawn(process.execPath, ["-e", helperSource], { stdio: "ignore" });
+			// Record both pids from the parent, synchronously after spawn: the helper's
+			// pid exists before its Node runtime boots, so the pid file is guaranteed to
+			// be present even if the clone timeout fires before the helper is ready.
+			writeFileSync(process.env.CLONE_PROCESS_PID_FILE, JSON.stringify({
+				rootPid: process.pid,
+				helperPid: helper.pid,
+			}));
 			setInterval(() => {}, 1000);
 		`,
 	);
@@ -961,7 +971,8 @@ test("GitHub clone timeout force-kills the SIGTERM-resistant process group", { s
 			console.log(JSON.stringify(result));
 		`,
 		encoding: "utf8",
-		timeout: 10000,
+		// Allow the clone timeout, kill grace, and cold Node/fake gh startups.
+		timeout: 15_000,
 		env: {
 			...process.env,
 			CLONE_PROCESS_PID_FILE: processPidFile,
