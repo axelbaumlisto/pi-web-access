@@ -1,6 +1,6 @@
 {
   "name": "pi-ext-int-search",
-  "version": "1.3.0",
+  "version": "1.3.1",
   "description": "Hardened fork of nicobailon/pi-web-access (synced to v0.28.0) with unified proxy mode + destination-first key binding + added internal search. EXTERNAL: web_search across OpenAI, Brave, Parallel, TinyFish, Search1API, Searchinfinity, Querit, Tavily, Firecrawl, Jina, SERPdive, Kagi, Ollama, AnySearch, Bright Data, SerpBase, SearXNG, Exa, Perplexity, Gemini, Kimi, Mistral (URL fetch raw/answer modes, GitHub clone + PR/issue, PDF, YouTube/video, source_check). INTERNAL: memory_search over your own pi chat sessions, claude-recall memories, project docs, and git history.",
   "type": "module",
   "scripts": {

@@ -4,6 +4,14 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+## [pi-ext-int-search 1.3.1] - 2026-09-05 (fork release)
+
+### Changed
+- Synced with upstream **v0.28.0** (our PRs #353 / #354 landed there with credit; upstream's unreleased-code cleanup;
+  xAI `x_search`, Mistral search, parallel batch queries — see the 0.28.0 entry).
+- Fixed a fifth upstream test race (`github-issue-pr` REST-abort test raced process spawn; now asserts the ordering
+  invariant instead of wall-clock) — upstream PR #359.
+
 ## [pi-ext-int-search 1.3.0] - 2026-09-04 (fork release)
 
 ### Fixed
