@@ -16,6 +16,7 @@ All notable changes to this project will be documented in this file.
 
 ### Fixed
 
+- Improved Node-startup race test reliability by widening cold-boot test timeouts. Thanks to [@axelbaumlisto](https://github.com/axelbaumlisto) for PR #353.
 - Retained citations referenced in Perplexity answers even when they fall beyond `numResults`, while preserving the result-count limit for answers without citation markers. Thanks to [@schlessera](https://github.com/schlessera) for issue #340 and PR #341.
 - Scoped configured proxy transport to web-tool operations so unrelated Pi requests retain their existing transport. Thanks to [@alexei-ciobanu](https://github.com/alexei-ciobanu) for PR #339 and [@mystery4f](https://github.com/mystery4f) for PR #343.
 - Cleaned stale GitHub clone runtime directories after a crashed process when the owner can be proven dead, while preserving runtimes with unknown or live owners. Thanks to [@yazanabuashour](https://github.com/yazanabuashour) for issue #331.
