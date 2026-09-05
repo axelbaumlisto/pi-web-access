@@ -139,7 +139,6 @@ test("curator add-search indexes do not collide with reserved initial provider r
 		assert.equal(searchResponse.status, 200);
 		const added = await searchResponse.json();
 		assert.equal(added.queryIndex, 6);
-		assert.notEqual(added.queryIndex, 2);
 
 		// Index 2 is a later provider result for the first initial query. Before
 		// reserving the initial range, the added search also received index 2.

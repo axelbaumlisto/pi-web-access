@@ -34,8 +34,7 @@ const SEARCH_TIMEOUT_MS = 60_000;
 const WEB_SEARCH_AUTH_MODEL_CANDIDATES = ["grok-4.5", "grok-4.3", "grok-build-0.1"] as const;
 const X_SEARCH_AUTH_MODEL_CANDIDATES = ["grok-4.6", ...WEB_SEARCH_AUTH_MODEL_CANDIDATES] as const;
 
-const XAI_SEARCH_TOOL_NAMES = ["web_search", "x_search"] as const;
-type XaiSearchTool = typeof XAI_SEARCH_TOOL_NAMES[number];
+type XaiSearchTool = "web_search" | "x_search";
 const DEFAULT_XAI_SEARCH_TOOLS = ["web_search"] as const satisfies readonly XaiSearchTool[];
 
 interface WebSearchConfig {
@@ -87,14 +86,13 @@ function resolveConfiguredSearchTools(value: unknown): XaiSearchTool[] {
 
 	const tools: XaiSearchTool[] = [];
 	for (const tool of value) {
-		if (typeof tool !== "string" || !XAI_SEARCH_TOOL_NAMES.includes(tool as XaiSearchTool)) {
+		if (tool !== "web_search" && tool !== "x_search") {
 			throw new Error(`xaiSearchTools in ${CONFIG_PATH} may only contain web_search or x_search`);
 		}
-		const toolName = tool as XaiSearchTool;
-		if (tools.includes(toolName)) {
-			throw new Error(`xaiSearchTools in ${CONFIG_PATH} must not contain duplicates: ${toolName}`);
+		if (tools.includes(tool)) {
+			throw new Error(`xaiSearchTools in ${CONFIG_PATH} must not contain duplicates: ${tool}`);
 		}
-		tools.push(toolName);
+		tools.push(tool);
 	}
 	return tools;
 }
