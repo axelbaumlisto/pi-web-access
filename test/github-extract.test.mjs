@@ -971,7 +971,8 @@ test("GitHub clone timeout force-kills the SIGTERM-resistant process group", { s
 			console.log(JSON.stringify(result));
 		`,
 		encoding: "utf8",
-		timeout: 10000,
+		// Allow the clone timeout, kill grace, and cold Node/fake gh startups.
+		timeout: 15_000,
 		env: {
 			...process.env,
 			CLONE_PROCESS_PID_FILE: processPidFile,
