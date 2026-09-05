@@ -242,7 +242,7 @@ function runSearchQueries<T>(queries: string[], run: (query: string, index: numb
 // Keep primary query indexes stable for curator slots, then interleave additional
 // provider entries deterministically instead of assigning by completion order.
 function curatorResultIndex(queryIndex: number, entryIndex: number, queryCount: number): number {
-	return entryIndex === 0 ? queryIndex : entryIndex * queryCount + queryIndex;
+	return entryIndex * queryCount + queryIndex;
 }
 
 function curatorResultIndexCapacity(queryCount: number): number {
