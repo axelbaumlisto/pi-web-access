@@ -95,25 +95,33 @@ search routing, fetch-content domain policy, configurable tool names).
 - Made `source_check` tests hermetic (they no longer pick up the developer's
   real `~/.pi/web-search.json`).
 
-## [Unreleased — upstream]
+## [0.28.0] - 2026-09-04
+
+### Highlights
+
+- Search X posts through xAI or choose Mistral for web searches.
+- Batch searches run in parallel for faster multi-query research.
+- Follow-up retrieval can access stored search results, and Perplexity keeps all cited sources.
+- Web-tool proxy settings no longer affect unrelated Pi requests.
 
 ### Added
 
 - Documented the Linux `xdg-utils` dependency for automatic curator browser launch and the manual URL fallback. Thanks to [@wickedTangent](https://github.com/wickedTangent) for issue #336 and PR #337.
-- Added opt-in xAI Agent Tools `x_search` support alongside `web_search`, with validated `xaiSearchTools` configuration and defensive citation handling. Thanks to [@Jerry2003sky](https://github.com/Jerry2003sky) for issue #342.
-- Added explicit-only Mistral Conversations web search over direct HTTP, with `mistralApiKey` / `MISTRAL_API_KEY` credentials and opt-in `web_search_premium` support. Thanks to [@jaudiger](https://github.com/jaudiger) for issue #346.
+- Added opt-in X post search through xAI alongside web search, configured with `xaiSearchTools`. Thanks to [@Jerry2003sky](https://github.com/Jerry2003sky) for issue #342.
+- Added Mistral web search with `provider: "mistral"`, using `mistralApiKey` / `MISTRAL_API_KEY` credentials. Premium web search is available as a separate opt-in. Thanks to [@jaudiger](https://github.com/jaudiger) for issue #346.
 
 ### Changed
 
-- Run batch `web_search` queries with bounded concurrency while preserving query order and sequential provider fallback within each query. Thanks to [@Noir-Lime](https://github.com/Noir-Lime) for PR #345.
+- Run batch searches in parallel with a concurrency limit, keeping results in query order and preserving provider fallback. Thanks to [@Noir-Lime](https://github.com/Noir-Lime) for PR #345.
 
 ### Fixed
 
-- Surfaced the stored `responseId` in `web_search` output so the model can call `get_search_content` on search results; previously the id lived only in `details`, which the model never sees.
-- Retained citations referenced in Perplexity answers even when they fall beyond `numResults`, while preserving the result-count limit for answers without citation markers. Thanks to [@schlessera](https://github.com/schlessera) for issue #340 and PR #341.
-- Scoped configured proxy transport to web-tool operations so unrelated Pi requests retain their existing transport. Thanks to [@alexei-ciobanu](https://github.com/alexei-ciobanu) for PR #339 and [@mystery4f](https://github.com/mystery4f) for PR #343.
-- Cleaned stale GitHub clone runtime directories after a crashed process when the owner can be proven dead, while preserving runtimes with unknown or live owners. Thanks to [@yazanabuashour](https://github.com/yazanabuashour) for issue #331.
-- Kept an existing legacy `~/.pi/web-search.json` in use when `XDG_CONFIG_HOME` is set but its XDG config file is absent. Thanks to [@hu3rror](https://github.com/hu3rror) for issue #333.
+- Included `responseId` in search output so the model can retrieve stored results with `get_search_content`. Thanks to [@axelbaumlisto](https://github.com/axelbaumlisto) for PR #354.
+- Fixed flaky tests on slower Node startups. Thanks to [@axelbaumlisto](https://github.com/axelbaumlisto) for PR #353.
+- Kept all sources cited in Perplexity answers, even beyond `numResults`. Answers without citations still respect the result limit. Thanks to [@schlessera](https://github.com/schlessera) for issue #340 and PR #341.
+- Limited configured proxies to web-tool requests so unrelated Pi requests are unaffected. Thanks to [@alexei-ciobanu](https://github.com/alexei-ciobanu) for PR #339 and [@mystery4f](https://github.com/mystery4f) for PR #343.
+- Cleaned up abandoned GitHub clone directories after crashes, only when their owning process is confirmed dead. Thanks to [@yazanabuashour](https://github.com/yazanabuashour) for issue #331.
+- Kept using an existing `~/.pi/web-search.json` when `XDG_CONFIG_HOME` is set but no config file exists there. Thanks to [@hu3rror](https://github.com/hu3rror) for issue #333.
 
 ## [0.27.0] - 2026-08-28
 

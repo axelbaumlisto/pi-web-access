@@ -213,19 +213,16 @@ test("Mistral rejects malformed and empty Conversations responses", async () => 
 		JSON.stringify({ outputs: [] }),
 		JSON.stringify({ outputs: [{ type: "message.output", content: [{ type: "unknown" }] }] }),
 	];
-	for (const response of responses) {
-		const home = await createHome({ mistralApiKey: "mistral-key" });
-		const child = runChild(`
-			globalThis.fetch = async () => new Response(${JSON.stringify(response)}, { status: 200 });
-			const { searchWithMistral } = await import(${JSON.stringify(mistralModuleUrl)});
-			try { await searchWithMistral("malformed"); console.log(JSON.stringify({ ok: true })); }
-			catch (error) { console.log(JSON.stringify({ ok: false, message: String(error) })); }
-		`, { PI_CODING_AGENT_DIR: home });
-		assert.equal(child.status, 0, child.stderr);
-		const output = JSON.parse(child.stdout.trim());
-		assert.equal(output.ok, false);
-		assert.match(output.message, /invalid JSON|invalid response|no answer or sources/i);
-	}
+	const home = await createHome({ mistralApiKey: "mistral-key" });
+	const child = runChild(`
+		import assert from "node:assert/strict";
+		const { searchWithMistral } = await import(${JSON.stringify(mistralModuleUrl)});
+		for (const response of ${JSON.stringify(responses)}) {
+			globalThis.fetch = async () => new Response(response, { status: 200 });
+			await assert.rejects(searchWithMistral("malformed"), /invalid JSON|invalid response|no answer or sources/i);
+		}
+	`, { PI_CODING_AGENT_DIR: home });
+	assert.equal(child.status, 0, child.stderr);
 });
 
 test("Mistral propagates caller abort and passes the combined signal to fetch", async () => {
@@ -348,6 +345,5 @@ test("Curator page exposes Mistral as an available manual provider", async () =>
 	const page = generateCuratorPage(["query"], "token", 20, available, "mistral", "mistral", [], null);
 	assert.match(page, /data-provider="mistral"/);
 	assert.match(page, />Mistral<\/button>/);
-	assert.match(page, /"mistral"/);
 	assert.match(page, /provider === "mistral"\) return "Mistral"/);
 });

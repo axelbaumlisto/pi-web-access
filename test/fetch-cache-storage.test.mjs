@@ -25,8 +25,6 @@ const {
 afterEach(() => {
 	globalThis.fetch = originalFetch;
 	Date.now = originalDateNow;
-	if (originalAgentDir === undefined) delete process.env.PI_CODING_AGENT_DIR;
-	else process.env.PI_CODING_AGENT_DIR = originalAgentDir;
 	clearResults();
 });
 
@@ -37,7 +35,6 @@ after(() => {
 });
 
 async function useTempAgentDir() {
-	process.env.PI_CODING_AGENT_DIR = testAgentDir;
 	rmSync(join(testAgentDir, "web-search-cache"), { recursive: true, force: true });
 	return testAgentDir;
 }

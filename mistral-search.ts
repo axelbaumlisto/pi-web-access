@@ -9,10 +9,9 @@ const CONFIG_PATH = getWebSearchConfigPath();
 const SEARCH_TIMEOUT_MS = 60_000;
 const DEFAULT_SEARCH_MODEL = "mistral-small-latest";
 const DEFAULT_SEARCH_TOOL = "web_search";
-const SEARCH_TOOLS = ["web_search", "web_search_premium"] as const;
 const MAX_RESULTS = 20;
 
-type MistralSearchTool = typeof SEARCH_TOOLS[number];
+type MistralSearchTool = "web_search" | "web_search_premium";
 
 interface WebSearchConfig {
 	mistralApiKey?: unknown;
@@ -59,10 +58,10 @@ function resolveSearchModel(value: unknown): string {
 
 function resolveSearchTool(value: unknown): MistralSearchTool {
 	if (value === undefined) return DEFAULT_SEARCH_TOOL;
-	if (typeof value !== "string" || !SEARCH_TOOLS.includes(value as MistralSearchTool)) {
+	if (value !== "web_search" && value !== "web_search_premium") {
 		throw new Error(`mistralSearchTool in ${CONFIG_PATH} must be either web_search or web_search_premium`);
 	}
-	return value as MistralSearchTool;
+	return value;
 }
 
 function normalizeCount(value: number | undefined): number {
@@ -98,12 +97,7 @@ function parseDomainFilters(domainFilter: string[] | undefined): DomainFilters {
 
 function passesDomainFilters(url: string, filters: DomainFilters): boolean {
 	if (filters.include.length === 0 && filters.exclude.length === 0) return true;
-	let hostname: string;
-	try {
-		hostname = new URL(url).hostname.toLowerCase();
-	} catch {
-		return false;
-	}
+	const hostname = new URL(url).hostname.toLowerCase();
 	const matches = (domain: string) => hostname === domain || hostname.endsWith(`.${domain}`);
 	if (filters.exclude.some(matches)) return false;
 	return filters.include.length === 0 || filters.include.some(matches);

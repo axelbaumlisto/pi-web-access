@@ -114,20 +114,11 @@ export function isPerplexityAvailable(): boolean {
 /** Hard ceiling on kept citations, matching the `numResults` clamp. */
 const MAX_CITATIONS = 20;
 
-/**
- * How many citations to keep.
- *
- * Perplexity's citations are the answer's footnotes, not a result list: sonar
- * numbers its `[n]` markers against the full array, so cutting the array to
- * `numResults` leaves the prose referencing sources that were dropped. Keep
- * every citation the answer actually cites, and let `numResults` govern only
- * the unreferenced remainder.
- */
+// Preserve citation numbering by keeping the prefix through the highest cited index, capped at 20.
 function citationsToKeep(answer: string, available: number, numResults: number): number {
 	let highestCited = 0;
 	for (const match of answer.matchAll(/\[(\d{1,3})\]/g)) {
-		const index = Number(match[1]);
-		if (Number.isFinite(index) && index > highestCited) highestCited = index;
+		highestCited = Math.max(highestCited, Number(match[1]));
 	}
 	return Math.min(available, MAX_CITATIONS, Math.max(numResults, highestCited));
 }
