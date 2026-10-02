@@ -4,6 +4,19 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+## [pi-ext-int-search 1.3.2] - 2026-10-02 (fork release)
+
+### Fixed
+- **Pi startup warning "Host-provided extension packages must be declared in peerDependencies".** `typebox` moved from
+  `dependencies` to `peerDependencies` with a `"*"` range (pinned as an exact devDependency for reproducible
+  typecheck), so the installed copy can no longer bypass Pi's extension module mapping and create a duplicate
+  TypeBox registry. Port of upstream PR [#448](https://github.com/nicobailon/pi-web-access/pull/448)
+  (issue [#442](https://github.com/nicobailon/pi-web-access/issues/442)); the packed-install test now asserts the
+  peer contract instead of the old bundled-copy contract.
+- **Runtime security: `undici` bumped to `^8.11.2`** (was `^8.9.0`, which resolved into the vulnerable `8.0.0–8.10.1`
+  range: TLS validation bypass in `BalancedPool`, response splitting/truncation via interceptors, cache poisoning and
+  several DoS advisories). `npm run audit:runtime` is now clean.
+
 ## [pi-ext-int-search 1.3.1] - 2026-09-05 (fork release)
 
 ### Changed
