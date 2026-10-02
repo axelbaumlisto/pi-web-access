@@ -688,7 +688,7 @@ Or via env: `WEB_SEARCH_PROXY_URL` / `WEB_SEARCH_PROXY_KEY`. Fronted providers r
 - destination is the gateway origin → the shared `proxyApiKey` is the **only** credential. If it is missing, the provider is **unavailable** — it never falls back to a personal key (`OPENAI_API_KEY`, a `$ENV` / `!command` source, or a model-registry Codex token).
 - destination is anything else → upstream credential rules; the proxy key is never sent to a non-gateway host.
 - "gateway origin" is a parsed-origin compare, not `startsWith` — `your-gateway.example.evil.com` is not the gateway.
-- Model-registry OpenAI/Codex tokens are additionally gated to OpenAI-owned origins, and a JWT-shaped proxy key is never redirected to `chatgpt.com`.
+- Model-registry OpenAI/Codex tokens reach only three kinds of destination: OpenAI-owned origins, an endpoint you set explicitly in `openaiResponsesUrl`, or your own provider `baseUrl` when `openaiUseProviderBaseUrl` is on. A destination that exists *only* because of the shared `proxyBaseUrl` gateway never receives them — it uses `proxyApiKey`. A JWT-shaped gateway key is likewise never redirected to `chatgpt.com`: the Codex hop is decided from the key's shape, so a standalone key resolved for a non-OpenAI destination is pinned there (`useCodexEndpoint: false`) when it is issued.
 
 Every keyed provider request goes through redirect credential stripping: on a cross-origin redirect the credential header is dropped (upstream does this for brave/exa/tavily; the fork extends it to perplexity, openai and gemini's custom `x-goog-api-key` / `cf-aig-authorization`).
 
