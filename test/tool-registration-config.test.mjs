@@ -1,5 +1,6 @@
 import assert from "node:assert/strict";
 import { spawnSync } from "node:child_process";
+import { createHash } from "node:crypto";
 import { mkdtempSync, readFileSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -24,11 +25,15 @@ function runRegistrationWithConfig(configText) {
 			const { default: initializeExtension } = await import(${JSON.stringify(indexUrl)});
 			const tools = [];
 			const commands = [];
+			let active = [];
 			initializeExtension({
-				registerTool(tool) { tools.push({ name: tool.name, description: tool.description, promptSnippet: tool.promptSnippet, parameters: tool.parameters }); },
+				registerTool(tool) { tools.push({ name: tool.name, description: tool.description, promptSnippet: tool.promptSnippet, parameters: tool.parameters }); active.push(tool.name); },
 				registerCommand(name) { commands.push(name); },
 				registerShortcut() {},
-				on() {},
+				on() { return () => {}; },
+				getAllTools() { return tools; },
+				getActiveTools() { return active; },
+				setActiveTools(names) { active = [...names]; },
 			});
 			console.log(JSON.stringify({ tools, commands }));
 		`,
@@ -65,7 +70,25 @@ test("malformed config falls back during extension registration", () => {
 	const child = runRegistrationWithConfig("{");
 	assert.equal(child.status, 0, child.stderr);
 	const registered = JSON.parse(child.stdout);
-	assert.deepEqual(registered.tools.map(tool => tool.name), ["web_search", "source_check", "fetch_content", "memory_search", "get_search_content"]);
+	assert.deepEqual(registered.tools.map(tool => tool.name), ["web_search", "source_check", "fetch_content", "memory_search", "get_search_content", "web_enable"]);
+});
+
+// Fork: the hashes below are OUR tool definitions (fork descriptions + memory_search),
+// not upstream's. They are a tripwire against accidental schema/description drift.
+test("default public execution tool definitions retain their compatibility hashes", () => {
+	const expected = {
+		web_search: "c1f0e0020561c46d9dc5547664ac50ab2442e57ab9aa14d4b06a1bd18428dbae",
+		source_check: "685467b6e6bcbe32f7d7eb51805896f43077e3116e64a47b637c4584b3f2510e",
+		fetch_content: "0082465bae0f184988fd37fe152cad9c7a236e410747ba6770013895a28978d4",
+		// Fork-only tool; the four above still match upstream's hashes byte for byte.
+		memory_search: "98c5f6762e401c92f4976299b067b22d4e0bb3b164f81da090ff6285f8e783aa",
+		get_search_content: "e1c7597fc085a811c0c6fcde365a96571c275c70b93a48206a38be06a7a45a5f",
+	};
+	const tools = registered({}).tools.filter(tool => tool.name !== "web_enable");
+	assert.deepEqual(Object.fromEntries(tools.map(({ name, description, parameters }) => [
+		name,
+		createHash("sha256").update(JSON.stringify({ name, description, parameters })).digest("hex"),
+	])), expected);
 });
 
 test("search tools constrain numResults to integer values from 1 through 20", () => {
@@ -84,18 +107,18 @@ test("search tools constrain numResults to integer values from 1 through 20", ()
 });
 
 test("tool registration gates support legacy and per-tool config", () => {
-	assert.deepEqual(registeredToolNames({ webSearch: { enabled: false } }), ["fetch_content", "memory_search", "get_search_content"]);
+	assert.deepEqual(registeredToolNames({ webSearch: { enabled: false } }), ["fetch_content", "memory_search", "get_search_content", "web_enable"]);
 	assert.deepEqual(registeredToolNames({
 		webSearch: { enabled: false },
 		tools: { webSearch: { enabled: true }, sourceCheck: { enabled: true }, fetchContent: { enabled: false } },
-	}), ["web_search", "source_check", "memory_search", "get_search_content"]);
+	}), ["web_search", "source_check", "memory_search", "get_search_content", "web_enable"]);
 	assert.deepEqual(registeredToolNames({
 		tools: { sourceCheck: { enabled: false }, getSearchContent: { enabled: false } },
-	}), ["web_search", "fetch_content", "memory_search"]);
+	}), ["web_search", "fetch_content", "memory_search", "web_enable"]);
 	// Fork: memory_search has its own per-tool gate like every other tool.
 	assert.deepEqual(registeredToolNames({
 		tools: { memorySearch: { enabled: false } },
-	}), ["web_search", "source_check", "fetch_content", "get_search_content"]);
+	}), ["web_search", "source_check", "fetch_content", "get_search_content", "web_enable"]);
 });
 
 test("command registration gates default to enabled", () => {
@@ -147,7 +170,7 @@ test("web activity shortcut renders through the supported string-array API", asy
 
 test("tool names can be configured without changing defaults", () => {
 	// Fork: memory_search (internal search) is registered by default and renamable.
-	assert.deepEqual(registeredToolNames({}), ["web_search", "source_check", "fetch_content", "memory_search", "get_search_content"]);
+	assert.deepEqual(registeredToolNames({}), ["web_search", "source_check", "fetch_content", "memory_search", "get_search_content", "web_enable"]);
 	assert.deepEqual(registeredToolNames({
 		toolNames: {
 			webSearch: "research_web",
@@ -156,13 +179,15 @@ test("tool names can be configured without changing defaults", () => {
 			memorySearch: "recall_history",
 			getSearchContent: "open_content",
 		},
-	}), ["research_web", "verify_sources", "grab_content", "recall_history", "open_content"]);
+	}), ["research_web", "verify_sources", "grab_content", "recall_history", "open_content", "web_enable"]);
 });
 
-test("tool name config rejects invalid and duplicate registered names", () => {
+test("tool config rejects invalid, duplicate, or reserved names and unknown toolActivation", () => {
 	assert.match(registrationError({ toolNames: { webSearch: "1bad" } }), /toolNames\.webSearch/);
 	assert.match(registrationError({ toolNames: { webSearch: "same_name", fetchContent: "same_name" } }), /duplicates/);
 	assert.match(registrationError({ toolNames: { memorySearch: "web_search" } }), /duplicates/);
+	assert.match(registrationError({ toolActivation: "lazy" }), /toolActivation.*"auto", "dynamic", or "eager"/);
+	assert.match(registrationError({ toolNames: { webSearch: "web_enable" } }), /web_enable.*reserved/i);
 });
 
 test("webSearch.enabled false registers only fetch tools and ignores disabled-name duplicates", () => {
@@ -174,7 +199,7 @@ test("webSearch.enabled false registers only fetch tools and ignores disabled-na
 			fetchContent: "grab_content",
 			getSearchContent: "open_content",
 		},
-	}), ["grab_content", "memory_search", "open_content"]);
+	}), ["grab_content", "memory_search", "open_content", "web_enable"]);
 	assert.match(registrationError({
 		webSearch: { enabled: false },
 		toolNames: { fetchContent: "same_name", getSearchContent: "same_name" },

@@ -20,3 +20,7 @@ if (!process.env.PI_CODING_AGENT_DIR) {
 }
 // A real XDG config would also be picked up by utils.getWebSearchConfigDir().
 delete process.env.XDG_CONFIG_HOME;
+
+// Upstream isolate-env.mjs: tests write and prune the fetched-content cache, so a
+// cache root exported in the shell must never reach them.
+delete process.env.PI_WEB_ACCESS_CACHE_ROOT;

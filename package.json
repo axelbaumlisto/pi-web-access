@@ -1,12 +1,16 @@
 {
   "name": "pi-ext-int-search",
-  "version": "1.3.2",
-  "description": "Hardened fork of nicobailon/pi-web-access (synced to v0.28.0) with unified proxy mode + destination-first key binding + added internal search. EXTERNAL: web_search across OpenAI, Brave, Parallel, TinyFish, Search1API, Searchinfinity, Querit, Tavily, Firecrawl, Jina, SERPdive, Kagi, Ollama, AnySearch, Bright Data, SerpBase, SearXNG, Exa, Perplexity, Gemini, Kimi, Mistral (URL fetch raw/answer modes, GitHub clone + PR/issue, PDF, YouTube/video, source_check). INTERNAL: memory_search over your own pi chat sessions, claude-recall memories, project docs, and git history.",
+  "version": "1.4.0",
+  "description": "Hardened fork of nicobailon/pi-web-access (synced to v0.35.0) with unified proxy mode + destination-first key binding + added internal search. EXTERNAL: web_search across OpenAI, Brave, Parallel, TinyFish, Search1API, Searchinfinity, Querit, Tavily, Firecrawl, Crawl4AI, Jina, SERPdive, Kagi, Ollama, AnySearch, Bright Data, SerpBase, SerpApi, Serply, You.com, SearXNG, Exa, Perplexity, Gemini, Kimi, Mistral, Z.ai (URL fetch raw/answer modes, GitHub clone + PR/issue, PDF, YouTube/video, source_check). INTERNAL: memory_search over your own pi chat sessions, claude-recall memories, project docs, and git history.",
   "type": "module",
   "scripts": {
     "test": "node --import ./test/hermetic-env.mjs --test",
     "typecheck": "tsc",
-    "audit:runtime": "npm audit --omit=dev --omit=peer"
+    "audit:runtime": "npm audit --omit=dev --omit=peer",
+    "build": "node scripts/build.js",
+    "prepublishOnly": "npm run build && node scripts/pi-extensions-dist.js dist",
+    "postpublish": "node scripts/pi-extensions-dist.js index.ts",
+    "release": "node scripts/publish.js"
   },
   "keywords": [
     "pi-package",
@@ -38,6 +42,7 @@
   },
   "homepage": "https://github.com/axelbaumlisto/pi-web-access#readme",
   "files": [
+    "dist",
     "*.ts",
     "CHANGELOG.md",
     "SECURITY.md",
@@ -45,19 +50,24 @@
     "skills"
   ],
   "devDependencies": {
+    "@earendil-works/pi-ai": "0.86.1",
+    "@earendil-works/pi-coding-agent": "0.86.1",
+    "@earendil-works/pi-tui": "0.86.1",
     "@types/turndown": "^5.0.6",
+    "esbuild": "^0.28.1",
     "typebox": "1.3.27",
     "typescript": "^7.0.2"
   },
   "dependencies": {
+    "@modelcontextprotocol/sdk": "1.27.1",
     "@mozilla/readability": "^0.6.0",
     "defuddle": "0.19.3",
     "linkedom": "^0.16.0",
     "p-limit": "^6.1.0",
     "promise.try": "^2.0.1",
     "turndown": "^7.2.0",
-    "unpdf": "^1.6.2",
-    "undici": "^8.11.2"
+    "undici": "^8.11.2",
+    "unpdf": "^1.6.2"
   },
   "peerDependencies": {
     "@earendil-works/pi-ai": "*",

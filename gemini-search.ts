@@ -11,6 +11,8 @@ import { isBraveAvailable, searchWithBrave } from "./brave.ts";
 import {
 	isCurrentModelHostedSearchEligible,
 	isOpenAISearchAvailable,
+	isOpenAISubscriptionModelSelected,
+	OpenAIAlphaSearchUnsupportedError,
 	searchWithCurrentModelOpenAI,
 	searchWithOpenAI,
 } from "./openai-search.ts";
@@ -21,6 +23,7 @@ import { isSearch1APIAvailable, searchWithSearch1API } from "./search1api.ts";
 import { isSearchinfinityAvailable, searchWithSearchinfinity } from "./searchinfinity.ts";
 import { isQueritAvailable, searchWithQuerit } from "./querit.ts";
 import { isTavilyAvailable, searchWithTavily } from "./tavily.ts";
+import { isYouAvailable, searchWithYou } from "./you.ts";
 import { isFirecrawlAvailable, searchWithFirecrawl } from "./firecrawl.ts";
 import { isJinaSearchAvailable, searchWithJina } from "./jina-search.ts";
 import { isSerpdiveAvailable, searchWithSerpdive } from "./serpdive.ts";
@@ -34,7 +37,11 @@ import { isXcrawlAvailable, searchWithXCrawl } from "./xcrawl.ts";
 import { isXaiSearchAvailable, searchWithXai } from "./xai-search.ts";
 import { isBrightDataAvailable, searchWithBrightData } from "./brightdata.ts";
 import { isSerpBaseAvailable, searchWithSerpBase } from "./serpbase.ts";
+import { isSerpApiAvailable, searchWithSerpApi } from "./serpapi.ts";
 import { isSerperAvailable, searchWithSerper } from "./serper.ts";
+import { isSerplyAvailable, searchWithSerply } from "./serply.ts";
+import { isBaizhiAvailable, searchWithBaizhi } from "./baizhi.ts";
+import { isZaiAvailable, searchWithZai } from "./zai.ts";
 import { isValyuAvailable, searchWithValyu } from "./valyu.ts";
 import { isKimiSearchAvailable, searchWithKimi } from "./kimi-search.ts";
 import { isMistralAvailable, searchWithMistral } from "./mistral-search.ts";
@@ -42,7 +49,7 @@ import { getWebSearchConfigPath } from "./utils.ts";
 import { validateRemoteUrl } from "./ssrf-protection.ts";
 import { redactError } from "./redact.ts";
 
-export const RESOLVED_SEARCH_PROVIDERS = ["openai", "brave", "parallel", "parallel-mcp", "tinyfish", "search1api", "searchinfinity", "querit", "tavily", "firecrawl", "jina", "searxng", "duckduckgo", "perplexity", "gemini", "kimi", "exa", "serpdive", "kagi", "ollama", "anysearch", "xai", "mistral", "brightdata", "serpbase", "serper", "valyu", "bocha", "xcrawl"] as const;
+export const RESOLVED_SEARCH_PROVIDERS = ["openai", "brave", "parallel", "parallel-mcp", "tinyfish", "search1api", "searchinfinity", "querit", "tavily", "you", "firecrawl", "jina", "searxng", "duckduckgo", "perplexity", "gemini", "kimi", "exa", "serpdive", "kagi", "ollama", "anysearch", "xai", "mistral", "brightdata", "serpbase", "serpapi", "serper", "serply", "valyu", "bocha", "xcrawl", "baizhi", "zai"] as const;
 export const SEARCH_PROVIDERS = ["auto", "all", ...RESOLVED_SEARCH_PROVIDERS] as const;
 
 export type ResolvedSearchProvider = typeof RESOLVED_SEARCH_PROVIDERS[number];
@@ -107,7 +114,7 @@ export interface AttributedSearchResponse extends SearchResponse {
 
 const CONFIG_PATH = getWebSearchConfigPath();
 const DEFAULT_SEARCH_MODEL = "gemini-3.6-flash";
-// Explicit-only providers (Parallel MCP, DuckDuckGo, Kimi, AnySearch, XCrawl, xAI, Mistral, Bright Data, SerpBase, Serper, Valyu) are deliberately absent:
+// Explicit-only providers (Parallel MCP, DuckDuckGo, Kimi, AnySearch, XCrawl, xAI, Mistral, Bright Data, SerpBase, SerpApi, Serper, Serply, You.com, Valyu, Baizhi, Z.ai) are deliberately absent:
 // `all` must never fan out to an opt-in or paid provider without the user asking for it.
 export const ALL_SEARCH_PROVIDERS: ResolvedSearchProvider[] = ["searxng", "openai", "exa", "brave", "parallel", "tinyfish", "search1api", "searchinfinity", "querit", "tavily", "firecrawl", "jina", "serpdive", "kagi", "ollama", "perplexity", "gemini", "bocha"];
 const VALID_ROUTING_KINDS = ["transient", "quota", "network", "invalid-response", "unsupported"] as const;
@@ -117,6 +124,7 @@ type SearchConfig = {
 	searchProviderConfigured: boolean;
 	searchRouting?: SearchRoutingConfig;
 	searchModel?: string;
+	allowedProviders?: ResolvedSearchProvider[];
 };
 
 let cachedSearchConfig: SearchConfig | null = null;
@@ -142,12 +150,31 @@ function getSearchConfig(): SearchConfig {
 	}
 
 	const searchModel = normalizeSearchModel(raw.searchModel);
+	const webSearch = raw.webSearch;
+	if (webSearch !== undefined && (!webSearch || typeof webSearch !== "object" || Array.isArray(webSearch))) {
+		throw new Error(`webSearch in ${CONFIG_PATH} must be an object`);
+	}
+	const allowedProviders = webSearch && Object.hasOwn(webSearch, "allowedProviders")
+		? normalizeResolvedProviderList((webSearch as Record<string, unknown>).allowedProviders, `webSearch.allowedProviders in ${CONFIG_PATH}`)
+		: undefined;
 	const searchProviderConfigured = Object.hasOwn(raw, "searchProvider") || Object.hasOwn(raw, "provider");
+	const searchProvider = normalizeSearchProviderSelection(raw.searchProvider ?? raw.provider, `provider in ${CONFIG_PATH}`);
+	const searchRouting = Object.hasOwn(raw, "searchRouting") ? normalizeSearchRouting(raw.searchRouting) : undefined;
+	if (allowedProviders) {
+		if (Object.hasOwn(raw, "searchProvider")) {
+			assertSearchProviderSelectionAllowed(normalizeSearchProviderSelection(raw.searchProvider), `searchProvider in ${CONFIG_PATH}`, allowedProviders);
+		}
+		if (Object.hasOwn(raw, "provider")) {
+			assertSearchProviderSelectionAllowed(normalizeSearchProviderSelection(raw.provider), `provider in ${CONFIG_PATH}`, allowedProviders);
+		}
+		if (searchRouting) assertSearchProviderSelectionAllowed(searchRouting.providers, `searchRouting.providers in ${CONFIG_PATH}`, allowedProviders);
+	}
 	cachedSearchConfig = {
-		searchProvider: normalizeSearchProviderSelection(raw.searchProvider ?? raw.provider, `provider in ${CONFIG_PATH}`),
+		searchProvider,
 		searchProviderConfigured,
-		...(Object.hasOwn(raw, "searchRouting") ? { searchRouting: normalizeSearchRouting(raw.searchRouting) } : {}),
+		...(searchRouting ? { searchRouting } : {}),
 		...(searchModel ? { searchModel } : {}),
+		...(allowedProviders ? { allowedProviders } : {}),
 	};
 	return cachedSearchConfig;
 }
@@ -210,6 +237,25 @@ function normalizeResolvedProviderList(value: unknown, label: string): ResolvedS
 	return providers;
 }
 
+export function assertSearchProviderSelectionAllowed(
+	selection: SearchProviderSelection,
+	label = "provider",
+	allowedProviders = getSearchConfig().allowedProviders,
+): void {
+	if (!allowedProviders) return;
+	const requested = Array.isArray(selection)
+		? selection
+		: selection === "auto" || selection === "all" ? [] : [selection];
+	const disabled = requested.filter(provider => !allowedProviders.includes(provider));
+	if (disabled.length > 0) {
+		throw new Error(`${label} ${disabled.length === 1 ? `references disabled provider "${disabled[0]}"` : `references disabled providers: ${disabled.join(", ")}`}; allowed by webSearch.allowedProviders: ${allowedProviders.join(", ")}`);
+	}
+}
+
+export function getAllowedSearchProviders(): readonly ResolvedSearchProvider[] {
+	return getSearchConfig().allowedProviders ?? RESOLVED_SEARCH_PROVIDERS;
+}
+
 export function normalizeSearchProviderSelection(value: unknown, label = "provider"): SearchProviderSelection {
 	if (Array.isArray(value)) return normalizeResolvedProviderList(value, label);
 	const normalized = typeof value === "string" ? value.trim().toLowerCase() : "";
@@ -230,20 +276,10 @@ function isAbortError(err: unknown): boolean {
 	return errorMessage(err).toLowerCase().includes("abort");
 }
 
-function shouldTryOpenAIInAuto(options: SearchOptions): boolean {
-	if (options.recencyFilter) return false;
-	if (typeof options.numResults === "number" && Number.isFinite(options.numResults) && Math.floor(options.numResults) !== 5) {
-		return false;
-	}
-	return true;
-}
-
-function isOpenAICodexSelected(ctx?: ExtensionContext): boolean {
-	return ctx?.model?.provider === "openai-codex";
-}
-
+// Upstream v0.33+: OpenAI search honours numResults and recencyFilter itself
+// (instructions + result slicing + alpha `recency`), so AUTO no longer skips it
+// for those options. The old fork gate would have fallen through to Exa.
 async function tryOpenAIInAuto(query: string, options: FullSearchOptions, fallback: AutoFallback): Promise<AttributedSearchResponse | null> {
-	if (!shouldTryOpenAIInAuto(options)) return null;
 	try {
 		if (await isOpenAISearchAvailable(options.extensionContext)) {
 			return nonEmptyOrThrow(await searchWithOpenAI(query, options, options.extensionContext), "openai");
@@ -344,6 +380,8 @@ function classifyProviderError(provider: ResolvedSearchProvider, err: unknown): 
 		kind = "credential";
 	} else if (isAbortError(err)) {
 		kind = "aborted";
+	} else if (err instanceof OpenAIAlphaSearchUnsupportedError) {
+		kind = "unsupported";
 	} else if (provider === "xai" && status === 403 && /spending[- ]limit|(?:no|out of) credits?|insufficient quota|quota (?:exceeded|exhausted)|credits? (?:exhausted|depleted|used up)/.test(lower)) {
 		kind = "quota";
 	} else if (status === 401 || status === 403) {
@@ -352,7 +390,7 @@ function classifyProviderError(provider: ResolvedSearchProvider, err: unknown): 
 		kind = "unsupported";
 	} else if (status === 400 || status === 422) {
 		kind = "invalid-request";
-	} else if (status === 402 || status === 429) {
+	} else if (status === 402 || status === 429 || (provider === "tavily" && status === 432)) {
 		kind = "quota";
 	} else if (status !== undefined && (status === 408 || status === 425 || status >= 500)) {
 		kind = "transient";
@@ -379,7 +417,7 @@ async function searchWithResolvedProvider(
 	query: string,
 	options: FullSearchOptions,
 	useCurrentModel = false,
-): Promise<AttributedSearchResponse> {
+): Promise<ProviderSearchResponse> {
 	if (provider === "openai") {
 		const result = useCurrentModel
 			? await searchWithCurrentModelOpenAI(query, options, options.extensionContext)
@@ -394,6 +432,7 @@ async function searchWithResolvedProvider(
 	if (provider === "searchinfinity") return { ...(await searchWithSearchinfinity(query, options)), provider };
 	if (provider === "querit") return { ...(await searchWithQuerit(query, options)), provider };
 	if (provider === "tavily") return { ...(await searchWithTavily(query, options)), provider };
+	if (provider === "you") return { ...(await searchWithYou(query, options)), provider };
 	if (provider === "firecrawl") return { ...(await searchWithFirecrawl(query, options)), provider };
 	if (provider === "jina") return { ...(await searchWithJina(query, options)), provider };
 	if (provider === "serpdive") return { ...(await searchWithSerpdive(query, options)), provider };
@@ -405,7 +444,11 @@ async function searchWithResolvedProvider(
 	if (provider === "mistral") return { ...(await searchWithMistral(query, options)), provider };
 	if (provider === "brightdata") return { ...(await searchWithBrightData(query, options)), provider };
 	if (provider === "serpbase") return { ...(await searchWithSerpBase(query, options)), provider };
+	if (provider === "serpapi") return { ...(await searchWithSerpApi(query, options)), provider };
 	if (provider === "serper") return { ...(await searchWithSerper(query, options)), provider };
+	if (provider === "serply") return { ...(await searchWithSerply(query, options)), provider };
+	if (provider === "baizhi") return { ...(await searchWithBaizhi(query, options)), provider };
+	if (provider === "zai") return { ...(await searchWithZai(query, options)), provider };
 	if (provider === "valyu") return { ...(await searchWithValyu(query, options)), provider };
 	if (provider === "xcrawl") return { ...(await searchWithXCrawl(query, options)), provider };
 	if (provider === "perplexity") return { ...(await searchWithPerplexity(query, options)), provider };
@@ -442,6 +485,7 @@ async function isResolvedProviderAvailable(provider: ResolvedSearchProvider, opt
 	if (provider === "searchinfinity") return isSearchinfinityAvailable();
 	if (provider === "querit") return isQueritAvailable();
 	if (provider === "tavily") return isTavilyAvailable();
+	if (provider === "you") return isYouAvailable();
 	if (provider === "firecrawl") return isFirecrawlAvailable();
 	if (provider === "jina") return isJinaSearchAvailable();
 	if (provider === "serpdive") return isSerpdiveAvailable();
@@ -453,7 +497,11 @@ async function isResolvedProviderAvailable(provider: ResolvedSearchProvider, opt
 	if (provider === "mistral") return isMistralAvailable();
 	if (provider === "brightdata") return isBrightDataAvailable();
 	if (provider === "serpbase") return isSerpBaseAvailable();
+	if (provider === "serpapi") return isSerpApiAvailable();
 	if (provider === "serper") return isSerperAvailable();
+	if (provider === "serply") return isSerplyAvailable();
+	if (provider === "baizhi") return isBaizhiAvailable();
+	if (provider === "zai") return isZaiAvailable();
 	if (provider === "valyu") return isValyuAvailable();
 	if (provider === "xcrawl") return isXcrawlAvailable();
 	if (provider === "perplexity") return isPerplexityAvailable();
@@ -472,7 +520,7 @@ async function isGeminiWebOptionallyAvailable(): Promise<boolean> {
 	}
 }
 
-function providerLabel(provider: ResolvedSearchProvider): string {
+export function providerLabel(provider: ResolvedSearchProvider): string {
 	if (provider === "openai") return "OpenAI";
 	if (provider === "parallel-mcp") return "Parallel MCP";
 	if (provider === "tinyfish") return "TinyFish";
@@ -492,7 +540,12 @@ function providerLabel(provider: ResolvedSearchProvider): string {
 	if (provider === "mistral") return "Mistral";
 	if (provider === "brightdata") return "Bright Data";
 	if (provider === "serpbase") return "SerpBase";
+	if (provider === "serpapi") return "SerpApi";
 	if (provider === "serper") return "Serper";
+	if (provider === "serply") return "Serply";
+	if (provider === "you") return "You.com";
+	if (provider === "baizhi") return "Baizhi";
+	if (provider === "zai") return "Z.ai";
 	if (provider === "valyu") return "Valyu";
 	return provider.charAt(0).toUpperCase() + provider.slice(1);
 }
@@ -501,7 +554,7 @@ async function searchWithAllProvider(
 	provider: ResolvedSearchProvider,
 	query: string,
 	options: FullSearchOptions,
-): Promise<AttributedSearchResponse> {
+): Promise<ProviderSearchResponse> {
 	if (provider !== "gemini") return searchWithResolvedProvider(provider, query, options);
 	const result = await searchWithGeminiApi(query, options);
 	if (result) return { ...result, provider };
@@ -513,14 +566,15 @@ async function searchWithProviders(
 	options: FullSearchOptions,
 	selectedProviders?: ResolvedSearchProvider[],
 ): Promise<AttributedSearchResponse> {
-	const providers = selectedProviders ?? (await Promise.all(ALL_SEARCH_PROVIDERS.map(async (provider) => ({
+	const allowed = getAllowedSearchProviders();
+	const providers = selectedProviders ?? (await Promise.all(ALL_SEARCH_PROVIDERS.filter(provider => allowed.includes(provider)).map(async (provider) => ({
 		provider,
 		available: provider === "gemini"
 			? isGeminiApiAvailable()
 			: await isResolvedProviderAvailable(provider, options),
 	})))).filter((entry) => entry.available).map((entry) => entry.provider);
 	if (providers.length === 0) {
-		throw new Error("No configured search provider available for provider \"all\". Parallel MCP, DuckDuckGo, Kimi, AnySearch, xAI, Mistral, Bright Data, SerpBase, Serper, Valyu, and XCrawl are excluded.");
+		throw new Error("No configured search provider available for provider \"all\". Parallel MCP, DuckDuckGo, Kimi, AnySearch, xAI, Mistral, Bright Data, SerpBase, SerpApi, Serper, Serply, You.com, Valyu, Baizhi, Z.ai, and XCrawl are excluded.");
 	}
 
 	const settled = await Promise.allSettled(
@@ -530,7 +584,7 @@ async function searchWithProviders(
 	);
 	if (options.signal?.aborted) throw new Error("Aborted");
 
-	const successes: AttributedSearchResponse[] = [];
+	const successes: ProviderSearchResponse[] = [];
 	const failures: Array<{ provider: ResolvedSearchProvider; error: string }> = [];
 	for (let index = 0; index < settled.length; index++) {
 		const outcome = settled[index];
@@ -563,7 +617,7 @@ async function searchWithProviders(
 	}
 
 	const answerSections = successes.map((response) =>
-		`## ${providerLabel(response.provider as ResolvedSearchProvider)}\n\n${response.answer || "(No answer text returned.)"}`
+		`## ${providerLabel(response.provider)}\n\n${response.answer || "(No answer text returned.)"}`
 	);
 	if (failures.length > 0) {
 		answerSections.push(
@@ -575,7 +629,7 @@ async function searchWithProviders(
 		provider: "all",
 		answer: answerSections.join("\n\n"),
 		results,
-		providerResponses: successes as ProviderSearchResponse[],
+		providerResponses: successes,
 		...(failures.length > 0 ? { providerErrors: failures } : {}),
 		...(inlineContent.length > 0 ? { inlineContent } : {}),
 	};
@@ -611,6 +665,7 @@ export async function search(query: string, options: FullSearchOptions = {}): Pr
 	const provider = options.provider === undefined || options.provider === "auto"
 		? config.searchProvider
 		: options.provider;
+	assertSearchProviderSelectionAllowed(provider, "Requested provider");
 	if (Array.isArray(provider)) {
 		return searchWithProviders(query, options, normalizeResolvedProviderList(provider, "provider"));
 	}
@@ -623,8 +678,9 @@ export async function search(query: string, options: FullSearchOptions = {}): Pr
 	// See EmptyResultError / nonEmptyOrThrow: every provider below is wrapped so an
 	// HTTP-200-but-empty answer continues the chain instead of ending it.
 	const fallback = new AutoFallback();
+	const allowed = new Set(config.allowedProviders ?? RESOLVED_SEARCH_PROVIDERS);
 
-	if (isSearXNGAvailable()) {
+	if (allowed.has("searxng") && isSearXNGAvailable()) {
 		try {
 			return nonEmptyOrThrow(await searchWithSearXNG(query, options), "searxng");
 		} catch (err) {
@@ -634,13 +690,13 @@ export async function search(query: string, options: FullSearchOptions = {}): Pr
 	}
 
 	let triedOpenAI = false;
-	if (!options.extensionContext || isOpenAICodexSelected(options.extensionContext)) {
+	if (allowed.has("openai") && (!options.extensionContext || isOpenAISubscriptionModelSelected(options.extensionContext))) {
 		triedOpenAI = true;
 		const result = await tryOpenAIInAuto(query, options, fallback);
 		if (result) return result;
 	}
 
-	if (isExaAvailable()) {
+	if (allowed.has("exa") && isExaAvailable()) {
 		try {
 			return nonEmptyOrThrow(await searchWithExa(query, options), "exa");
 		} catch (err) {
@@ -649,12 +705,12 @@ export async function search(query: string, options: FullSearchOptions = {}): Pr
 		}
 	}
 
-	if (!triedOpenAI) {
+	if (allowed.has("openai") && !triedOpenAI) {
 		const result = await tryOpenAIInAuto(query, options, fallback);
 		if (result) return result;
 	}
 
-	if (isBraveAvailable()) {
+	if (allowed.has("brave") && isBraveAvailable()) {
 		try {
 			return nonEmptyOrThrow(await searchWithBrave(query, options), "brave");
 		} catch (err) {
@@ -663,7 +719,7 @@ export async function search(query: string, options: FullSearchOptions = {}): Pr
 		}
 	}
 
-	if (isParallelAvailable()) {
+	if (allowed.has("parallel") && isParallelAvailable()) {
 		try {
 			return nonEmptyOrThrow(await searchWithParallel(query, options), "parallel");
 		} catch (err) {
@@ -672,7 +728,7 @@ export async function search(query: string, options: FullSearchOptions = {}): Pr
 		}
 	}
 
-	if (isTinyFishAvailable()) {
+	if (allowed.has("tinyfish") && isTinyFishAvailable()) {
 		try {
 			return nonEmptyOrThrow(await searchWithTinyFish(query, options), "tinyfish");
 		} catch (err) {
@@ -681,7 +737,7 @@ export async function search(query: string, options: FullSearchOptions = {}): Pr
 		}
 	}
 
-	if (isSearch1APIAvailable()) {
+	if (allowed.has("search1api") && isSearch1APIAvailable()) {
 		try {
 			return nonEmptyOrThrow(await searchWithSearch1API(query, options), "search1api");
 		} catch (err) {
@@ -690,7 +746,7 @@ export async function search(query: string, options: FullSearchOptions = {}): Pr
 		}
 	}
 
-	if (isSearchinfinityAvailable()) {
+	if (allowed.has("searchinfinity") && isSearchinfinityAvailable()) {
 		try {
 			return nonEmptyOrThrow(await searchWithSearchinfinity(query, options), "searchinfinity");
 		} catch (err) {
@@ -699,7 +755,7 @@ export async function search(query: string, options: FullSearchOptions = {}): Pr
 		}
 	}
 
-	if (isQueritAvailable()) {
+	if (allowed.has("querit") && isQueritAvailable()) {
 		try {
 			return nonEmptyOrThrow(await searchWithQuerit(query, options), "querit");
 		} catch (err) {
@@ -708,7 +764,7 @@ export async function search(query: string, options: FullSearchOptions = {}): Pr
 		}
 	}
 
-	if (isTavilyAvailable()) {
+	if (allowed.has("tavily") && isTavilyAvailable()) {
 		try {
 			return nonEmptyOrThrow(await searchWithTavily(query, options), "tavily");
 		} catch (err) {
@@ -717,7 +773,7 @@ export async function search(query: string, options: FullSearchOptions = {}): Pr
 		}
 	}
 
-	if (isFirecrawlAvailable()) {
+	if (allowed.has("firecrawl") && isFirecrawlAvailable()) {
 		try {
 			return nonEmptyOrThrow(await searchWithFirecrawl(query, options), "firecrawl");
 		} catch (err) {
@@ -726,7 +782,7 @@ export async function search(query: string, options: FullSearchOptions = {}): Pr
 		}
 	}
 
-	if (isJinaSearchAvailable()) {
+	if (allowed.has("jina") && isJinaSearchAvailable()) {
 		try {
 			return nonEmptyOrThrow(await searchWithJina(query, options), "jina");
 		} catch (err) {
@@ -735,7 +791,7 @@ export async function search(query: string, options: FullSearchOptions = {}): Pr
 		}
 	}
 
-	if (isSerpdiveAvailable()) {
+	if (allowed.has("serpdive") && isSerpdiveAvailable()) {
 		try {
 			return nonEmptyOrThrow(await searchWithSerpdive(query, options), "serpdive");
 		} catch (err) {
@@ -744,7 +800,7 @@ export async function search(query: string, options: FullSearchOptions = {}): Pr
 		}
 	}
 
-	if (isKagiAvailable()) {
+	if (allowed.has("kagi") && isKagiAvailable()) {
 		try {
 			return nonEmptyOrThrow(await searchWithKagi(query, options), "kagi");
 		} catch (err) {
@@ -753,7 +809,7 @@ export async function search(query: string, options: FullSearchOptions = {}): Pr
 		}
 	}
 
-	if (isBochaAvailable()) {
+	if (allowed.has("bocha") && isBochaAvailable()) {
 		try {
 			return nonEmptyOrThrow(await searchWithBocha(query, options), "bocha");
 		} catch (err) {
@@ -762,7 +818,7 @@ export async function search(query: string, options: FullSearchOptions = {}): Pr
 		}
 	}
 
-	if (isOllamaAvailable()) {
+	if (allowed.has("ollama") && isOllamaAvailable()) {
 		try {
 			return nonEmptyOrThrow(await searchWithOllama(query, options), "ollama");
 		} catch (err) {
@@ -771,7 +827,7 @@ export async function search(query: string, options: FullSearchOptions = {}): Pr
 		}
 	}
 
-	if (isPerplexityAvailable()) {
+	if (allowed.has("perplexity") && isPerplexityAvailable()) {
 		try {
 			return nonEmptyOrThrow(await searchWithPerplexity(query, options), "perplexity");
 		} catch (err) {
@@ -780,7 +836,7 @@ export async function search(query: string, options: FullSearchOptions = {}): Pr
 		}
 	}
 
-	try {
+	if (allowed.has("gemini")) try {
 		return nonEmptyOrThrow(await searchWithGemini(query, options, false), "gemini");
 	} catch (err) {
 		if (isAbortError(err)) throw err;
@@ -803,7 +859,7 @@ export async function search(query: string, options: FullSearchOptions = {}): Pr
 		"  3. Set OPENAI_API_KEY, BRAVE_API_KEY, PARALLEL_API_KEY, TINYFISH_API_KEY, SEARCH1API_KEY, SEARCHINFINITY_API_KEY, QUERIT_API_KEY, TAVILY_API_KEY, FIRECRAWL_BASE_URL, JINA_API_KEY, SERPDIVE_API_KEY, KAGI_API_KEY, BOCHA_API_KEY, OLLAMA_API_KEY, SEARXNG_BASE_URL, EXA_API_KEY, PERPLEXITY_API_KEY, GEMINI_API_KEY, or CLOUDFLARE_API_KEY env vars\n" +
 		"  4. Set GOOGLE_GEMINI_BASE_URL with CLOUDFLARE_API_KEY for Cloudflare AI Gateway routing\n" +
 		"  5. Sign into gemini.google.com in a supported Chromium-based browser\n" +
-		"  6. Explicitly select provider: \"anysearch\" for anonymous AnySearch, \"xcrawl\" for XCrawl, \"xai\" for Grok, \"mistral\" for Mistral Conversations web search, \"brightdata\" with brightdataSerpZone for paid Bright Data SERP, \"serpbase\" or \"serper\" for Google SERP, or \"valyu\" for research search"
+		"  6. Explicitly select provider: \"anysearch\" for anonymous AnySearch, \"xcrawl\" for XCrawl, \"xai\" for Grok, \"mistral\" for Mistral Conversations web search, \"brightdata\" with brightdataSerpZone for paid Bright Data SERP, \"serpbase\", \"serpapi\", \"serper\", or \"serply\" for Google SERP, \"you\" for You.com, \"zai\" for Z.ai GLM Coding Plan search, or \"valyu\" for research search"
 	);
 }
 

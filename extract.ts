@@ -1,8 +1,5 @@
 import { existsSync, readFileSync } from "node:fs";
-import { Readability } from "@mozilla/readability";
-import { resizeImage } from "@earendil-works/pi-coding-agent";
-import { parseHTML } from "linkedom";
-import TurndownService from "turndown";
+import type TurndownService from "turndown";
 import pLimit from "p-limit";
 import { activityMonitor } from "./activity.ts";
 import { extractRSCContent } from "./rsc-extract.ts";
@@ -20,6 +17,7 @@ import { extractWithQuerit, isQueritAvailable } from "./querit.ts";
 import { extractWithKagi, isKagiExtractAvailable } from "./kagi.ts";
 import { extractWithOllama, isOllamaFetchAvailable } from "./ollama.ts";
 import { extractWithFirecrawl, isFirecrawlAvailable } from "./firecrawl.ts";
+import { extractWithCrawl4ai, isCrawl4aiAvailable } from "./crawl4ai.ts";
 import { extractWithBrightDataUnlocker, isBrightDataUnlockerAvailable } from "./brightdata-unlocker.ts";
 import { isVideoFile, extractVideo, extractVideoFrame, getLocalVideoDuration } from "./video-extract.ts";
 import { appendDeclaredWebLinks, discoverDeclaredWebLinks, type DeclaredWebLink } from "./declared-web-links.ts";
@@ -70,10 +68,10 @@ function loadFetchTimeoutMs(): number {
 const NON_RECOVERABLE_ERRORS = ["Unsupported content type", "Response too large", "PDF extraction is disabled", "Image fetching is disabled"];
 const MIN_USEFUL_CONTENT = 500;
 const SUPPORTED_IMAGE_TYPES = new Set(["image/png", "image/jpeg", "image/webp", "image/gif"]);
-const FETCH_PROVIDERS = ["http", "firecrawl", "jina", "tinyfish", "search1api", "querit", "kagi", "ollama", "parallel", "parallel-mcp", "brightdata", "gemini"] as const;
+const FETCH_PROVIDERS = ["http", "firecrawl", "crawl4ai", "jina", "tinyfish", "search1api", "querit", "kagi", "ollama", "parallel", "parallel-mcp", "brightdata", "gemini"] as const;
 type FetchProvider = typeof FETCH_PROVIDERS[number];
 type FetchRouting = { providers: FetchProvider[]; allowRemoteHostedProviders: boolean };
-const DEFAULT_FETCH_PROVIDER_ORDER: FetchProvider[] = ["http", "firecrawl", "jina", "tinyfish", "search1api", "querit", "kagi", "ollama", "parallel", "brightdata", "gemini"];
+const DEFAULT_FETCH_PROVIDER_ORDER: FetchProvider[] = ["http", "firecrawl", "crawl4ai", "jina", "tinyfish", "search1api", "querit", "kagi", "ollama", "parallel", "brightdata", "gemini"];
 const REMOTE_HOSTED_FETCH_PROVIDERS = new Set<FetchProvider>(["jina", "tinyfish", "search1api", "querit", "kagi", "ollama", "parallel", "parallel-mcp", "brightdata", "gemini"]);
 
 function isDefuddleConsoleError(args: Parameters<typeof console.error>): boolean {
@@ -83,6 +81,7 @@ function isDefuddleConsoleError(args: Parameters<typeof console.error>): boolean
 
 async function extractWithDefuddle(text: string, url: string): Promise<{ title: string; content: string } | null> {
 	const { Defuddle } = await import("defuddle/node");
+	const { parseHTML } = await import("linkedom");
 	const { document } = parseHTML(text);
 	Object.defineProperty(document, "location", {
 		value: new URL(url),
@@ -135,6 +134,10 @@ function isAbortError(err: unknown): boolean {
 	return errorMessage(err).toLowerCase().includes("abort");
 }
 
+function isAbortException(err: unknown): boolean {
+	return err instanceof DOMException && (err.name === "AbortError" || err.name === "TimeoutError");
+}
+
 function isRedirectPolicyError(message: string): boolean {
 	return message.startsWith("Authenticated fetch refused cross-origin redirect") ||
 		message.startsWith("Blocked internal ") ||
@@ -170,13 +173,14 @@ const REDIRECT_STATUSES = new Set([301, 302, 303, 307, 308]);
 async function fetchAuthenticatedRemoteUrl(
 	url: string,
 	init: RequestInit,
-	validationOptions: { ssrf: SsrfConfig; domainPolicy: DomainPolicy; lookup?: Lookup },
+	validationOptions: { ssrf: SsrfConfig; domainPolicy: DomainPolicy; lookup?: Lookup; proxy?: string },
 	profile: AuthFetchProfile,
 ): Promise<Response> {
 	let current = await validateRemoteUrl(url, {
 		allowRanges: validationOptions.ssrf.allowRanges,
 		trustEnvProxy: validationOptions.ssrf.trustEnvProxy,
 		domainPolicy: validationOptions.domainPolicy,
+		proxy: validationOptions.proxy,
 		...(validationOptions.lookup ? { lookup: validationOptions.lookup } : {}),
 	});
 	let requestInit = init;
@@ -193,6 +197,7 @@ async function fetchAuthenticatedRemoteUrl(
 			allowRanges: validationOptions.ssrf.allowRanges,
 			trustEnvProxy: validationOptions.ssrf.trustEnvProxy,
 			domainPolicy: validationOptions.domainPolicy,
+			proxy: validationOptions.proxy,
 			...(validationOptions.lookup ? { lookup: validationOptions.lookup } : {}),
 		});
 		authFetchRedirectGuard(profile, from, current);
@@ -284,14 +289,38 @@ function notFoundGuidance(result: ExtractedContent, toolNames?: RegisteredToolNa
 	return lines.join("\n");
 }
 
+
+/** Fallback-list hint for the keyless Jina Reader. Returns null when Jina
+ * already ran for this fetch, and otherwise names only the config change still
+ * missing, so users keep their existing or default provider order. */
+function jinaReaderGuidance(routing: FetchRouting, providerOrder: FetchProvider[], needsRemoteOptIn: boolean): string | null {
+	if (providerOrder.includes("jina")) return null;
+	const privacy = "target URLs are fetched through Jina's infrastructure";
+	const optInCaveat = "this also allows the other hosted providers in your fetch provider order";
+	if (routing.providers.includes("jina")) {
+		return `  • Enable the keyless Jina Reader fallback: set fetchRouting.allowRemoteHostedProviders to true in ${WEB_SEARCH_CONFIG_PATH} (Jina is already in your fetch provider order; ${optInCaveat}; ${privacy})`;
+	}
+	return needsRemoteOptIn
+		? `  • Enable the keyless Jina Reader fallback: add "jina" to your existing fetchRouting.providers and set fetchRouting.allowRemoteHostedProviders to true in ${WEB_SEARCH_CONFIG_PATH} (${optInCaveat}; ${privacy})`
+		: `  • Enable the keyless Jina Reader fallback: add "jina" to your existing fetchRouting.providers in ${WEB_SEARCH_CONFIG_PATH} (${privacy})`;
+}
 function abortedResult(url: string): ExtractedContent {
 	return { url, title: "", content: "", error: "Aborted" };
 }
 
-const turndown = new TurndownService({
-	headingStyle: "atx",
-	codeBlockStyle: "fenced",
-});
+// Share first-use initialization without loading Turndown at extension startup.
+let turndownInstance: Promise<TurndownService> | undefined;
+async function loadTurndown(): Promise<TurndownService> {
+	const { default: TurndownService } = await import("turndown");
+	return new TurndownService({
+		headingStyle: "atx",
+		codeBlockStyle: "fenced",
+	});
+}
+function getTurndown(): Promise<TurndownService> {
+	turndownInstance ??= loadTurndown();
+	return turndownInstance;
+}
 
 const fetchLimit = pLimit(CONCURRENT_LIMIT);
 
@@ -329,7 +358,7 @@ export interface ExtractOptions {
 	answerModel?: string;
 	authFetchProfile?: AuthFetchProfile;
 	toolNames?: RegisteredToolNames;
-	/** Optional http(s) proxy URL; routed through the curl-backed transport. */
+	/** Optional HTTP(S) or SOCKS proxy URL; routed through the curl-backed transport. */
 	proxy?: string;
 	/** Custom DNS resolver used for SSRF validation. Primarily a test seam. */
 	lookup?: Lookup;
@@ -515,6 +544,7 @@ export async function extractContent(
 				allowRanges: ssrf.allowRanges,
 				trustEnvProxy: ssrf.trustEnvProxy,
 				domainPolicy,
+				proxy: options?.proxy,
 				...(options?.lookup ? { lookup: options.lookup } : {}),
 			});
 		} catch (err) {
@@ -788,6 +818,7 @@ export async function extractContent(
 	};
 
 	let firecrawlError: string | null = null;
+	let crawl4aiError: string | null = null;
 	let tinyfishError: string | null = null;
 	let search1apiError: string | null = null;
 	let queritError: string | null = null;
@@ -826,6 +857,25 @@ export async function extractContent(
 				if (isAbortError(err)) return abortedResult(url);
 				firecrawlError = errorMessage(err);
 				if (isConfigParseError(err)) return parseErrorResult(firecrawlError);
+			}
+			continue;
+		}
+
+		if (provider === "crawl4ai") {
+			try {
+				if (isCrawl4aiAvailable()) {
+					const ssrf = loadSsrfConfig();
+					const crawl4aiResult = await extractWithCrawl4ai(url, signal, {
+						timeoutMs: options?.timeoutMs,
+						...(options?.lookup ? { lookup: options.lookup } : {}),
+						ssrf,
+					});
+					if (crawl4aiResult) return withDeclaredLinks(crawl4aiResult);
+				}
+			} catch (err) {
+				if (signal?.aborted || isAbortException(err)) return abortedResult(url);
+				crawl4aiError = errorMessage(err);
+				if (isConfigParseError(err)) return parseErrorResult(crawl4aiError);
 			}
 			continue;
 		}
@@ -988,9 +1038,11 @@ export async function extractContent(
 	}
 
 	const searchToolName = options?.toolNames?.webSearch;
+	const jinaHint = jinaReaderGuidance(fetchRouting, providerOrder, Boolean(remoteUrl) && !fetchRouting.allowRemoteHostedProviders);
 	const guidance = [
 		finalHttpResult?.error ?? "No fetch_content provider returned content",
 		...(firecrawlError ? [`Firecrawl fallback failed: ${firecrawlError}`] : []),
+		...(crawl4aiError ? [`Crawl4AI fallback failed: ${crawl4aiError}`] : []),
 		...(tinyfishError ? [`TinyFish fallback failed: ${tinyfishError}`] : []),
 		...(search1apiError ? [`Search1API fallback failed: ${search1apiError}`] : []),
 		...(queritError ? [`Querit fallback failed: ${queritError}`] : []),
@@ -1001,7 +1053,9 @@ export async function extractContent(
 		...(brightdataError ? [`Bright Data fallback failed: ${brightdataError}`] : []),
 		"",
 		"Fallback options:",
+		...(jinaHint ? [jinaHint] : []),
 		`  • Set firecrawlBaseUrl in ${WEB_SEARCH_CONFIG_PATH} to a self-hosted Firecrawl instance`,
+		`  • Set crawl4aiBaseUrl in ${WEB_SEARCH_CONFIG_PATH} to a self-hosted Crawl4AI instance`,
 		`  • Set tinyfishApiKey in ${WEB_SEARCH_CONFIG_PATH} or TINYFISH_API_KEY`,
 		`  • Set search1apiApiKey in ${WEB_SEARCH_CONFIG_PATH} or SEARCH1API_KEY`,
 		`  • Set queritApiKey in ${WEB_SEARCH_CONFIG_PATH} or QUERIT_API_KEY`,
@@ -1014,6 +1068,18 @@ export async function extractContent(
 		...(searchToolName ? [`  • Use ${searchToolName} to find content about this topic`] : []),
 	].join("\n");
 	return { ...(finalHttpResult ?? { url, title: "", content: "", error: null }), error: guidance };
+}
+
+// Cloudflare interstitials served with HTTP 200. The header is authoritative for
+// any text response; the body check is HTML-only and needs both challenge-platform
+// markers so a generic "Just a moment..." page never matches.
+function isCloudflareChallenge(response: Response, text: string, isHTML: boolean): boolean {
+	if (response.status !== 200) return false;
+	if (response.headers.get("cf-mitigated") === "challenge") return true;
+	return isHTML &&
+		/<title>\s*Just a moment\.\.\.\s*<\/title>/i.test(text) &&
+		text.includes("window._cf_chl_opt") &&
+		text.includes("/cdn-cgi/challenge-platform/");
 }
 
 function isLikelyJSRendered(html: string): boolean {
@@ -1118,6 +1184,7 @@ async function extractViaHttp(
 	const activityId = activityMonitor.logStart({ type: "fetch", url });
 
 	const controller = new AbortController();
+	const startedAt = Date.now();
 	const timeoutId = setTimeout(() => controller.abort(), timeoutMs);
 
 	const onAbort = () => controller.abort();
@@ -1127,7 +1194,6 @@ async function extractViaHttp(
 		const ssrf = loadSsrfConfig();
 		const domainPolicy = loadFetchContentDomainPolicy();
 		const authProfile = options?.authFetchProfile;
-		const trustEnvProxy = options?.proxy === undefined && ssrf.trustEnvProxy;
 		const requestInit: ProxiedRequestInit = {
 			signal: controller.signal,
 			__proxy: options?.proxy,
@@ -1144,14 +1210,15 @@ async function extractViaHttp(
 			},
 		};
 		const response = authProfile
-			? await fetchAuthenticatedRemoteUrl(url, requestInit, { ssrf: { ...ssrf, trustEnvProxy }, domainPolicy, ...(options?.lookup ? { lookup: options.lookup } : {}) }, authProfile)
+			? await fetchAuthenticatedRemoteUrl(url, requestInit, { ssrf, domainPolicy, proxy: options?.proxy, ...(options?.lookup ? { lookup: options.lookup } : {}) }, authProfile)
 			: await fetchRemoteUrl(
 				url,
 				requestInit,
 				{
 					allowRanges: ssrf.allowRanges,
-					trustEnvProxy,
+					trustEnvProxy: ssrf.trustEnvProxy,
 					domainPolicy,
+					proxy: options?.proxy,
 					...(options?.lookup ? { lookup: options.lookup } : {}),
 				},
 			);
@@ -1210,6 +1277,7 @@ async function extractViaHttp(
 			}
 			try {
 				const buffer = await readResponseBufferWithLimit(response, maxResponseSize, () => responseSizeLimitError(maxResponseSize));
+				const { resizeImage } = await import("@earendil-works/pi-coding-agent");
 				const resized = await resizeImage(new Uint8Array(buffer), mimeType, { maxWidth: 2000, maxHeight: 2000 });
 				activityMonitor.logComplete(activityId, response.status);
 				if (!resized) return { url, title: "", content: "", error: `Could not decode image: ${mimeType}`, mimeType, status: response.status };
@@ -1239,7 +1307,9 @@ async function extractViaHttp(
 				return {
 					url,
 					title: result.title,
-					content: `PDF extracted and saved to: ${result.outputPath}\n\nPages: ${result.pages}\nCharacters: ${result.chars}`,
+					content: options?.mode === "answer"
+						? result.content
+						: `PDF extracted and saved to: ${result.outputPath}\n\nPages: ${result.pages}\nCharacters: ${result.chars}`,
 					error: null,
 				};
 			} catch (err) {
@@ -1272,12 +1342,18 @@ async function extractViaHttp(
 		const text = await readTextResponseWithLimit(response, maxResponseSize);
 		const isHTML = contentType.includes("text/html") || contentType.includes("application/xhtml+xml");
 
+		if (isCloudflareChallenge(response, text, isHTML)) {
+			activityMonitor.logComplete(activityId, response.status);
+			return { url, title: "", content: "", error: `HTTP ${response.status}: Blocked by Cloudflare challenge page`, status: response.status };
+		}
+
 		if (!isHTML) {
 			activityMonitor.logComplete(activityId, response.status);
 			const title = extractTextTitle(text, url);
 			return { url, title, content: text, error: null };
 		}
 
+		const { parseHTML } = await import("linkedom");
 		const { document } = parseHTML(text);
 		const documentTitle = document.title?.trim() ?? "";
 		const declaredLinks = discoverDeclaredWebLinks(
@@ -1285,6 +1361,7 @@ async function extractViaHttp(
 			response.headers.get("link"),
 			response.url || url,
 		);
+		const { Readability } = await import("@mozilla/readability");
 		const reader = new Readability(document as unknown as Document);
 		const article = reader.parse();
 
@@ -1332,7 +1409,7 @@ async function extractViaHttp(
 		if (typeof article.content !== "string") {
 			throw new Error("Readability returned invalid article content");
 		}
-		const markdown = turndown.turndown(article.content);
+		const markdown = (await getTurndown()).turndown(article.content);
 		activityMonitor.logComplete(activityId, response.status);
 
 		if (markdown.length < MIN_USEFUL_CONTENT) {
@@ -1387,6 +1464,13 @@ async function extractViaHttp(
 	} finally {
 		clearTimeout(timeoutId);
 		signal?.removeEventListener("abort", onAbort);
+		// Imports and CPU-bound processing need not observe the fetch signal, and
+		// can finish before an expired timer gets a turn. Guard every exit, with
+		// caller cancellation taking precedence over the internal deadline.
+		if (signal?.aborted) return abortedResult(url);
+		if (controller.signal.aborted || Date.now() - startedAt >= timeoutMs) {
+			return { url, title: "", content: "", error: "The operation was aborted." };
+		}
 	}
 }
 

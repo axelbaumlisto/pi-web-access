@@ -1,5 +1,8 @@
 import { existsSync, readFileSync } from "node:fs";
 import { activityMonitor } from "./activity.ts";
+import { BraveRateLimitCoordinator } from "./brave-rate-limit.ts";
+import { normalizeDomain } from "./domain-filter-normalization.ts";
+import { normalizeSearchResultCount } from "./search-result-count-normalization.ts";
 import type { SearchOptions, SearchResult, SearchResponse } from "./perplexity.ts";
 import { redactCredential } from "./credential-source.ts";
 import { fetchWithCredentialRedirects, getWebSearchConfigPath } from "./utils.ts";
@@ -7,10 +10,41 @@ import { providerHasCredential, providerUrl, resolveProviderKey } from "./provid
 import { redactError, redactProviderError } from "./redact.ts";
 const CONFIG_PATH = getWebSearchConfigPath();
 const SEARCH_TIMEOUT_MS = 30_000;
+const braveRateLimit = new BraveRateLimitCoordinator();
 
 interface WebSearchConfig {
 	braveApiKey?: unknown;
 	braveBaseUrl?: unknown;
+}
+
+// Fork: Brave returns HTML in titles/snippets; strip tags and decode entities.
+function stripHtml(s: string): string {
+	const namedEntities: Record<string, string> = {
+		"&amp;": "&",
+		"&lt;": "<",
+		"&gt;": ">",
+		"&quot;": "\"",
+		"&#39;": "'",
+		"&#x27;": "'",
+		"&nbsp;": " ",
+	};
+
+	return s
+		.replace(/<[^>]+>/g, "")
+		.replace(/&(?:amp|lt|gt|quot|nbsp|#39|#x27);|&#\d+;|&#x[0-9a-f]+;/gi, (entity) => {
+			const named = namedEntities[entity.toLowerCase()];
+			if (named !== undefined) return named;
+
+			const radix = entity.slice(0, 3).toLowerCase() === "&#x" ? 16 : 10;
+			const value = Number.parseInt(entity.slice(radix === 16 ? 3 : 2, -1), radix);
+			try {
+				return String.fromCodePoint(value);
+			} catch {
+				return entity;
+			}
+		})
+		.replace(/[ \t]{2,}/g, " ")
+		.trim();
 }
 
 interface NormalizedDomainFilters {
@@ -52,55 +86,6 @@ async function getApiKey(signal?: AbortSignal): Promise<string | null> {
 // /v1/brave/search route under proxy); only query params are appended here.
 function getApiUrl(): string {
 	return providerUrl("brave");
-}
-
-function normalizeCount(value: number | undefined): number {
-	if (typeof value !== "number" || !Number.isFinite(value)) return 5;
-	return Math.max(1, Math.min(Math.floor(value), 20));
-}
-
-function stripHtml(s: string): string {
-	const namedEntities: Record<string, string> = {
-		"&amp;": "&",
-		"&lt;": "<",
-		"&gt;": ">",
-		"&quot;": "\"",
-		"&#39;": "'",
-		"&#x27;": "'",
-		"&nbsp;": " ",
-	};
-
-	return s
-		.replace(/<[^>]+>/g, "")
-		.replace(/&(?:amp|lt|gt|quot|nbsp|#39|#x27);|&#\d+;|&#x[0-9a-f]+;/gi, (entity) => {
-			const named = namedEntities[entity.toLowerCase()];
-			if (named !== undefined) return named;
-
-			const radix = entity.slice(0, 3).toLowerCase() === "&#x" ? 16 : 10;
-			const value = Number.parseInt(entity.slice(radix === 16 ? 3 : 2, -1), radix);
-			try {
-				return String.fromCodePoint(value);
-			} catch {
-				return entity;
-			}
-		})
-		.replace(/[ \t]{2,}/g, " ")
-		.trim();
-}
-
-function normalizeDomain(value: string): string | null {
-	let input = value.trim().toLowerCase();
-	if (!input) return null;
-	if (input.startsWith("-")) input = input.slice(1).trim();
-	if (!input) return null;
-	try {
-		const parsed = input.includes("://") ? new URL(input) : new URL(`https://${input}`);
-		input = parsed.hostname;
-	} catch {
-		input = input.split("/")[0]?.split(":")[0] ?? "";
-	}
-	input = input.replace(/^\.+|\.+$/g, "");
-	return /^[a-z0-9][a-z0-9.-]*\.[a-z]{2,}$/i.test(input) ? input : null;
 }
 
 function normalizeDomainFilters(domainFilter: string[] | undefined): NormalizedDomainFilters {
@@ -177,7 +162,7 @@ export async function searchWithBrave(
 		);
 	}
 
-	const numResults = normalizeCount(options.numResults);
+	const numResults = normalizeSearchResultCount(options.numResults);
 	const domainFilters = normalizeDomainFilters(options.domainFilter);
 	const searchQuery = buildBraveQuery(query, options.domainFilter);
 	const activityId = activityMonitor.logStart({ type: "api", query: searchQuery });
@@ -198,17 +183,32 @@ export async function searchWithBrave(
 	}
 
 	try {
-		const response = await fetchWithCredentialRedirects(`${apiUrl}?${params.toString()}`, {
-			method: "GET",
-			headers: {
-				"X-Subscription-Token": apiKey,
-				"Accept": "application/json",
-				"Accept-Encoding": "gzip",
-			},
-			signal: options.signal
-				? AbortSignal.any([AbortSignal.timeout(SEARCH_TIMEOUT_MS), options.signal])
-				: AbortSignal.timeout(SEARCH_TIMEOUT_MS),
-		}, ["X-Subscription-Token"]);
+		const searchDeadline = AbortSignal.timeout(SEARCH_TIMEOUT_MS);
+		const searchSignal = options.signal
+			? AbortSignal.any([searchDeadline, options.signal])
+			: searchDeadline;
+		const response = await braveRateLimit.run(async () => {
+			for (let attempt = 0; attempt < 2; attempt++) {
+				const current = await fetchWithCredentialRedirects(`${apiUrl}?${params.toString()}`, {
+					method: "GET",
+					headers: {
+						"X-Subscription-Token": apiKey,
+						"Accept": "application/json",
+						"Accept-Encoding": "gzip",
+					},
+					signal: searchSignal,
+				}, ["X-Subscription-Token"]);
+
+				braveRateLimit.observe(current.headers);
+				if (current.status !== 429 || attempt === 1) return current;
+				const retryDelay = braveRateLimit.retryDelay(current.headers);
+				if (retryDelay === null) return current;
+				braveRateLimit.recordRetryDelay(retryDelay);
+				await current.body?.cancel().catch(() => undefined);
+				await braveRateLimit.waitForRecordedCooldown(searchSignal);
+			}
+			throw new Error("Brave Search retry loop exited unexpectedly");
+		}, searchSignal);
 
 		if (!response.ok) {
 			activityMonitor.logError(activityId, `HTTP ${response.status}`);

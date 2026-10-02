@@ -4,6 +4,36 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+## [pi-ext-int-search 1.4.0] - 2026-10-02 (fork release)
+
+### Changed
+- **Synced with upstream v0.35.0** (76 commits since our v0.28.0 base). Inherited: Z.ai GLM and You.com search
+  providers, Crawl4AI self-hosted extraction, `web_enable` lazy tool activation (`toolActivation: auto | dynamic |
+  eager`), Brave adaptive rate-limit queue, Tavily 20-key pool with failover, `summaryInstructions`, Cloudflare
+  challenge fallback for fetches, Exa `/search` for every keyed request, OpenAI `openaiUseProviderBaseUrl` and
+  ChatGPT-OAuth routing to the official Responses API, and a precompiled `dist/` for published installs.
+
+### Fork deltas preserved through the merge
+- **Destination-first key binding** survives upstream's new OpenAI auth paths: model-registry credentials still reach
+  only OpenAI-owned origins — or the user's own provider `baseUrl` when `openaiUseProviderBaseUrl` opts in — and a
+  JWT-shaped proxy key is still never redirected to `chatgpt.com`.
+- **Unified proxy mode**: Tavily's new numbered key pool (`TAVILY_API_KEY_1…20`) is disabled for a proxied Tavily
+  destination, so vendor keys never leak to a gateway that has its own bound credential.
+- `redactProviderError` (bounded + pattern-redacted upstream error bodies) reapplied to the rewritten Tavily and
+  OpenAI request paths; Brave keeps the fork's HTML-entity `stripHtml` for titles and snippets.
+- AUTO-mode empty-result fallback (`EmptyResultError` / `AutoFallback`) now composes with upstream's
+  `allowedProviders` gating instead of being replaced by it.
+- `memory_search` keeps its own registration gate and renamable tool name alongside upstream's `web_enable`; the
+  tool-definition compatibility hashes for the four shared tools still match upstream byte for byte. Because
+  `memory_search` searches local history only, it is registered up front instead of waiting behind the activation
+  loader, so the dormant-schema budgets are raised from 700 B / 11 924 B to 2 600 B / 13 900 B.
+
+### Note
+- The test suite now needs **Node 24+** (upstream CI's version). On Node 22 the ten upstream `brave-rate-limit`
+  tests fail with `Promise resolution is still pending but the event loop has already resolved` — verified
+  identical on a pristine upstream checkout, so it is a runtime artifact, not a fork regression. Full suite on
+  Node 25: **1122/1122**.
+
 ## [pi-ext-int-search 1.3.2] - 2026-10-02 (fork release)
 
 ### Fixed
@@ -115,6 +145,185 @@ search routing, fetch-content domain policy, configurable tool names).
   packaging.
 - Made `source_check` tests hermetic (they no longer pick up the developer's
   real `~/.pi/web-search.json`).
+### Fixed
+
+- `web_search` accepts `provider`, `queries`, and `domainFilter` arrays that a model sent as a JSON string, such as `provider: "[\"parallel-mcp\"]"`. They failed schema validation before the search ran. Thanks to [@advaitpaliwal](https://github.com/advaitpaliwal) for [PR #491](https://github.com/nicobailon/pi-web-access/pull/491).
+
+## [0.35.0] - 2026-09-30
+
+### Highlights
+
+- Tell the summarizer what matters to you, such as keeping prices, limits, and versions exactly as written.
+- Brave search holds up on low-rate plans instead of failing when several searches run at once.
+- OpenAI web search works when you signed in to Pi with your ChatGPT account.
+
+### Added
+
+- Add your own instructions to search summaries with `summaryInstructions` in `web-search.json`, for example "keep prices, limits, and versions verbatim." They apply to summaries from the curator and the `auto-summary` workflow, and the built-in safety rules still apply. Thanks to [@rcharrisg](https://github.com/rcharrisg) for [PR #489](https://github.com/nicobailon/pi-web-access/pull/489).
+
+### Fixed
+
+- Brave searches now wait their turn according to the rate limits Brave reports, so running several searches at once no longer overruns low-rate plans. If Brave says to slow down and the wait is short, the search retries once. If the wait is long, it fails right away and later searches respect the same wait. The 30-second search timeout includes this waiting. Thanks to [@saschaSpoonbill](https://github.com/saschaSpoonbill) for [PR #487](https://github.com/nicobailon/pi-web-access/pull/487).
+- OpenAI web search now works when you signed in to Pi with "Sign in with ChatGPT" on the `openai` provider. Searches go to OpenAI's official API, and `auto` search tries OpenAI first for this login, as it already did for `openai-codex`. With an `openai` API key, `auto` still tries Exa first. Thanks to [@kasumikira](https://github.com/kasumikira) for [issue #488](https://github.com/nicobailon/pi-web-access/issues/488).
+
+## [0.34.0] - 2026-09-30
+
+### Highlights
+
+- Turning on web tools no longer costs a prompt-cache miss on models like DeepSeek. New sessions now pick the activation style that suits the model.
+- Search with Z.ai's GLM Coding Plan and use your plan quota instead of paying per call.
+- `fetch_content` now gets past Cloudflare "Just a moment..." pages by handing off to your other fetch providers.
+- Fetching works on networks where only your configured proxy can resolve hostnames.
+- `undici` is updated to pick up fixes for known security advisories.
+
+### Added
+
+- Search with Z.ai's GLM Coding Plan web search when you select `provider: "zai"`. Set `ZAI_API_KEY` or `zaiApiKey` to your plan key, and set `zaiEndpoint: "china"` if your key comes from bigmodel.cn. Searches use your plan quota instead of per-call billing. Thanks to [@nailuoGG](https://github.com/nailuoGG) for [issue #475](https://github.com/nicobailon/pi-web-access/issues/475) and for live-testing the China endpoint in [issue #479](https://github.com/nicobailon/pi-web-access/issues/479).
+
+### Changed
+
+- `toolActivation` now defaults to `"auto"`. On models that can take tools added mid-conversation, new sessions start with `web_enable` as before. On other models, such as DeepSeek, every enabled web tool is available from the first request, so turning them on no longer makes Pi resend the whole conversation and miss the prompt cache. Set `"dynamic"` to always start with `web_enable`, or `"eager"` to never use it. Resumed sessions keep the tools they already had. The README's Tool activation section explains the trade-off. Thanks to [@tinoy1336](https://github.com/tinoy1336) for [issue #484](https://github.com/nicobailon/pi-web-access/issues/484) and [@jordi9](https://github.com/jordi9) for [issue #481](https://github.com/nicobailon/pi-web-access/issues/481).
+- Keyed Exa searches with default options or `numResults: 5` now call Exa's `/search` endpoint instead of `/answer`, like every other keyed Exa search. Their answer text now comes from the search results instead of Exa's generated answer. If you route Exa through a custom `exaBaseUrl` gateway, it must support `/search`. Thanks to [@SuTang-vain](https://github.com/SuTang-vain) for [issue #470](https://github.com/nicobailon/pi-web-access/issues/470).
+- When `fetch_content` can't get a page, its list of fallback options now explains how to turn on the keyless Jina Reader fallback. It names only the setting you still need and keeps your current or default provider order. The hint doesn't appear if Jina already ran for that fetch, and it warns that Jina's servers fetch the target URLs. Thanks to [@SuTang-vain](https://github.com/SuTang-vain) for [PR #471](https://github.com/nicobailon/pi-web-access/pull/471).
+
+### Fixed
+
+- `fetch_content` now treats a Cloudflare "Just a moment..." challenge page returned with HTTP 200 as a failed fetch, so your configured fallback providers can retrieve the real page. Detection needs Cloudflare's `cf-mitigated: challenge` header or its challenge-page scripts, so a page that only says "Just a moment..." is unaffected. Raw mode still returns the response unchanged, and authenticated fetches report the challenge without falling back to other providers. Thanks to [@SuTang-vain](https://github.com/SuTang-vain) for [issue #472](https://github.com/nicobailon/pi-web-access/issues/472).
+- With `ssrf.trustEnvProxy: true`, the `proxy` configured in `web-search.json` now resolves hostnames for web tools instead of your local DNS, so `fetch_content` works where only the proxy can resolve names. A per-call `proxy` with a different value is still checked against local DNS. When local resolution fails for a request going through the configured proxy, the error now names this setting. Thanks to [@ChenAuCarre](https://github.com/ChenAuCarre) for [issue #476](https://github.com/nicobailon/pi-web-access/issues/476).
+- Exa results without a title are now labeled with their site's hostname, such as `cdn.jsdelivr.net`, instead of `Source N`. Results whose URL has no hostname, such as `mailto:` or `file:` links, still use `Source N`. Thanks to [@SuTang-vain](https://github.com/SuTang-vain) for [PR #469](https://github.com/nicobailon/pi-web-access/pull/469).
+- `undici` is updated to 8.11.2. Earlier 8.x releases, including the 8.10.0 this package previously installed, have known security advisories such as decompression denial of service and a TLS certificate validation bypass. Thanks to [@setanta00](https://github.com/setanta00) for [issue #483](https://github.com/nicobailon/pi-web-access/issues/483).
+
+## [0.33.0] - 2026-09-27
+
+### Highlights
+
+- Keep every web tool available from the first message with `"toolActivation": "eager"`, for models that rarely call `web_enable` on their own.
+- Search with You.com when you select it explicitly.
+- Give each Pi process its own fetched-page cache so parallel sessions stop evicting each other's pages.
+- Model allowlists in `enabledModels` or `--models` now work with every pattern Pi accepts.
+- Resumed older sessions keep the tools they had instead of gaining `web_enable`.
+
+### Added
+
+- Set `"toolActivation": "eager"` in `web-search.json` to skip `web_enable` and keep every enabled web tool available from the first message. With the default `"dynamic"` setting, `web_enable` now tells the model to call it first whenever current, external, or linked information could help. Thanks to [@ackalker](https://github.com/ackalker) for [issue #458](https://github.com/nicobailon/pi-web-access/issues/458).
+- Set `PI_WEB_ACCESS_CACHE_ROOT` to a directory to give a Pi process its own fetched-page cache. The cache goes in a `web-search-cache` folder inside that directory, and `web-search.json` stays where it is. Parallel sessions then stop evicting each other's cached pages. Thanks to [@goodman-b](https://github.com/goodman-b) for [issue #457](https://github.com/nicobailon/pi-web-access/issues/457).
+- You.com is available as an optional search provider. Set `youApiKey` or `YDC_API_KEY`, then select `provider: "you"`, add it to a provider list, or list it in `searchRouting`. It also appears in the Curator. `auto` and `provider: "all"` never pick it. Thanks to [@mouse-value-add](https://github.com/mouse-value-add) for [PR #461](https://github.com/nicobailon/pi-web-access/pull/461).
+
+### Fixed
+
+- Resuming a session that never had `web_enable`, for example one started before pi-web-access was installed or upgraded, no longer adds it partway through the conversation. The session keeps the tools it already had. Thanks to [@nilsoskar](https://github.com/nilsoskar) for [issue #462](https://github.com/nicobailon/pi-web-access/issues/462).
+- Answer mode, query rewrite, and summaries now follow the model list Pi builds from `enabledModels` or `--models`, so every pattern Pi accepts works here too, including patterns such as `@(!(openai-codex))/*` and partial names such as `sonnet`. Before, an allowlist made of those patterns blocked every model. Thanks to [@IdrisGit](https://github.com/IdrisGit) for [issue #463](https://github.com/nicobailon/pi-web-access/issues/463) and [PR #464](https://github.com/nicobailon/pi-web-access/pull/464).
+- `web_enable` now depends on the version of Pi you are running, not an older Pi package that may be installed next to the extension, so those setups no longer lose it. It needs Pi 0.86.0 or newer. On older Pi, every enabled web tool stays available from the start. Thanks to [@PhrZer](https://github.com/PhrZer) for [PR #456](https://github.com/nicobailon/pi-web-access/pull/456) and [@nguyenchiencong](https://github.com/nguyenchiencong) for [issue #444](https://github.com/nicobailon/pi-web-access/issues/444).
+
+## [0.32.0] - 2026-09-26
+
+### Highlights
+
+- Spread Tavily searches across up to 20 API keys, with automatic failover when one runs out of quota.
+- Use Gemini Web browser cookies on KDE Linux, where Chrome keeps its password in KWallet.
+- Search with OpenAI through OpenCode and `opencode-go` without session errors or the wrong model.
+- See full search queries and URLs in tool-call labels.
+- Globally installed Pi no longer shows false version or duplicate TypeBox warnings.
+
+### Added
+
+- Tavily can use a pool of up to 20 API keys. Set `TAVILY_API_KEY_1` through `TAVILY_API_KEY_20`, and when a key hits a quota or auth error the search moves on to the next one. `TAVILY_API_KEY_INDEX` picks the key to try first, and `TAVILY_API_KEY` / `tavilyApiKey` is tried last. Thanks to [@apoapostolov](https://github.com/apoapostolov) for [PR #430](https://github.com/nicobailon/pi-web-access/pull/430).
+
+### Fixed
+
+- On KDE Linux, Chrome and Chromium cookies for Gemini Web now decrypt with the password stored in KWallet when Secret Service doesn't have it. Thanks to [@dianzuan](https://github.com/dianzuan) for [issue #436](https://github.com/nicobailon/pi-web-access/issues/436).
+- OpenAI search requests to `opencode.ai` now include OpenCode's session headers, fixing `400 MissingSessionID` errors. Other destinations never receive these headers. Thanks to [@juliocc](https://github.com/juliocc) for [PR #445](https://github.com/nicobailon/pi-web-access/pull/445).
+- When `openaiSearchModel` isn't set, OpenAI search through gateways such as `opencode-go` now picks the newest GPT model instead of a non-OpenAI model.
+- Globally installed Pi no longer shows a false "requires Pi 0.86.1 or newer" warning, and dynamic tool activation now works there. Thanks to [@samsimsom](https://github.com/samsimsom) for [issue #428](https://github.com/nicobailon/pi-web-access/issues/428).
+- TypeBox now comes from Pi instead of being installed separately, which avoids duplicate copies and Pi startup warnings. Thanks to [@ksreenivasan](https://github.com/ksreenivasan) for [issue #442](https://github.com/nicobailon/pi-web-access/issues/442) and [PR #443](https://github.com/nicobailon/pi-web-access/pull/443).
+- Tool-call labels show full search queries and fetch URLs when the terminal is wide enough, instead of cutting them off at 60 characters. Thanks to [@TheBestPessimist](https://github.com/TheBestPessimist) for [issue #440](https://github.com/nicobailon/pi-web-access/issues/440).
+
+## [0.31.0] - 2026-09-22
+
+### Highlights
+
+- Start fresh sessions with a smaller web-tool list, then enable the tools when you need them.
+- Keep long search responses manageable without losing access to the full results.
+- Search with Baizhi MCP when you explicitly configure it.
+- Connect Brave, Exa, and Tavily to local HTTP services on loopback addresses.
+
+### Added
+
+- Fresh sessions now show `web_enable` instead of the full web-tool list when supported. Call it to make your configured web tools available. Thanks to [@Knimoms](https://github.com/Knimoms) for [PR #424](https://github.com/nicobailon/pi-web-access/pull/424).
+- Added Baizhi MCP as an optional search provider, with search routing and Curator support. It is used only when explicitly selected. Thanks to [@ct-jaryn](https://github.com/ct-jaryn) for [PR #422](https://github.com/nicobailon/pi-web-access/pull/422).
+
+### Changed
+
+- Long `web_search` responses now show a shorter result and the providers used. Full results remain available through `get_search_content`. Thanks to [@theSprog](https://github.com/theSprog) for [issue #423](https://github.com/nicobailon/pi-web-access/issues/423).
+
+### Fixed
+
+- Allow explicitly configured Brave, Exa, and Tavily API base URLs to use HTTP on true loopback hosts while continuing to require HTTPS remotely. Thanks to [@aaschmid](https://github.com/aaschmid) for [issue #421](https://github.com/nicobailon/pi-web-access/issues/421).
+
+## [0.30.0] - 2026-09-19
+
+### Highlights
+
+- Start installed copies of Pi Web Access much faster with a precompiled bundle.
+- Use standalone OpenAI search or reuse an existing Pi provider URL without duplicating gateway configuration.
+- Control which search providers and fetch modes are available.
+- Search Google through the new explicit Serply provider.
+- Get more reliable proxy handling, OpenCode requests, PDF answers, source checks, and stored-content retrieval.
+
+### Added
+
+- Added opt-in `openaiUseProviderBaseUrl` to reuse a selected Pi provider's URL and credentials for OpenAI search. An explicit `openaiResponsesUrl` still takes precedence.
+- Added opt-in `openaiUseAlphaSearch` for standalone OpenAI search, with source limits, recency filtering, allowed-domain filtering, and normal provider fallback. Existing Responses search remains the default. Thanks to [@ZacharyQin](https://github.com/ZacharyQin) for [PR #420](https://github.com/nicobailon/pi-web-access/pull/420).
+- Added `fetch.defaultMode` and `fetch.allowedModes` for choosing the default `fetch_content` mode and disabling unwanted modes. Thanks to [@Slooz](https://github.com/Slooz) for #395.
+- Added `webSearch.allowedProviders` to restrict providers consistently across search, source checks, routing, aggregation, schemas, and Curator. Thanks to [@Slooz](https://github.com/Slooz) for #396.
+- Added an explicit-only Serply Google Search provider with domain filtering, recency filtering, routing, and Curator support. Configure it with `serplyApiKey` or `SERPLY_API_KEY`. Thanks to Serply vendor [@googio](https://github.com/googio) for PR #386.
+
+### Changed
+
+- Published packages now load a precompiled bundle for faster startup, while source checkouts continue loading TypeScript directly. Thanks to [@Yisus423](https://github.com/Yisus423) for [issue #418](https://github.com/nicobailon/pi-web-access/issues/418) and [PR #419](https://github.com/nicobailon/pi-web-access/pull/419).
+- Fresh installs now use the silent `none` web search workflow by default. Explicit and configured Curator or summary workflows are unchanged. Thanks to [@ducaoya](https://github.com/ducaoya) for issue #416.
+
+### Fixed
+
+- Preserve legacy `~/.pi/web-search.json` configuration when `~/.pi/agent/web-search.json` is absent in default environments without `XDG_CONFIG_HOME`. Thanks to [@fancyboi999](https://github.com/fancyboi999) for issue #411.
+- List Crawl4AI in the README provider summary and the package description, which both still omitted it after the provider shipped in 0.29.0. Thanks to [@bergheim](https://github.com/bergheim) for [PR #382](https://github.com/nicobailon/pi-web-access/pull/382).
+- Removed the unconditional global `fetch` replacement during extension initialization; proxy transport is now installed lazily when a proxied web-tool operation runs. Thanks to [@AdrianJ20](https://github.com/AdrianJ20) for [issue #388](https://github.com/nicobailon/pi-web-access/issues/388).
+- Send OpenCode session attribution headers when generating summaries, preventing configured `opencode` and `opencode-go` summary models from silently falling through to another candidate. Thanks to [@damozhang](https://github.com/damozhang) for issue #385.
+- Send the `x-opencode-session` / `x-opencode-client` attribution headers when `fetch_content` answer mode uses an `opencode` or `opencode-go` model. The answer path dispatches through the model registry, which bypasses the attribution headers Pi merges in the main agent loop, so those requests were rejected with `400 MissingSessionID`. Thanks to [@MrSerious0](https://github.com/MrSerious0) for PR #381.
+- Pass extracted PDF Markdown to `fetch_content` answer mode instead of the saved-file notice, while preserving readable-mode file output and stored-content retrieval. Thanks to [@MDGChamomile](https://github.com/MDGChamomile) for PR #390.
+- Prevent malformed `fetch_content` auth, mode, or proxy parameters from breaking tool-call rendering while preserving strict execution validation. Thanks to [@tekumara](https://github.com/tekumara) for issue #387.
+- Clarified that a negative `fetch_content` answer-mode result means the answer was not found in the extracted content, rather than asserting that it is absent from the whole page. Thanks to [@Slooz](https://github.com/Slooz) for issue #394.
+- Stop inferring claim support or contradiction from unrelated lexical markers in `source_check`; retrieved passages now require manual semantic review. Thanks to [@wayenchan](https://github.com/wayenchan) for issue #383.
+- Return bounded `get_search_content` excerpts instead of dropping oversized merged match ranges, using compact query IDs to reserve representative ranges when discovered spans fit the output budget. Thanks to [@MDGChamomile](https://github.com/MDGChamomile) for PR #391.
+
+## [0.29.0] - 2026-09-10
+
+### Highlights
+
+- Search Google through SerpApi with domain and recency filters.
+- Use a self-hosted Crawl4AI instance as an extraction fallback.
+- Connect through SOCKS proxies and resolve credentials with 1Password service accounts.
+- Start Pi faster through on-demand loading of extraction and AI features.
+- Get more reliable provider fallback, credential routing, caching, and config discovery.
+
+### Added
+
+- Added a Curator action that approves the current summary and uses auto-summary for later default-workflow searches in the same prompt run. The choice is not saved between prompts. Thanks to [@thomak-dev](https://github.com/thomak-dev) for issue #376.
+- Added a self-hosted Crawl4AI extraction fallback for `fetch_content`, configured with `crawl4aiBaseUrl` / `CRAWL4AI_BASE_URL` and `crawl4aiApiToken` / `CRAWL4AI_API_TOKEN`. It runs after Firecrawl and before hosted providers, and can be selected with `crawl4ai` in `fetchRouting.providers`. Thanks to [@bergheim](https://github.com/bergheim) for [PR #375](https://github.com/nicobailon/pi-web-access/pull/375).
+- Added an explicit SerpApi Google Search provider with `serpapiApiKey` / `SERPAPI_KEY`, domain and recency filters, search routing, and Curator support. Thanks to [@tanysheng](https://github.com/tanysheng) for PR #363.
+- Added SOCKS4, SOCKS4A, SOCKS5, and SOCKS5H proxy support in config and per-call overrides. Thanks to [@phillipzink](https://github.com/phillipzink) for PR #365.
+- Added 1Password service-account support for credential resolver commands through `OP_SERVICE_ACCOUNT_TOKEN`. Thanks to PR author [@Avg8888](https://github.com/Avg8888) and commit author [@xapids](https://github.com/xapids) for [PR #364](https://github.com/nicobailon/pi-web-access/pull/364).
+
+### Changed
+
+- Load extraction and AI features only when first used, reducing extension startup time. Thanks to [@ducaoya](https://github.com/ducaoya) for PR #366.
+
+### Fixed
+
+- Treat Tavily monthly plan exhaustion as a quota error so search routing can fall back to another provider. Thanks to [@simbel](https://github.com/simbel) for issue #378.
+- Refuse to send Pi-resolved OpenAI credentials to the official Responses endpoint when they belong to a provider with a custom `baseUrl`. Configure `openaiResponsesUrl` explicitly to search through a gateway. Thanks to [@projectkite](https://github.com/projectkite) for issue #367.
+- Remove expired fetched content from memory when pruning the cache, while preserving the retrieval window and session history. Thanks to [@MDGChamomile](https://github.com/MDGChamomile) for issue #362.
+- Use Pi's agent directory (`~/.pi/agent/web-search.json`) for the default web-search config instead of falling back to the legacy `~/.pi/web-search.json`. Existing `PI_CODING_AGENT_DIR` and XDG behavior is unchanged. Thanks to [@lJoublanc](https://github.com/lJoublanc) for issue #360.
 
 ## [0.28.0] - 2026-09-04
 

@@ -43,7 +43,12 @@ function buildProviderButtons(
 		{ value: "mistral", label: "Mistral", available: available.mistral },
 		{ value: "brightdata", label: "Bright Data", available: available.brightdata },
 		{ value: "serpbase", label: "SerpBase", available: available.serpbase },
+		{ value: "serpapi", label: "SerpApi", available: available.serpapi },
 		{ value: "serper", label: "Serper", available: available.serper },
+		{ value: "serply", label: "Serply", available: available.serply },
+		{ value: "you", label: "You.com", available: available.you },
+		{ value: "baizhi", label: "Baizhi", available: available.baizhi },
+		{ value: "zai", label: "Z.ai", available: available.zai },
 		{ value: "valyu", label: "Valyu", available: available.valyu },
 	];
 
@@ -149,6 +154,7 @@ ${CSS}
 <button class="btn btn-secondary" id="btn-summary-regenerate">Regenerate</button>
 <button class="btn btn-secondary" id="btn-summary-preview" title="Preview rendered summary">Preview</button>
 <button class="btn btn-submit" id="btn-summary-approve">Approve</button>
+<button class="btn btn-submit" id="btn-summary-approve-remaining">Approve + auto-summary remaining searches for this prompt</button>
 </div>
 </section>
 </main>
@@ -1197,6 +1203,7 @@ main {
 }
 .summary-actions {
   display: flex;
+  flex-wrap: wrap;
   align-items: center;
   justify-content: flex-end;
   gap: 8px;
@@ -1469,7 +1476,7 @@ const SCRIPT = `(function() {
   var token = DATA.sessionToken;
   var timeoutSec = DATA.timeout;
   var queries = Array.isArray(DATA.queries) ? DATA.queries : [];
-  var providers = ["all", "openai", "exa", "brave", "parallel", "parallel-mcp", "tinyfish", "search1api", "searchinfinity", "querit", "tavily", "firecrawl", "jina", "serpdive", "kagi", "bocha", "ollama", "searxng", "duckduckgo", "perplexity", "gemini", "kimi", "anysearch", "xcrawl", "xai", "mistral", "brightdata", "serpbase", "serper", "valyu"];
+  var providers = ["auto", "all", "openai", "exa", "brave", "parallel", "parallel-mcp", "tinyfish", "search1api", "searchinfinity", "querit", "tavily", "firecrawl", "jina", "serpdive", "kagi", "bocha", "ollama", "searxng", "duckduckgo", "perplexity", "gemini", "kimi", "anysearch", "xcrawl", "xai", "mistral", "brightdata", "serpbase", "serpapi", "serper", "serply", "valyu", "baizhi", "you", "zai"];
   var availProviders = DATA.availableProviders && typeof DATA.availableProviders === "object" ? DATA.availableProviders : {};
   var workflow = "summary-review";
   var initialDefaultProvider = typeof DATA.defaultProvider === "string" ? DATA.defaultProvider : "exa";
@@ -1534,6 +1541,7 @@ const SCRIPT = `(function() {
   var btnSummaryRegenerate = document.getElementById("btn-summary-regenerate");
   var btnSummaryPreview = document.getElementById("btn-summary-preview");
   var btnSummaryApprove = document.getElementById("btn-summary-approve");
+  var btnSummaryApproveRemaining = document.getElementById("btn-summary-approve-remaining");
   var successOverlay = document.getElementById("success-overlay");
   var successText = document.getElementById("success-text");
   var expiredOverlay = document.getElementById("expired-overlay");
@@ -1672,6 +1680,7 @@ const SCRIPT = `(function() {
   }
 
   function providerLabel(provider) {
+    if (provider === "auto") return "Auto";
     if (provider === "all") return "All";
     if (provider === "openai") return "OpenAI";
     if (provider === "brave") return "Brave";
@@ -1699,6 +1708,13 @@ const SCRIPT = `(function() {
     if (provider === "mistral") return "Mistral";
     if (provider === "brightdata") return "Bright Data";
     if (provider === "serpbase") return "SerpBase";
+    if (provider === "serpapi") return "SerpApi";
+    if (provider === "serper") return "Serper";
+    if (provider === "serply") return "Serply";
+    if (provider === "you") return "You.com";
+    if (provider === "baizhi") return "Baizhi";
+    if (provider === "zai") return "Z.ai";
+    if (provider === "valyu") return "Valyu";
     return "Unknown";
   }
 
@@ -2113,6 +2129,9 @@ const SCRIPT = `(function() {
     if (btnSummaryPreview) btnSummaryPreview.disabled = !hasDraft || stage === "generating-summary";
     if (btnSummaryApprove) {
       btnSummaryApprove.disabled = submitted || timerExpired || submitInFlight || stage === "generating-summary" || isRegenerating || !hasSelection || !hasDraft;
+    }
+    if (btnSummaryApproveRemaining) {
+      btnSummaryApproveRemaining.disabled = submitted || timerExpired || submitInFlight || stage === "generating-summary" || isRegenerating || !hasSelection || !hasDraft;
     }
 
     applyProviderInterlocks();
@@ -3205,7 +3224,7 @@ const SCRIPT = `(function() {
     requestSummary(selected);
   }
 
-  function doApprove() {
+  function doApprove(autoApproveRemainingSearches) {
     if (submitted || timerExpired || submitInFlight || stage !== "summary-review") return;
 
     var selected = getSelectedIndices();
@@ -3217,6 +3236,7 @@ const SCRIPT = `(function() {
 
     var draft = getSummaryDraftText();
     var payload = { selected: selected };
+    if (autoApproveRemainingSearches === true) payload.autoApproveRemainingSearches = true;
     if (draft.length > 0) {
       payload.summary = draft;
       payload.summaryMeta = normalizeSummaryMeta(summaryMeta, summaryMeta && summaryMeta.edited === true);
@@ -3451,6 +3471,13 @@ const SCRIPT = `(function() {
   if (btnSummaryApprove) {
     btnSummaryApprove.addEventListener("click", function() {
       doApprove();
+      resetTimer();
+    });
+  }
+
+  if (btnSummaryApproveRemaining) {
+    btnSummaryApproveRemaining.addEventListener("click", function() {
+      doApprove(true);
       resetTimer();
     });
   }

@@ -1,15 +1,15 @@
-import { complete, type Api, type Model, type ProviderHeaders } from "@earendil-works/pi-ai/compat";
+import type { complete, Api, Model, ProviderHeaders } from "@earendil-works/pi-ai/compat";
 import type { SummaryGenerationContext } from "./summary-review.ts";
-import { findModelWithProviderRouting, loadEnabledModelPatterns, modelMatchesEnabledPatterns } from "./summary-model-scope.ts";
+import { awaitWithAbort } from "./abortable.ts";
+import { findModelWithProviderRouting, isModelInScope } from "./summary-model-scope.ts";
 
 async function resolveFirstAvailableModel(
 	ctx: SummaryGenerationContext,
 	candidates: Array<{ provider: string; id: string }>,
 ): Promise<{ model: Model<Api>; apiKey: string; headers?: ProviderHeaders }> {
-	const enabledModelPatterns = loadEnabledModelPatterns(ctx);
 	for (const { provider, id } of candidates) {
 		const model = findModelWithProviderRouting(ctx.modelRegistry, provider, id);
-		if (!model || !modelMatchesEnabledPatterns(model, enabledModelPatterns)) continue;
+		if (!model || !isModelInScope(model, ctx.scopedModels)) continue;
 		const auth = await ctx.modelRegistry.getApiKeyAndHeaders(model);
 		if (auth.ok && auth.apiKey) return { model, apiKey: auth.apiKey, headers: auth.headers };
 	}
@@ -28,7 +28,9 @@ export async function rewriteSearchQuery(
 	]);
 	const registry = ctx.modelRegistry as typeof ctx.modelRegistry & { complete?: typeof complete };
 	const usesRegistryComplete = typeof registry.complete === "function";
-	const completeFn = usesRegistryComplete ? registry.complete!.bind(registry) : complete;
+	if (signal.aborted) throw new Error("Aborted");
+	const completeFn = usesRegistryComplete ? registry.complete!.bind(registry) : (await awaitWithAbort(import("@earendil-works/pi-ai/compat"), signal)).complete;
+	if (signal.aborted) throw new Error("Aborted");
 	const response = await completeFn(
 		model,
 		{

@@ -41,7 +41,7 @@ export interface IndexedCuratorSearchEntry extends CuratorSearchEntry {
 }
 
 export interface CuratorServerCallbacks {
-	onSubmit: (payload: { selectedQueryIndices: number[]; summary?: string; summaryMeta?: SummaryMeta; rawResults?: boolean }) => void;
+	onSubmit: (payload: { selectedQueryIndices: number[]; summary?: string; summaryMeta?: SummaryMeta; rawResults?: boolean; autoApproveRemainingSearches?: boolean }) => void;
 	onCancel: (reason: "user" | "timeout" | "stale") => void;
 	onProviderChange: (provider: string) => void;
 	onAddSearch: (query: string, provider?: string) => Promise<CuratorSearchEntry[]>;
@@ -304,6 +304,10 @@ export function startCuratorServer(
 		if (provider === "brightdata") return availableProviders.brightdata;
 		if (provider === "serpbase") return availableProviders.serpbase;
 		if (provider === "serper") return availableProviders.serper;
+		if (provider === "serply") return availableProviders.serply;
+		if (provider === "you") return availableProviders.you;
+		if (provider === "baizhi") return availableProviders.baizhi;
+		if (provider === "zai") return availableProviders.zai;
 		if (provider === "valyu") return availableProviders.valyu;
 		return false;
 	}
@@ -642,12 +646,14 @@ export function startCuratorServer(
 					return;
 				}
 				const rawResults = (body as { rawResults?: unknown }).rawResults === true;
+				const autoApproveRemainingSearches = (body as { autoApproveRemainingSearches?: unknown }).autoApproveRemainingSearches === true;
 				sendJson(res, 200, { ok: true });
 				setImmediate(() => callbacks.onSubmit({
 					selectedQueryIndices: parsed.indices,
 					...(summary !== undefined ? { summary } : {}),
 					...(summaryMeta !== undefined ? { summaryMeta } : {}),
 					rawResults,
+					...(autoApproveRemainingSearches ? { autoApproveRemainingSearches: true } : {}),
 				}));
 				return;
 			}
