@@ -10,6 +10,8 @@ import { redactError, redactProviderError } from "../redact.ts";
 const perplexityModuleUrl = new URL("../perplexity.ts", import.meta.url).href;
 const exaModuleUrl = new URL("../exa.ts", import.meta.url).href;
 const braveModuleUrl = new URL("../brave.ts", import.meta.url).href;
+const tavilyModuleUrl = new URL("../tavily.ts", import.meta.url).href;
+const openaiModuleUrl = new URL("../openai-search.ts", import.meta.url).href;
 
 const FAKE_OPENAI_KEY = `sk-proxy-${"A".repeat(32)}`;
 const FAKE_GOOGLE_KEY = `AIza${"B".repeat(32)}`;
@@ -273,4 +275,61 @@ test("Brave invalid-JSON on a 200 is redacted (HIGH 3)", async () => {
 	assert.match(output.message, /\[REDACTED\]/);
 	assert.equal(output.message.includes("sk-proxy"), false);
 	assert.equal(output.message.includes(FAKE_OPENAI_KEY), false);
+});
+
+// Regression guards for the v0.35.0 merge: upstream rewrote the Tavily and OpenAI
+// request paths (key-pool failover / alpha search), and the fork's bounded,
+// pattern-redacted upstream error bodies had to be re-applied there by hand.
+test("Tavily non-ok error body is redacted and bounded (integration)", async () => {
+	const dir = await agentDir("pi-web-access-tavily-nonok-");
+	const body = `denied ${FAKE_GOOGLE_KEY} ${"q".repeat(600)}`;
+	const script = `
+		globalThis.fetch = async () => new Response(${JSON.stringify(body)}, { status: 403 });
+		const { searchWithTavily } = await import(${JSON.stringify(tavilyModuleUrl)});
+		try {
+			await searchWithTavily("denied");
+		} catch (error) {
+			console.log(JSON.stringify({ message: error.message }));
+		}
+	`;
+	const output = parseChild(runChild(script, { PI_CODING_AGENT_DIR: dir, TAVILY_API_KEY: "tavily-test-key" }));
+	assert.match(output.message, /^Tavily API error 403: /);
+	assert.match(output.message, /\[REDACTED\]/);
+	assert.equal(output.message.includes(FAKE_GOOGLE_KEY), false);
+	assert.ok(output.message.endsWith("…"));
+});
+
+test("Tavily invalid-JSON on a 200 is redacted (HIGH 3)", async () => {
+	const dir = await agentDir("pi-web-access-tavily-badjson-");
+	const script = `
+		globalThis.fetch = async () => new Response(${JSON.stringify(`${FAKE_OPENAI_KEY} not-json`)}, { status: 200, headers: { "content-type": "application/json" } });
+		const { searchWithTavily } = await import(${JSON.stringify(tavilyModuleUrl)});
+		try {
+			await searchWithTavily("bad json");
+		} catch (error) {
+			console.log(JSON.stringify({ message: error.message }));
+		}
+	`;
+	const output = parseChild(runChild(script, { PI_CODING_AGENT_DIR: dir, TAVILY_API_KEY: "tavily-test-key" }));
+	assert.match(output.message, /^Tavily API returned invalid JSON: /);
+	assert.equal(output.message.includes(FAKE_OPENAI_KEY), false);
+});
+
+test("OpenAI non-ok error body is redacted and bounded (integration)", async () => {
+	const dir = await agentDir("pi-web-access-openai-nonok-");
+	const body = `denied ${FAKE_GOOGLE_KEY} ${"q".repeat(600)}`;
+	const script = `
+		globalThis.fetch = async () => new Response(${JSON.stringify(body)}, { status: 403 });
+		const { searchWithOpenAI } = await import(${JSON.stringify(openaiModuleUrl)});
+		try {
+			await searchWithOpenAI("denied", {});
+		} catch (error) {
+			console.log(JSON.stringify({ message: error.message }));
+		}
+	`;
+	const output = parseChild(runChild(script, { PI_CODING_AGENT_DIR: dir, OPENAI_API_KEY: "openai-test-key" }));
+	assert.match(output.message, /^OpenAI API error 403: /);
+	assert.match(output.message, /\[REDACTED\]/);
+	assert.equal(output.message.includes(FAKE_GOOGLE_KEY), false);
+	assert.ok(output.message.endsWith("…"));
 });

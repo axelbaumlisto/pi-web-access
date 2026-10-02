@@ -89,3 +89,32 @@ test("non-quota failures do not consume more pool keys", async () => {
 	assert.deepEqual(out.keys, ["key-1"]);
 	assert.match(out.error, /Tavily API error 400/);
 });
+
+// Fork invariant (regression guard for the v0.35.0 merge): keys bind to their
+// destination. When Tavily is fronted by the unified proxy, the numbered vendor
+// pool must not be tried at all — the gateway has its own bound credential.
+// Tavily has no gateway route of its own (PROVIDER_ENDPOINTS.tavily has no
+// proxyPath), so it only becomes a proxied destination when the user points
+// tavilyBaseUrl at the gateway origin by hand. That is exactly the case where the
+// numbered vendor pool would otherwise hand vendor keys to the gateway.
+test("a proxied Tavily destination ignores the numbered vendor pool and sends only the proxy key", async () => {
+	const out = await search({
+		config: { proxyBaseUrl: "https://airpx.cc", proxyApiKey: "shared-proxy-key", tavilyBaseUrl: "https://airpx.cc" },
+		env: { TAVILY_API_KEY_1: "vendor-key-1", TAVILY_API_KEY_2: "vendor-key-2", TAVILY_API_KEY: "vendor-standalone" },
+		succeedWith: "shared-proxy-key",
+	});
+	assert.equal(out.available, true);
+	assert.deepEqual(out.keys, ["shared-proxy-key"]);
+	assert.equal(out.results, 1);
+});
+
+test("a proxied Tavily destination without a proxy key is unavailable instead of falling back to vendor keys", async () => {
+	const out = await search({
+		config: { proxyBaseUrl: "https://airpx.cc", tavilyBaseUrl: "https://airpx.cc" },
+		env: { TAVILY_API_KEY_1: "vendor-key-1", TAVILY_API_KEY: "vendor-standalone" },
+		succeedWith: "never",
+	});
+	assert.equal(out.available, false);
+	assert.deepEqual(out.keys, []);
+	assert.match(out.error, /Tavily API key not found/);
+});

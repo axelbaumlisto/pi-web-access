@@ -17,8 +17,9 @@ All notable changes to this project will be documented in this file.
 - **Destination-first key binding** survives upstream's new OpenAI auth paths: model-registry credentials still reach
   only OpenAI-owned origins — or the user's own provider `baseUrl` when `openaiUseProviderBaseUrl` opts in — and a
   JWT-shaped proxy key is still never redirected to `chatgpt.com`.
-- **Unified proxy mode**: Tavily's new numbered key pool (`TAVILY_API_KEY_1…20`) is disabled for a proxied Tavily
-  destination, so vendor keys never leak to a gateway that has its own bound credential.
+- **Unified proxy mode**: Tavily's new numbered key pool (`TAVILY_API_KEY_1…20`) is disabled when the Tavily
+  destination resolves to the gateway origin — i.e. when `tavilyBaseUrl` points at it, since Tavily has no gateway
+  route of its own — so vendor keys never reach a gateway that has its own bound credential.
 - `redactProviderError` (bounded + pattern-redacted upstream error bodies) reapplied to the rewritten Tavily and
   OpenAI request paths; Brave keeps the fork's HTML-entity `stripHtml` for titles and snippets.
 - AUTO-mode empty-result fallback (`EmptyResultError` / `AutoFallback`) now composes with upstream's

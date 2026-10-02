@@ -117,3 +117,64 @@ test("proxy destination uses its shared key when no personal key exists", async 
 	assert.equal(output.registryCalls, 0);
 	assert.equal(output.available, true);
 });
+
+// Fork invariant (regression guard for the v0.35.0 merge): the chatgpt.com hop is
+// decided from isCodexJwt(apiKey), so a JWT-SHAPED key issued by a gateway must not
+// drag the request — and that gateway's key — to OpenAI's Codex backend. Before the
+// merge this was enforced at the request site; it now rides on the auth object as
+// useCodexEndpoint:false for every non-OpenAI destination.
+const JWT_SHAPED_PROXY_KEY = [
+	Buffer.from(JSON.stringify({ alg: "HS256", typ: "JWT" })).toString("base64url"),
+	Buffer.from(JSON.stringify({ "https://api.openai.com/auth": { chatgpt_account_id: "acct-from-gateway" } })).toString("base64url"),
+	"signature",
+].join(".");
+
+function inspectRequestDestination() {
+	return `
+		const requests = [];
+		globalThis.fetch = async (url, init) => {
+			requests.push({ url: String(url), authorization: new Headers(init.headers).get("authorization") });
+			return new Response(JSON.stringify({ output: [
+				{ type: "web_search_call", action: { sources: [] } },
+				{ type: "message", content: [{ type: "output_text", text: "ok" }] },
+			] }), {
+				status: 200,
+				headers: { "content-type": "application/json" },
+			});
+		};
+		const { searchWithOpenAI } = await import(${JSON.stringify(openaiModuleUrl)});
+		await searchWithOpenAI("q", {});
+		console.log(JSON.stringify({ requests }));
+	`;
+}
+
+test("a JWT-shaped gateway key stays on the gateway instead of hopping to chatgpt.com", async () => {
+	const agentDir = await makeAgentDir("pi-web-access-openai-proxy-jwt-");
+	const env = {
+		PI_CODING_AGENT_DIR: agentDir,
+		WEB_SEARCH_PROXY_URL: "https://airpx.cc",
+		WEB_SEARCH_PROXY_KEY: JWT_SHAPED_PROXY_KEY,
+	};
+
+	const auth = parseChild(runChild(inspectOpenAIAuth({ ok: false }), env));
+	assert.equal(auth.auth.apiKey, JWT_SHAPED_PROXY_KEY);
+	assert.equal(auth.destinationOrigin, "https://airpx.cc");
+	// Pinned at credential-resolution time so no later heuristic can re-enable the hop.
+	assert.equal(auth.auth.useCodexEndpoint, false);
+
+	const { requests } = parseChild(runChild(inspectRequestDestination(), env));
+	assert.equal(requests.length, 1);
+	assert.equal(new URL(requests[0].url).origin, "https://airpx.cc");
+	assert.equal(requests[0].authorization, `Bearer ${JWT_SHAPED_PROXY_KEY}`);
+});
+
+test("a JWT-shaped standalone key with no gateway still reaches only OpenAI", async () => {
+	const agentDir = await makeAgentDir("pi-web-access-openai-direct-jwt-");
+	const { requests } = parseChild(runChild(inspectRequestDestination(), {
+		PI_CODING_AGENT_DIR: agentDir,
+		OPENAI_API_KEY: JWT_SHAPED_PROXY_KEY,
+	}));
+
+	assert.equal(requests.length, 1);
+	assert.equal(new URL(requests[0].url).origin, "https://chatgpt.com");
+});
