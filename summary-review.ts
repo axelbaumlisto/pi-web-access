@@ -62,6 +62,32 @@ function estimateTokens(text: string): number {
 	return Math.max(1, Math.ceil(trimmed.length / 4));
 }
 
+/**
+ * Snippet budgets.
+ *
+ * A snippet is the only evidence when the provider returned no answer text —
+ * always the case for history matches, common for raw-result providers. When an
+ * answer IS present it already carries the substance, so snippets stay a thin
+ * corroboration: a fat prompt costs latency, and a cheap summary model then
+ * misses the generation deadline and silently degrades to the deterministic
+ * summary. Measured: a 2-query web search with full snippets overran 30 s on
+ * gemini-3.8-flash.
+ */
+const SNIPPET_BUDGETS = {
+	/** No answer text: the snippets must carry the whole story. */
+	evidence: { perSource: 600, perQuery: 12_000 },
+	/** Answer present: snippets only corroborate it. */
+	corroboration: { perSource: 200, perQuery: 3_000 },
+} as const;
+
+function clampSnippet(snippet: string, budgetLeft: number, perSource: number): string {
+	const text = snippet.replace(/\s+/g, " ").trim();
+	if (!text) return "";
+	const limit = Math.min(perSource, budgetLeft);
+	if (limit <= 0) return "";
+	return text.length <= limit ? text : `${text.slice(0, limit)}…`;
+}
+
 function summarizeQueryResult(result: QueryResultData): string {
 	if (result.error) {
 		return `Query: ${result.query}\nStatus: Error\nError: ${result.error}`;
@@ -79,9 +105,20 @@ function summarizeQueryResult(result: QueryResultData): string {
 	}
 
 	lines.push("Sources:");
+	// The snippet IS the evidence when a provider returns no answer text — which
+	// is always true for history matches, and common for raw result providers.
+	// Sending titles and URLs alone made the model report "no body text" while
+	// the answer sat in the snippets it never saw.
+	const budget = result.answer.trim() ? SNIPPET_BUDGETS.corroboration : SNIPPET_BUDGETS.evidence;
+	let budgetLeft = budget.perQuery;
 	for (let i = 0; i < result.results.length; i++) {
 		const source = result.results[i];
 		lines.push(`${i + 1}. ${source.title} — ${source.url}`);
+		const snippet = clampSnippet(source.snippet ?? "", budgetLeft, budget.perSource);
+		if (snippet) {
+			budgetLeft -= snippet.length;
+			lines.push(`   ${snippet}`);
+		}
 	}
 
 	return lines.join("\n");

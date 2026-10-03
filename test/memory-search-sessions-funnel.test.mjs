@@ -276,3 +276,63 @@ test("the deterministic fallback speaks history, not web", async () => {
 	assert.match(buildDeterministicSummary([], "history").summary, /No history matches/);
 	assert.match(buildDeterministicSummary([]).summary, /No completed search results/);
 });
+
+// --- default sources: hand-written markdown, not just chats and commits ------
+
+/** Run searchMemory in a sandboxed HOME with whatever sources the caller wants. */
+function searchDefaults(home, query, cwd, opts = "") {
+	const child = spawnSync(process.execPath, ["--experimental-strip-types", "--input-type=module"], {
+		input: `
+			const { searchMemory } = await import(${JSON.stringify(moduleUrl)});
+			const r = await searchMemory(${JSON.stringify(query)}, { cwd: ${JSON.stringify(cwd)}, limit: 20 ${opts} });
+			console.log(JSON.stringify({
+				status: r.sourceStatus,
+				hits: r.hits.map(h => ({ source: h.source, location: h.location, snippet: h.snippet })),
+			}));
+		`,
+		encoding: "utf8",
+		timeout: 120_000,
+		env: { ...process.env, HOME: home, PI_CODING_AGENT_DIR: join(home, ".pi", "agent") },
+	});
+	assert.equal(child.status, 0, child.stderr);
+	return JSON.parse(child.stdout.trim().split("\n").at(-1));
+}
+
+test("markdown is searched by default: project docs, CLAUDE.md, and the claude memory tree", () => {
+	const home = mkdtempSync(join(tmpdir(), "pi-memory-docs-default-"));
+	const project = join(home, "work", "proj");
+	mkdirSync(project, { recursive: true });
+	mkdirSync(join(home, ".claude", "memory", "entities", "decisions"), { recursive: true });
+	mkdirSync(join(home, ".pi", "agent"), { recursive: true });
+
+	writeFileSync(join(project, "README.md"), "# proj\n\nThe quokka protocol handshake is documented here.\n");
+	writeFileSync(join(project, "CLAUDE.md"), "Project rule: never deploy the quokka protocol on Friday.\n");
+	writeFileSync(join(home, ".claude", "memory", "entities", "decisions", "quokka.md"), "Decision: quokka protocol replaces the legacy ping.\n");
+	writeFileSync(join(home, ".pi", "agent", "AGENTS.md"), "Global instruction: quokka protocol needs a changelog entry.\n");
+
+	const out = searchDefaults(home, "quokka protocol", project);
+	assert.equal(out.status.docs, "ok", "docs ran without being asked for");
+	const locations = out.hits.filter((h) => h.source === "docs").map((h) => h.location);
+	for (const expected of ["README.md", "CLAUDE.md", "quokka.md", "AGENTS.md"]) {
+		assert.ok(
+			locations.some((l) => l.endsWith(expected)),
+			`${expected} is reachable by default — got ${JSON.stringify(locations)}`,
+		);
+	}
+});
+
+test("git stays opt-in while docs do not", () => {
+	const home = mkdtempSync(join(tmpdir(), "pi-memory-git-optin-"));
+	const project = join(home, "work", "proj");
+	mkdirSync(project, { recursive: true });
+	writeFileSync(join(project, "notes.md"), "the wombat migration is finished\n");
+
+	const plain = searchDefaults(home, "wombat migration", project);
+	assert.equal(plain.status.docs, "ok");
+	assert.equal(plain.status.git, undefined, "git must not run for a question that never mentions it");
+
+	const explicit = searchDefaults(home, "wombat migration", project, `, sources: ["docs"]`);
+	assert.equal(explicit.status.docs, "ok");
+	assert.equal(explicit.status.sessions, undefined, "an explicit list still narrows the search");
+	assert.equal(explicit.status.memory, undefined);
+});

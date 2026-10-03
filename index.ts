@@ -33,7 +33,7 @@ import { ALL_SEARCH_PROVIDERS, assertSearchProviderSelectionAllowed, getAllowedS
 export type { ProviderAvailability } from "./gemini-search.ts";
 import type { SearchResult } from "./perplexity.ts";
 import { formatSeconds, getWebSearchConfigDir, getWebSearchConfigPath, installGlobalProxyFetch, resolveCuratorNetworkConfig, runWithProxy } from "./utils.ts";
-import { searchMemory, parseRecency, wantsDocs, wantsGit, formatHits, hitsToQueryResults, type MemoryScope, type MemorySource } from "./memory-search.ts";
+import { searchMemory, parseRecency, wantsGit, formatHits, hitsToQueryResults, type MemoryScope, type MemorySource } from "./memory-search.ts";
 import {
 	clearResults,
 	deleteResult,
@@ -2916,7 +2916,7 @@ export default function (pi: ExtensionAPI) {
 		name: toolNames.memorySearch,
 		label: "Memory Search",
 		description:
-			"Search your OWN history instead of the web: past pi chat sessions (transcripts), stored claude-recall memories, and project markdown docs. Use when the user refers to earlier work — 'как мы делали это вчера', 'search our chat', 'what did we decide about X', 'поищи в переписке/в памяти', 'last week we...'. Ranks by keyword relevance × recency and returns snippets tagged with source (chat/memory/doc), date, and project. Defaults to the CURRENT project; set scope='all' (or when the user says 'across all projects / на этом компе') to search every project on this machine.",
+			"Search your OWN history instead of the web: past pi chat sessions (transcripts), stored claude-recall memories, and hand-written markdown — project docs, CLAUDE.md/AGENTS.md, and the ~/.claude/memory notes tree — all searched by default. Use when the user refers to earlier work — 'как мы делали это вчера', 'search our chat', 'what did we decide about X', 'поищи в переписке/в памяти', 'last week we...'. Ranks by keyword relevance × recency and returns snippets tagged with source (chat/memory/doc), date, and project. Defaults to the CURRENT project; set scope='all' (or when the user says 'across all projects / на этом компе') to search every project on this machine.",
 		promptSnippet:
 			"Use to recall prior work from chat history, saved memories, and docs (not the web). Default scope is the current project; use scope='all' for every project.",
 		parameters: Type.Object({
@@ -2928,7 +2928,7 @@ export default function (pi: ExtensionAPI) {
 			),
 			sources: Type.Optional(
 				Type.Array(StringEnum(["sessions", "memory", "docs", "git"]), {
-					description: "Which sources to search. Default = sessions + memory (chat transcripts + claude-recall). Include 'docs' (markdown) ONLY when the user asks to search documentation ('поищи в документации', 'search the docs'). Include 'git' (commit messages + diffs, expanded for top hits) ONLY when the user asks about git history ('поищи в гит истории', 'git commits', 'diffs this month' — with a time phrase it lists ALL commits in the window and expands their diffs).",
+					description: "Which sources to search. Default = sessions + memory + docs (chat transcripts, claude-recall, and markdown: project docs, CLAUDE.md/AGENTS.md, ~/.claude/memory). Pass a narrower list to restrict it. Include 'git' (commit messages + diffs, expanded for top hits) ONLY when the user asks about git history ('поищи в гит истории', 'git commits', 'diffs this month' — with a time phrase it lists ALL commits in the window and expands their diffs).",
 				}),
 			),
 			limit: Type.Optional(Type.Number({ description: "Max results (default 15)." })),
@@ -2948,22 +2948,21 @@ export default function (pi: ExtensionAPI) {
 				};
 			}
 			const scope = (params.scope as MemoryScope) ?? "current";
-			// Docs are opt-in: honor an explicit sources list, otherwise default to
-			// sessions+memory and add docs only if the query asks for documentation.
+			// Default = every cheap source that can legitimately answer a question
+			// about past work: chat transcripts, recall memories and hand-written
+			// markdown (project docs, CLAUDE.md/AGENTS.md, the claude memory tree).
+			// Git stays an ADDITIVE opt-in detected from the query — walking commits
+			// and expanding diffs is the expensive one. Exception: an explicit
+			// git-history request with a time window is a git-only intent
+			// ("все диффы за месяц").
 			let sources = params.sources as MemorySource[] | undefined;
 			if (!sources) {
-				// Default = chat + memory. docs/git are ADDITIVE opt-ins detected from
-				// the query, so a false-positive trigger never drops the base sources.
-				// Exception: an explicit git-history request with a time window is a
-				// git-only intent ("все диффы за месяц").
 				const g = wantsGit(query);
-				if (g && parseRecency(query) !== undefined) {
-					sources = ["git"];
-				} else {
-					sources = ["sessions", "memory"];
-					if (wantsDocs(query)) sources.push("docs");
-					if (g) sources.push("git");
-				}
+				sources = g && parseRecency(query) !== undefined
+					? ["git"]
+					: g
+						? ["sessions", "memory", "docs", "git"]
+						: ["sessions", "memory", "docs"];
 			}
 			const limit = typeof params.limit === "number" ? params.limit : 15;
 			const cwd = ctx?.cwd ?? process.cwd();

@@ -4,7 +4,8 @@
  * Three sources, searched on the fly (no index yet — that comes later):
  *   1. pi sessions   — ~/.pi/agent/sessions/<project>/*.jsonl  (chat transcripts)
  *   2. claude-recall — ~/.claude-recall/claude-recall.db        (stored memories)
- *   3. markdown docs — *.md under the project (and ~/.pi/agent for scope=all)
+ *   3. markdown docs — *.md under the project, plus ~/.claude/memory and
+ *      ~/.pi/agent (CLAUDE.md / AGENTS.md / notes); ~/work too for scope=all
  *
  * Scope:
  *   - "current" (default): the current project only. Sessions are the folder
@@ -69,6 +70,21 @@ const SESSIONS_ROOT = join(homedir(), ".pi", "agent", "sessions");
 const RECALL_DB = join(homedir(), ".claude-recall", "claude-recall.db");
 const WORK_ROOT = join(homedir(), "work");
 const PI_AGENT_ROOT = join(homedir(), ".pi", "agent");
+/** Hand-written knowledge that is NOT a chat log: the claude memory tree. */
+const CLAUDE_MEMORY_ROOT = join(homedir(), ".claude", "memory");
+
+/**
+ * Where markdown is searched.
+ *
+ * The project is the obvious root, but the durable notes live outside it: the
+ * claude memory tree (MEMORY.md, entities/, decisions/, journal/) and the agent
+ * instruction files under ~/.pi/agent. Those are small and always worth
+ * scanning, so they are in for both scopes; `scope: "all"` adds every project.
+ */
+function docRoots(scope: MemoryScope, cwd: string): string[] {
+	const roots = scope === "current" ? [cwd] : [WORK_ROOT];
+	return [...new Set([...roots, CLAUDE_MEMORY_ROOT, PI_AGENT_ROOT])].filter((r) => existsSync(r));
+}
 
 // ── query + scoring ─────────────────────────────────────────────────────────
 
@@ -599,7 +615,7 @@ async function searchDocs(
 	signal?: AbortSignal,
 ): Promise<MemoryHit[]> {
 	status.docs = "ok";
-	const roots = (scope === "current" ? [cwd] : [WORK_ROOT, PI_AGENT_ROOT]).filter((r) => existsSync(r));
+	const roots = docRoots(scope, cwd);
 	if (roots.length === 0) {
 		status.docs = "skipped";
 		return [];
@@ -850,9 +866,11 @@ export async function searchMemory(
 	const sourceStatus: Partial<Record<MemorySource, SourceStatus>> = {};
 	const tokens = tokenize(query);
 	const scope = opts.scope ?? "current";
-	// Default = "memory" in the user's sense: chat transcripts + recall memories.
-	// Markdown docs and git history are opt-in (only when the caller asks).
-	const sources = opts.sources ?? ["sessions", "memory"];
+	// Default = everything a question about past work can legitimately answer
+	// from: chat transcripts, recall memories, and the hand-written markdown
+	// (project docs, CLAUDE.md/AGENTS.md, the claude memory tree). Git stays
+	// opt-in: walking commits and expanding diffs is the expensive one.
+	const sources = opts.sources ?? ["sessions", "memory", "docs"];
 	const cwd = opts.cwd ?? process.cwd();
 	const limit = opts.limit ?? 15;
 	const now = Date.now();
@@ -908,15 +926,6 @@ export async function searchMemory(
 		hits: deduped.slice(0, gitWindow ? Math.max(limit, GIT_WINDOW_MAX) : limit),
 		sourceStatus,
 	};
-}
-
-/**
- * Detect whether the query explicitly asks to include markdown documentation.
- * By default memory_search covers only chat + recall memories; docs are opt-in.
- */
-export function wantsDocs(query: string): boolean {
-	const q = query.toLowerCase();
-	return /(документац|в доках|доках|\bdocs?\b|documentation|\bmarkdown\b|\b\.md\b|md-файл|md файл)/.test(q);
 }
 
 /**

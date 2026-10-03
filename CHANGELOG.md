@@ -4,9 +4,28 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+## [pi-ext-int-search 1.5.1] - 2026-10-03 (fork release)
+
+### Fixed
+- **The summary prompt carried no evidence.** Each source reached the summary model as `title — url` only, so with no
+  provider answer text the model honestly reported "no body text" — which is every `memory_search` summary and any
+  raw-result web provider. Snippets now travel with their source, bounded: 600 chars per source / 12 000 per query
+  when there is no answer to lean on, 200 / 3 000 when the provider already answered. Found by running the thing
+  against real questions, not by a unit test.
+- **Those snippets then blew the generation deadline.** A two-query web search with full snippets overran the default
+  30 s on `gemini-3.8-flash` and degraded to the deterministic summary. The split budget above keeps the
+  answer-present case near its previous size; both web and history now summarise inside the default deadline.
+
+
 ## [pi-ext-int-search 1.5.0] - 2026-10-03 (fork release)
 
 ### Added
+- **`memory_search` now collects hand-written markdown by default**, not just chat transcripts and recall memories:
+  project docs, `CLAUDE.md`/`AGENTS.md`, and the `~/.claude/memory` notes tree (MEMORY.md, `entities/`, `decisions/`,
+  `journal/`) — the last of which no scope reached before. Git history stays an additive opt-in detected from the
+  question, because walking commits and expanding diffs is the expensive source. The `wantsDocs()` phrase detector is
+  gone: it decided nothing once docs became a default, and a question that happened not to say "docs" no longer
+  misses a decision that was written down rather than chatted about.
 - **`memory_search` gained the same `workflow` pipeline as `web_search`.** `workflow: "auto-summary"` runs the
   history matches through the identical summary path — same `summaryModel`, `summaryInstructions`,
   `summaryGenerationDeadlineMs`, same no-invented-sources guardrails, same deterministic fallback. Only the prompt's
