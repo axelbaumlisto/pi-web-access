@@ -22,6 +22,7 @@ import { homedir } from "node:os";
 import { basename, join } from "node:path";
 import { execFile, execFileSync, spawn } from "node:child_process";
 import { refreshSessionDigest, sessionDigestFiles, sessionSourceForDigest } from "./session-digest.ts";
+import type { QueryResultData } from "./storage.ts";
 
 export type MemoryScope = "current" | "all";
 export type MemorySource = "sessions" | "memory" | "docs" | "git";
@@ -998,4 +999,32 @@ export function formatHits(
 		lines.push(`… ${omitted} more hit(s) omitted (output budget). Narrow the query or ask for a specific item.`);
 	}
 	return lines.join("\n");
+}
+
+/**
+ * Adapt history hits to the shape the shared summary pipeline consumes.
+ *
+ * `QueryResultData` is what `web_search` hands to `generateSummaryDraft`, so
+ * reusing it is what keeps the two searches consistent: identical model
+ * selection, deadline, guardrails, deterministic fallback and `summaryInstructions`.
+ * The only history-specific part is the `kind: "history"` prompt wording.
+ *
+ * A hit has no URL, so `url` carries its stable reference — the session file,
+ * memory key or doc/commit path — and `title` carries the human label the
+ * formatter already prints (`source · date · project`). Nothing is invented.
+ */
+export function hitsToQueryResults(query: string, hits: MemoryHit[]): QueryResultData[] {
+	return [
+		{
+			query,
+			answer: "",
+			provider: "memory_search",
+			error: null,
+			results: hits.map((hit) => ({
+				title: `${hit.source} · ${new Date(hit.timestamp).toISOString().slice(0, 10)} · ${hit.project}${hit.label ? ` · ${hit.label}` : ""}`,
+				url: hit.location,
+				snippet: hit.snippet,
+			})),
+		},
+	];
 }

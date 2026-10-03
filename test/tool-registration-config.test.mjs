@@ -81,7 +81,7 @@ test("default public execution tool definitions retain their compatibility hashe
 		source_check: "685467b6e6bcbe32f7d7eb51805896f43077e3116e64a47b637c4584b3f2510e",
 		fetch_content: "0082465bae0f184988fd37fe152cad9c7a236e410747ba6770013895a28978d4",
 		// Fork-only tool; the four above still match upstream's hashes byte for byte.
-		memory_search: "98c5f6762e401c92f4976299b067b22d4e0bb3b164f81da090ff6285f8e783aa",
+		memory_search: "8ff4d575ba31eee2ddd96d0cbb2f4e4f16ef570fd317e7d6e66000ce766bdbf5",
 		get_search_content: "e1c7597fc085a811c0c6fcde365a96571c275c70b93a48206a38be06a7a45a5f",
 	};
 	const tools = registered({}).tools.filter(tool => tool.name !== "web_enable");

@@ -4,6 +4,24 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+## [pi-ext-int-search 1.5.0] - 2026-10-03 (fork release)
+
+### Added
+- **`memory_search` gained the same `workflow` pipeline as `web_search`.** `workflow: "auto-summary"` runs the
+  history matches through the identical summary path — same `summaryModel`, `summaryInstructions`,
+  `summaryGenerationDeadlineMs`, same no-invented-sources guardrails, same deterministic fallback. Only the prompt's
+  domain wording differs (`kind: "history"`), and the Sources section lists `source · date · project` references
+  rather than URLs, because a transcript has no URL to cite. The ranked snippets still follow the summary, and a
+  failed generation degrades to the deterministic summary instead of failing a search that already succeeded.
+
+### Changed
+- **The session digest advances by tail, not by full re-read.** A manifest entry now records `offset` — how many
+  bytes of a transcript are already digested, always on a line boundary — so the live session, which grows between
+  queries, is read from where the last pass stopped instead of from byte zero. Digest format bumped to v3 (one
+  rebuild on first use). A shrunk or rewritten source, a hand-deleted digest, or an older manifest still fall back to
+  a full re-digest, and a half-written trailing line stays outside the offset until it is complete.
+
+
 ## [pi-ext-int-search 1.4.0] - 2026-10-02 (fork release)
 
 ### Changed

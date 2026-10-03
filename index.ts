@@ -33,7 +33,7 @@ import { ALL_SEARCH_PROVIDERS, assertSearchProviderSelectionAllowed, getAllowedS
 export type { ProviderAvailability } from "./gemini-search.ts";
 import type { SearchResult } from "./perplexity.ts";
 import { formatSeconds, getWebSearchConfigDir, getWebSearchConfigPath, installGlobalProxyFetch, resolveCuratorNetworkConfig, runWithProxy } from "./utils.ts";
-import { searchMemory, parseRecency, wantsDocs, wantsGit, formatHits, type MemoryScope, type MemorySource } from "./memory-search.ts";
+import { searchMemory, parseRecency, wantsDocs, wantsGit, formatHits, hitsToQueryResults, type MemoryScope, type MemorySource } from "./memory-search.ts";
 import {
 	clearResults,
 	deleteResult,
@@ -2932,6 +2932,11 @@ export default function (pi: ExtensionAPI) {
 				}),
 			),
 			limit: Type.Optional(Type.Number({ description: "Max results (default 15)." })),
+			workflow: Type.Optional(
+				StringEnum(["none", "auto-summary"], {
+					description: "none = ranked snippets (default); auto-summary = the same small-model summary pipeline web_search uses, written over the history matches with their source/date/project references.",
+				}),
+			),
 		}),
 
 		async execute(_callId, params, signal, _onUpdate, ctx) {
@@ -2978,8 +2983,54 @@ export default function (pi: ExtensionAPI) {
 				};
 			}
 
+			// Consistency with web_search: the same pipeline, model, deadline and
+			// guardrails; only the prompt's domain wording differs (kind: "history").
+			let summary: string | undefined;
+			let summaryMeta: SummaryMeta | undefined;
+			if (params.workflow === "auto-summary" && hits.length > 0) {
+				if (!ctx?.modelRegistry) {
+					return {
+						content: [{ type: "text", text: "Error: workflow 'auto-summary' requires an active extension context." }],
+						details: { error: "Missing extension context" },
+					};
+				}
+				const summaryContext: SummaryGenerationContext = {
+					model: ctx.model,
+					modelRegistry: ctx.modelRegistry,
+					sessionManager: ctx.sessionManager,
+					scopedModels: ctx.scopedModels,
+				};
+				const results = hitsToQueryResults(query, hits);
+				const choices = await loadSummaryModelChoices(summaryContext);
+				try {
+					const generated = await generateSummaryDraft(
+						results,
+						summaryContext,
+						signal,
+						choices.defaultSummaryModel ?? undefined,
+						undefined,
+						undefined,
+						getSummaryGenerationDeadlineMs(),
+						getSummaryInstructions(),
+						{ kind: "history" },
+					);
+					summary = generated.summary;
+					summaryMeta = generated.meta;
+				} catch (err) {
+					// A summary is an extra, never a gate: fall back to the ranked
+					// snippets rather than failing a search that already succeeded.
+					const deterministic = buildDeterministicSummary(results, "history");
+					summary = deterministic.summary;
+					summaryMeta = {
+						...deterministic.meta,
+						fallbackReason: err instanceof Error ? err.message : String(err),
+					};
+				}
+			}
+
+			const snippets = formatHits(hits, query, sourceStatus);
 			return {
-				content: [{ type: "text", text: formatHits(hits, query, sourceStatus) }],
+				content: [{ type: "text", text: summary ? `${summary}\n\n---\n\n${snippets}` : snippets }],
 				details: {
 					query,
 					scope,
@@ -2987,6 +3038,7 @@ export default function (pi: ExtensionAPI) {
 					sourceStatus,
 					sinceMs: sinceMs ?? null,
 					count: hits.length,
+					...(summary ? { workflow: "auto-summary", summaryMeta } : {}),
 					hits: hits.map((h) => ({
 						source: h.source,
 						label: h.label,

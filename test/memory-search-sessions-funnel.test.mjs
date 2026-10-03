@@ -173,3 +173,106 @@ test("a bare number in the query is not preferred as the line filter", () => {
 	assert.equal(out.hits.length, 3, JSON.stringify(out.hits.map((h) => h.snippet)));
 	assert.match(out.hits[0].snippet, /number 27 inside/);
 });
+
+// --- workflow parity with web_search ----------------------------------------
+
+test("history hits adapt to the shared summary shape without inventing anything", async () => {
+	const { hitsToQueryResults } = await import("../memory-search.ts");
+	const hits = [
+		{
+			source: "sessions",
+			label: "assistant",
+			snippet: "destination-first: proxied → proxy key only",
+			location: "/home/me/.pi/agent/sessions/--proj--/2026-09-01T00-00-00-000Z_a1.jsonl",
+			project: "pi-web-access",
+			timestamp: Date.UTC(2026, 8, 1),
+			score: 3.5,
+		},
+		{
+			source: "memory",
+			label: "preference",
+			snippet: "npm publish требует OTP",
+			location: "recall:preference",
+			project: "universal",
+			timestamp: Date.UTC(2026, 9, 2),
+			score: 1.25,
+		},
+	];
+
+	const results = hitsToQueryResults("key binding", hits);
+
+	assert.equal(results.length, 1, "one query block, like a single-query web search");
+	assert.equal(results[0].query, "key binding");
+	assert.equal(results[0].provider, "memory_search");
+	assert.equal(results[0].answer, "", "history has no provider answer to quote");
+	assert.equal(results[0].error, null);
+	assert.deepEqual(
+		results[0].results.map((r) => r.url),
+		hits.map((h) => h.location),
+		"the stable reference is carried verbatim — no fabricated URLs",
+	);
+	assert.match(results[0].results[0].title, /^sessions · 2026-09-01 · pi-web-access · assistant$/);
+	assert.match(results[0].results[1].title, /^memory · 2026-10-02 · universal · preference$/);
+	assert.equal(results[0].results[0].snippet, hits[0].snippet);
+});
+
+test("the history summary prompt keeps every web guardrail but drops the URL wording", async () => {
+	const { buildSummaryPrompt } = await import("../summary-review.ts");
+	const { hitsToQueryResults } = await import("../memory-search.ts");
+	const results = hitsToQueryResults("key binding", [
+		{
+			source: "sessions",
+			label: "assistant",
+			snippet: "proxied → proxy key only",
+			location: "/sessions/a1.jsonl",
+			project: "pi-web-access",
+			timestamp: Date.UTC(2026, 8, 1),
+			score: 1,
+		},
+	]);
+
+	const web = buildSummaryPrompt(results, undefined, undefined, "web");
+	const history = buildSummaryPrompt(results, undefined, undefined, "history");
+
+	for (const guardrail of ["Do not invent sources or claims.", "If evidence is weak or conflicting, say so explicitly."]) {
+		assert.ok(web.includes(guardrail), `web prompt keeps: ${guardrail}`);
+		assert.ok(history.includes(guardrail), `history prompt keeps: ${guardrail}`);
+	}
+	assert.match(web, /final web search summary/);
+	assert.match(history, /the user's OWN history/);
+	assert.match(web, /listing the most relevant URLs/);
+	assert.match(history, /source · date · project`, never as URLs/);
+	assert.match(history, /<history_matches>/);
+	assert.doesNotMatch(history, /<search_results>/);
+
+	// Custom requirements stay additive in both modes.
+	const withInstructions = buildSummaryPrompt(results, undefined, "- Keep dates verbatim.", "history");
+	assert.match(withInstructions, /- Keep dates verbatim\./);
+	assert.match(withInstructions, /Do not invent sources or claims\./);
+});
+
+test("the deterministic fallback speaks history, not web", async () => {
+	const { buildDeterministicSummary } = await import("../summary-review.ts");
+	const { hitsToQueryResults } = await import("../memory-search.ts");
+	const results = hitsToQueryResults("key binding", [
+		{
+			source: "sessions",
+			label: "assistant",
+			snippet: "proxied → proxy key only",
+			location: "/sessions/a1.jsonl",
+			project: "pi-web-access",
+			timestamp: Date.UTC(2026, 8, 1),
+			score: 1,
+		},
+	]);
+
+	const web = buildDeterministicSummary(results).summary;
+	const history = buildDeterministicSummary(results, "history").summary;
+	assert.match(web, /currently selected search results/);
+	assert.match(history, /matching history entries/);
+	assert.doesNotMatch(history, /search results/);
+
+	// Empty input keeps the same contract in both modes: a summary, never a throw.
+	assert.match(buildDeterministicSummary([], "history").summary, /No history matches/);
+	assert.match(buildDeterministicSummary([]).summary, /No completed search results/);
+});

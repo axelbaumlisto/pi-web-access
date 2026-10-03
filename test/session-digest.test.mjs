@@ -156,3 +156,90 @@ test("deeply nested subagent sessions digest fine and one unreadable file does n
 	assert.equal(r2.failed, 1);
 	assert.equal(r2.complete, true);
 });
+
+// --- incremental tail digest (v3) -------------------------------------------
+
+/** Read the manifest the way the module writes it. */
+const manifestOf = (dir) => JSON.parse(readFileSync(join(dir, "manifest.json"), "utf8"));
+
+test("a grown session is read from its recorded offset, not from the start", () => {
+	const home = mkdtempSync(join(tmpdir(), "pi-digest-tail-"));
+	const { a } = corpus(home);
+	const live = join(a, "2026-09-01T00-00-00-000Z_a1.jsonl");
+
+	const r1 = refresh(home);
+	const after1 = manifestOf(r1.dir).files[live];
+	assert.equal(after1.offset, statSync(live).size, "offset covers the whole file once digested");
+
+	// Grow the live session by one turn.
+	writeFileSync(live, readFileSync(live, "utf8") + turn("user", "incremental wombat") + "\n");
+	const r2 = refresh(home);
+	assert.equal(r2.digested, 1);
+	const after2 = manifestOf(r2.dir).files[live];
+	assert.equal(after2.offset, statSync(live).size);
+
+	// The appended turn is searchable, and the earlier ones were NOT rewritten:
+	// a full re-digest would have produced the same text, so assert the cheap
+	// path directly — the digest grew by exactly one line.
+	const digestPath = join(r1.dir, after2.digest);
+	const lines = readFileSync(digestPath, "utf8").trim().split("\n");
+	assert.equal(lines.length, 3, "two original turns + the appended one");
+	assert.match(lines.at(-1), /incremental wombat/);
+	assert.match(lines[0], /bind proxy keys/);
+});
+
+test("the offset never swallows a half-written trailing line", () => {
+	const home = mkdtempSync(join(tmpdir(), "pi-digest-tail-partial-"));
+	const { a } = corpus(home);
+	const live = join(a, "2026-09-01T00-00-00-000Z_a1.jsonl");
+	const r1 = refresh(home);
+	const complete = statSync(live).size;
+
+	// Append a complete turn plus a torn one, as a crashing writer would leave it.
+	const torn = '{"type":"message","timestamp":"2026-09-01T00:00:00Z","message":{"role":"user","content":[{"type":"text","text":"torn kang';
+	writeFileSync(live, readFileSync(live, "utf8") + turn("user", "whole walrus") + "\n" + torn);
+	const r2 = refresh(home);
+	const entry2 = manifestOf(r2.dir).files[live];
+	assert.ok(entry2.offset > complete, "the complete turn advanced the offset");
+	assert.ok(entry2.offset < statSync(live).size, "the torn tail stays outside the offset");
+
+	// Completing the line makes it appear, exactly once.
+	writeFileSync(live, readFileSync(live, "utf8") + 'aroo"}]}}\n');
+	const r3 = refresh(home);
+	const entry3 = manifestOf(r3.dir).files[live];
+	assert.equal(entry3.offset, statSync(live).size);
+	const text = readFileSync(join(r3.dir, entry3.digest), "utf8");
+	assert.equal(text.match(/torn kangaroo/g).length, 1);
+	assert.equal(text.match(/whole walrus/g).length, 1, "the complete turn was not digested twice");
+});
+
+test("a rewritten or shrunk source falls back to a full re-digest", () => {
+	const home = mkdtempSync(join(tmpdir(), "pi-digest-tail-rewrite-"));
+	const { a } = corpus(home);
+	const live = join(a, "2026-09-01T00-00-00-000Z_a1.jsonl");
+	const r1 = refresh(home);
+
+	// Not append-only: the file is replaced by a shorter, different transcript.
+	writeFileSync(live, turn("assistant", "replaced narwhal") + "\n");
+	const r2 = refresh(home);
+	const entry = manifestOf(r2.dir).files[live];
+	assert.equal(entry.offset, statSync(live).size);
+	const text = readFileSync(join(r2.dir, entry.digest), "utf8");
+	assert.match(text, /replaced narwhal/);
+	assert.doesNotMatch(text, /bind proxy keys/, "stale turns from the old content are gone");
+});
+
+test("a digest deleted by hand is rebuilt in full instead of appended to", () => {
+	const home = mkdtempSync(join(tmpdir(), "pi-digest-tail-wiped-"));
+	const { a } = corpus(home);
+	const live = join(a, "2026-09-01T00-00-00-000Z_a1.jsonl");
+	const r1 = refresh(home);
+	const entry1 = manifestOf(r1.dir).files[live];
+	rmSync(join(r1.dir, entry1.digest));
+
+	writeFileSync(live, readFileSync(live, "utf8") + turn("user", "rebuilt ocelot") + "\n");
+	const r2 = refresh(home);
+	const text = readFileSync(join(r2.dir, entry1.digest), "utf8");
+	assert.match(text, /bind proxy keys/, "the pre-existing turns came back");
+	assert.match(text, /rebuilt ocelot/);
+});

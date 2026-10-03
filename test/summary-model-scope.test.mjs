@@ -306,7 +306,7 @@ async function summaryGenerationDeadline(config) {
 	}
 }
 
-test("summary generation deadline config defaults, validates, caps, and reaches both workflows", async () => {
+test("summary generation deadline config defaults, validates, caps, and reaches every workflow", async () => {
 	assert.equal(await summaryGenerationDeadline(undefined), 30_000);
 	assert.equal(await summaryGenerationDeadline({ summaryGenerationDeadlineMs: 150_000 }), 150_000);
 	assert.equal(await summaryGenerationDeadline({ summaryGenerationDeadlineMs: 0 }), 30_000);
@@ -315,7 +315,14 @@ test("summary generation deadline config defaults, validates, caps, and reaches 
 	assert.equal(await summaryGenerationDeadline({ summaryGenerationDeadlineMs: 600_001 }), 600_000);
 	assert.match(indexSrc, /const MAX_SUMMARY_GENERATION_DEADLINE_MS = 600_000/);
 	assert.match(indexSrc, /generateSummaryDraft\(\s*selectedResults,\s*summaryContext,\s*signal,\s*modelOverride,\s*feedback,\s*undefined,\s*getSummaryGenerationDeadlineMs\(\),\s*getSummaryInstructions\(\),\s*\)/);
-	assert.equal((indexSrc.match(/getSummaryGenerationDeadlineMs\(\)/g) ?? []).length, 3);
+	// Fork: three web paths (curator submit, curator regenerate, auto-summary)
+	// plus memory_search's auto-summary — every summary respects the same config.
+	assert.equal((indexSrc.match(/getSummaryGenerationDeadlineMs\(\)/g) ?? []).length, 4);
+	assert.match(
+		indexSrc,
+		/generateSummaryDraft\(\s*results,\s*summaryContext,\s*signal,\s*choices\.defaultSummaryModel \?\? undefined,\s*undefined,\s*undefined,\s*getSummaryGenerationDeadlineMs\(\),\s*getSummaryInstructions\(\),\s*\{ kind: "history" \},\s*\)/,
+		"memory_search reuses the shared pipeline with history wording",
+	);
 	assert.match(readmeSrc, /"summaryGenerationDeadlineMs": 30000/);
 	assert.match(readmeSrc, /summaryGenerationDeadlineMs.*capped at `600000`/);
 });
