@@ -227,6 +227,48 @@ test("clearCloneCache removes only its runtime directory", { skip: process.platf
 	assert.equal(await readFile(sibling, "utf8"), "preserve");
 });
 
+test("releaseClonesUnusedSince removes only clones no fetch returned since then", { skip: process.platform === "win32" }, async () => {
+	const root = await mkdtemp(join(tmpdir(), "pi-web-access-github-release-"));
+	const agentDir = join(root, "agent-dir");
+	const binDir = join(root, "bin");
+	await mkdir(agentDir, { recursive: true });
+	await mkdir(binDir, { recursive: true });
+	await writeFile(join(agentDir, "web-search.json"), JSON.stringify({ githubClone: { clonePath: join(root, "repos") } }), "utf8");
+	await writeFakeExecutable(binDir, "gh", "process.exit(1);");
+	await writeFakeExecutable(binDir, "git", `
+		const { mkdirSync, writeFileSync } = require("node:fs");
+		const { join } = require("node:path");
+		const destination = process.argv.at(-1);
+		mkdirSync(destination, { recursive: true });
+		writeFileSync(join(destination, "README.md"), "fixture");
+	`);
+
+	const child = spawnSync(process.execPath, ["--input-type=module"], {
+		input: `
+			const { existsSync } = await import("node:fs");
+			const { clearCloneCache, extractGitHub, releaseClonesUnusedSince } = await import(${JSON.stringify(extractModuleUrl)});
+			const pathOf = (result) => result?.content.match(/^Repository cloned to: (.+)$/m)?.[1] ?? null;
+			const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+			const old = pathOf(await extractGitHub("https://github.com/owner/old", undefined, true));
+			const reused = pathOf(await extractGitHub("https://github.com/owner/reused", undefined, true));
+			await sleep(5);
+			const since = Date.now();
+			await sleep(5);
+			// A fetch after the cut-off keeps its clone, even though the clone itself is older.
+			await extractGitHub("https://github.com/owner/reused", undefined, true);
+			releaseClonesUnusedSince(since);
+			const result = { oldExists: existsSync(old), reusedExists: existsSync(reused) };
+			clearCloneCache();
+			console.log(JSON.stringify(result));
+		`,
+		encoding: "utf8",
+		env: { ...process.env, PATH: `${binDir}${delimiter}${process.env.PATH || ""}`, PI_CODING_AGENT_DIR: agentDir },
+	});
+
+	assert.equal(child.status, 0, child.stderr);
+	assert.deepEqual(JSON.parse(child.stdout), { oldExists: false, reusedExists: true });
+});
+
 test("clone cleanup unlinks a direct-child symlink without deleting its target", { skip: process.platform === "win32" }, async () => {
 	const root = await mkdtemp(join(tmpdir(), "pi-web-access-github-symlink-"));
 	const agentDir = join(root, "agent-dir");
