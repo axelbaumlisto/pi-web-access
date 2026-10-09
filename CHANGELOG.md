@@ -4,6 +4,15 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+## [0.38.0] - 2026-10-09
+
+### Highlights
+
+- Search with Ceramic, a new paid keyword search provider you can select.
+- OpenAI search now defaults to the newest Luna model, which costs about 20 times less per token than Terra.
+- Answer mode and query rewriting work with models whose provider signs in without an API key, such as pi-multiprovider models.
+- Requests through a proxy keep their method, headers, body and `Content-Length`, and HEAD requests stay HEAD requests.
+
 ### Added
 
 - New Ceramic search provider for [Ceramic](https://www.ceramic.ai)'s keyword web search API, used only when you select it. Set `ceramicApiKey` or `CERAMIC_API_KEY` to your Ceramic key. Ceramic is a paid API with free starter credits, so it is never picked by `auto` or `all`. Allowed domains are added to the query as `site:` filters, and excluded domains are removed from the results. Ceramic has no date filter, so `recencyFilter` is ignored. Thanks to [@sweepies](https://github.com/sweepies) for [issue #523](https://github.com/nicobailon/pi-web-access/issues/523).
