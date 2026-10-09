@@ -4,7 +4,7 @@ import type { ExtractedContent } from "./extract.ts";
 import { redactCredential } from "./credential-source.ts";
 import { formatSearchResultsAsAnswer } from "./search-answer-formatting.ts";
 import { fetchWithCredentialRedirects, getWebSearchConfigPath } from "./utils.ts";
-import { perplexitySearchUrl, providerHasCredential, providerUrl, resolveProviderKey } from "./provider-endpoints.ts";
+import { isProxiedDestination, perplexitySearchUrl, providerHasCredential, providerUrl, resolveProviderKey } from "./provider-endpoints.ts";
 import { redactError, redactProviderError } from "./redact.ts";
 
 // Endpoints come from provider-endpoints (env > config > default) so unified
@@ -176,10 +176,63 @@ async function postPerplexity(
 	}
 }
 
+/** Hard ceiling on kept citations, matching the `numResults` clamp. */
+const MAX_CITATIONS = 20;
+
+/** Keep the citation prefix through the highest cited index, so [n] markers in
+ * the answer keep pointing at the right source. */
+function citationsToKeep(answer: string, available: number, numResults: number): number {
+	let highestCited = 0;
+	for (const match of answer.matchAll(/\[(\d{1,3})\]/g)) {
+		highestCited = Math.max(highestCited, Number(match[1]));
+	}
+	return Math.min(available, MAX_CITATIONS, Math.max(numResults, highestCited));
+}
+
+/**
+ * Search through chat completions, the way this provider worked before the
+ * Search API existed. The unified gateway only routes /v1/chat/completions —
+ * measured: /v1/search answers 405 — so under proxy mode this is the only path
+ * that reaches Perplexity at all.
+ */
+async function searchThroughChat(query: string, numResults: number, options: SearchOptions): Promise<SearchResponse> {
+	const body: Record<string, unknown> = {
+		model: "sonar",
+		messages: [{ role: "user", content: query }],
+		return_related_questions: false,
+	};
+	if (options.recencyFilter) body.search_recency_filter = options.recencyFilter;
+	if (options.domainFilter && options.domainFilter.length > 0) {
+		const validated = validateDomainFilter(options.domainFilter);
+		if (validated.length > 0) body.search_domain_filter = validated;
+	}
+
+	const data = await postPerplexity(chatUrl(), body, { activityQuery: query, signal: options.signal });
+	const answer = (data.choices as Array<{ message?: { content?: string } }> | undefined)?.[0]?.message?.content || "";
+	const citations = Array.isArray(data.citations) ? data.citations : [];
+
+	const results: SearchResult[] = [];
+	const keep = citationsToKeep(answer, citations.length, numResults);
+	for (let i = 0; i < keep; i++) {
+		const citation = citations[i];
+		if (typeof citation === "string") {
+			results.push({ title: `Source ${i + 1}`, url: citation, snippet: "" });
+		} else if (citation && typeof citation === "object" && typeof (citation as { url?: unknown }).url === "string") {
+			const entry = citation as { url: string; title?: string };
+			results.push({ title: entry.title || `Source ${i + 1}`, url: entry.url, snippet: "" });
+		}
+	}
+	return { answer, results };
+}
+
 export async function searchWithPerplexity(query: string, options: SearchOptions = {}): Promise<SearchResponse> {
 	const numResults = typeof options.numResults === "number" && Number.isFinite(options.numResults)
 		? Math.max(1, Math.min(Math.floor(options.numResults), 20))
 		: 5;
+
+	// The Search API is a separate route the unified gateway does not carry, so
+	// a proxied destination goes through chat completions instead.
+	if (isProxiedDestination("perplexity")) return searchThroughChat(query, numResults, options);
 
 	const requestBody: Record<string, unknown> = {
 		query,
