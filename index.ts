@@ -740,8 +740,8 @@ export default function (pi: ExtensionAPI) {
 	const sourceCheckEnabled = isToolEnabled(initConfig, "sourceCheck");
 	const fetchContentEnabled = isToolEnabled(initConfig, "fetchContent");
 	const getSearchContentEnabled = isToolEnabled(initConfig, "getSearchContent");
-	// Поиск по собственной истории — добавка форка, проходит через ту же
-	// машинерию включения и переименования, что и инструменты апстрима.
+	// Fork: history search goes through the same enable/rename machinery as
+	// the upstream tools, so renames and duplicate checks cover it too.
 	const memorySearchEnabled = isToolEnabled(initConfig, "memorySearch");
 	const coreSettings = {
 		toolNames,

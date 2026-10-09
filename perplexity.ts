@@ -4,19 +4,12 @@ import type { ExtractedContent } from "./extract.ts";
 import { redactCredential } from "./credential-source.ts";
 import { formatSearchResultsAsAnswer } from "./search-answer-formatting.ts";
 import { fetchWithCredentialRedirects, getWebSearchConfigPath } from "./utils.ts";
-import { providerHasCredential, providerUrl, resolveProviderKey } from "./provider-endpoints.ts";
+import { perplexitySearchUrl, providerHasCredential, providerUrl, resolveProviderKey } from "./provider-endpoints.ts";
 import { redactError, redactProviderError } from "./redact.ts";
 
-// Адрес берётся из provider-endpoints (env > config > умолчание), чтобы
-// работал единый режим через шлюз. Апстрим ходит в два разных пути: /search за
-// ранжированными ссылками и /chat/completions за прозой. Поисковый путь
-// выводим из настроенного, иначе переопределение адреса ломало бы половину.
+// Endpoints come from provider-endpoints (env > config > default) so unified
+// proxy mode keeps working.
 const chatUrl = () => providerUrl("perplexity");
-const CHAT_SUFFIX = "/chat/completions";
-const searchUrl = () => {
-	const chat = chatUrl();
-	return chat.endsWith(CHAT_SUFFIX) ? `${chat.slice(0, -CHAT_SUFFIX.length)}/search` : chat;
-};
 const CONFIG_PATH = getWebSearchConfigPath();
 
 const RATE_LIMIT = {
@@ -147,8 +140,8 @@ async function postPerplexity(
 				"Content-Type": "application/json",
 			},
 			body: JSON.stringify(body),
-			// Форк: у запроса всегда есть собственный предел в 30 секунд — без
-			// него зависший шлюз держит поиск до конца хода.
+			// Fork: every request carries its own 30s deadline. Without it a
+			// stalled gateway holds the search for the rest of the turn.
 			signal: AbortSignal.any([
 				AbortSignal.timeout(30000),
 				...(options.signal ? [options.signal] : []),
@@ -206,7 +199,7 @@ export async function searchWithPerplexity(query: string, options: SearchOptions
 		}
 	}
 
-	const data = await postPerplexity(searchUrl(), requestBody, { activityQuery: query, signal: options.signal });
+	const data = await postPerplexity(perplexitySearchUrl(), requestBody, { activityQuery: query, signal: options.signal });
 
 	const results: SearchResult[] = [];
 	for (const entry of Array.isArray(data.results) ? data.results : []) {

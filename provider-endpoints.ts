@@ -258,6 +258,20 @@ export function providerUrl(provider: SearchProviderId): string {
 	return resolveProviderEndpoint(provider).url;
 }
 
+/**
+ * Perplexity answers on two paths: `/search` returns ranked links and
+ * `/chat/completions` returns prose. Only the chat URL is configurable, so the
+ * search URL is derived from it — otherwise an override or the gateway would
+ * move half the provider and leave the other half pointing at the public API.
+ */
+const PERPLEXITY_CHAT_SUFFIX = "/chat/completions";
+export function perplexitySearchUrl(): string {
+	const chat = providerUrl("perplexity");
+	return chat.endsWith(PERPLEXITY_CHAT_SUFFIX)
+		? `${chat.slice(0, -PERPLEXITY_CHAT_SUFFIX.length)}/search`
+		: chat;
+}
+
 /** True when two URLs share the same parsed origin (scheme+host+port). */
 function sameOrigin(a: string, b: string): boolean {
 	try {

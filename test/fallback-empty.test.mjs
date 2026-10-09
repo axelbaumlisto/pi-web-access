@@ -61,7 +61,7 @@ test("auto search falls through an empty provider to the next non-empty one", as
 	assert.equal(child.status, 0, child.stderr);
 	const r = JSON.parse(child.stdout.trim());
 	assert.equal(r.provider, "perplexity", "should fall through empty brave to perplexity");
-	assert.ok(r.answer.includes("PPLX answer"), `ответ собран из источников: ${r.answer}`);
+	assert.ok(r.answer.includes("PPLX answer"), `answer is built from sources: ${r.answer}`);
 	assert.ok(r.n >= 2);
 });
 

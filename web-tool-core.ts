@@ -126,7 +126,7 @@ export type ToolNames = {
 	webSearch: string;
 	sourceCheck: string;
 	fetchContent: string;
-	/** Поиск по собственной истории — добавка форка, см. memory-search.ts. */
+	/** Fork addition: search over local history, see memory-search.ts. */
 	memorySearch: string;
 	getSearchContent: string;
 };
@@ -1462,8 +1462,8 @@ export function createStandaloneWebToolCore(): StandaloneWebToolCore {
 			sourceCheck: isToolEnabled(config, "sourceCheck"),
 			fetchContent: isToolEnabled(config, "fetchContent"),
 			getSearchContent: isToolEnabled(config, "getSearchContent"),
-			// Поиск по истории живёт в расширении pi: отдельному потребителю без
-			// хоста он недоступен, поэтому здесь всегда выключен.
+			// History search needs the Pi host for sessions and config, so a
+			// standalone consumer never gets it.
 			memorySearch: false,
 		},
 		maxInlineContentChars: getMaxInlineContentChars(config),
