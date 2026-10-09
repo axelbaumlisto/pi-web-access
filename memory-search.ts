@@ -180,6 +180,24 @@ interface ExecResult {
  * and honors the tool's AbortSignal so the user can cancel a runaway search.
  * Never throws — partial stdout is preserved with `broken` set.
  */
+/**
+ * Where ripgrep actually lives.
+ *
+ * Pi downloads its own `rg` into the agent bin directory and does not put that
+ * directory on PATH, so a bare "rg" works on a developer box and silently fails
+ * on a server — measured: two of three memory_search sources reported
+ * "tool missing/crashed" on a host where pi had installed rg itself. Resolved
+ * once per process: PATH first, then pi's own copy.
+ */
+let ripgrepPath: string | null = null;
+function ripgrep(): string {
+	if (ripgrepPath) return ripgrepPath;
+	const agentDir = process.env.PI_AGENT_DIR ?? join(homedir(), ".pi", "agent");
+	const own = join(agentDir, "bin", process.platform === "win32" ? "rg.exe" : "rg");
+	ripgrepPath = existsSync(own) ? own : "rg";
+	return ripgrepPath;
+}
+
 function execFileAsync(
 	cmd: string,
 	args: string[],
@@ -383,7 +401,7 @@ async function planSessionScan(
 			// lines per file ("proxy": 1 439 files / 15 446 lines) is a worse
 			// filter than one in more files but fewer lines ("destination": 2 388
 			// files / 2 508 lines) — 6x less pass-2 work.
-			const r = await execFileAsync("rg", ["-i", "-F", "-c", "--with-filename", "-e", t, "--", ...searchFiles], 64 * 1024 * 1024, signal);
+			const r = await execFileAsync(ripgrep(), ["-i", "-F", "-c", "--with-filename", "-e", t, "--", ...searchFiles], 64 * 1024 * 1024, signal);
 			if (r.status === 1) return { token: t, files: [] as string[], lines: 0, ok: true };
 			if (r.status !== 0 && !r.stdout) return { token: t, files: [] as string[], lines: 0, ok: false };
 			const files: string[] = [];
@@ -461,7 +479,7 @@ async function searchSessions(
 	const plan = await planSessionScan(tokens, files, status, signal);
 	if (!plan) return [];
 	const res = await execFileStreaming(
-		"rg",
+		ripgrep(),
 		["-i", "-F", "--no-heading", "--no-line-number", "--with-filename", "-e", plan.discriminator, "--", ...plan.files],
 		SESSIONS_SCAN_BUDGET_BYTES,
 		signal,
@@ -625,7 +643,7 @@ async function searchDocs(
 	// node_modules/.git by default). We then read+score only those files.
 	const pattern = tokens.map(escapeRe).join("|");
 	const res = await execFileAsync(
-		"rg",
+		ripgrep(),
 		["-l", "-i", "--glob", "*.md", "-e", pattern, "--", ...roots],
 		32 * 1024 * 1024,
 		signal,

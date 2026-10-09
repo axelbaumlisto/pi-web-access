@@ -4,6 +4,15 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+## [pi-ext-int-search 1.6.2] - 2026-10-10 (fork release)
+
+### Fixed
+- **History search found nothing on hosts without a system ripgrep.** Pi installs its own `rg` into the agent bin
+  directory and leaves that directory off `PATH`, so a bare `rg` works on a laptop and fails on a server: two of
+  three `memory_search` sources came back as `source FAILED (tool missing/crashed)` on a host where pi had
+  installed ripgrep itself. The binary is now resolved once — `PATH` first, then pi's own copy. Found by asking
+  the tool on a remote machine, not by a test.
+
 ## [pi-ext-int-search 1.6.1] - 2026-10-10 (fork release)
 
 ### Fixed
