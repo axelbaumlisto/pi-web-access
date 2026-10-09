@@ -4,6 +4,15 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+## [pi-ext-int-search 1.6.1] - 2026-10-10 (fork release)
+
+### Fixed
+- **A proxied Perplexity search reached a route the gateway does not have.** Upstream v0.37.0 moved the provider
+  onto the Search API; measured against the gateway this fork talks to, `POST /v1/search` answers 405 while
+  `POST /v1/chat/completions` answers 200. Under proxy mode the provider now searches through chat completions
+  again, citation trimming included, so `[n]` markers keep pointing at the right source. Direct installs keep
+  upstream's Search API path. Found by probing the gateway after the merge, not by a test.
+
 ## [pi-ext-int-search 1.6.0] - 2026-10-09 (fork release)
 
 ### Security
