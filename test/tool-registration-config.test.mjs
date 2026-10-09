@@ -77,8 +77,8 @@ test("malformed config falls back during extension registration", () => {
 // not upstream's. They are a tripwire against accidental schema/description drift.
 test("default public execution tool definitions retain their compatibility hashes", () => {
 	const expected = {
-		web_search: "c1f0e0020561c46d9dc5547664ac50ab2442e57ab9aa14d4b06a1bd18428dbae",
-		source_check: "685467b6e6bcbe32f7d7eb51805896f43077e3116e64a47b637c4584b3f2510e",
+		web_search: "eb831762c218c50c43cedf765a984f6b1c46efb47ac9b7289dfbac4854112de4",
+		source_check: "48e69c75320f7a844a83bfe032c98b93ef11115e908831e6349915e708b16889",
 		fetch_content: "0082465bae0f184988fd37fe152cad9c7a236e410747ba6770013895a28978d4",
 		// Fork-only tool; the four above still match upstream's hashes byte for byte.
 		memory_search: "61ea96fa52b8fb6b1b07d8d840af43e154b87b343ff45a5f2170c85e7d15ccd8",
@@ -139,6 +139,8 @@ test("registered tools do not advertise disabled get_search_content", () => {
 	assert.ok(fetchTool);
 	assert.doesNotMatch(fetchTool.description, /get_search_content/);
 	assert.match(fetchTool.description, /retrieval tool is not registered/);
+	assert.doesNotMatch(registeredTool({ tools: { getSearchContent: { enabled: false } } }, "web_search").description, /get_search_content/);
+	assert.match(registeredTool({ toolNames: { getSearchContent: "open_content" } }, "web_search").description, /retrieval with open_content /);
 });
 
 test("web activity shortcut renders through the supported string-array API", async () => {

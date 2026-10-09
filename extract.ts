@@ -149,6 +149,12 @@ function isRedirectPolicyError(message: string): boolean {
 		message.startsWith("Failed to resolve ");
 }
 
+// Errors that end routing: no other provider may be tried after them.
+function isNonRecoverableHttpError(error: string | null): boolean {
+	return !!error && (NON_RECOVERABLE_ERRORS.some(prefix => error.startsWith(prefix)) ||
+		isRedirectPolicyError(error) || isConfigParseError(error));
+}
+
 function imageGateError(): string | null {
 	try {
 		return isImageEnabled() ? null : "Image fetching is disabled by image.enabled";
@@ -360,6 +366,9 @@ export interface ExtractOptions {
 	toolNames?: RegisteredToolNames;
 	/** Optional HTTP(S) or SOCKS proxy URL; routed through the curl-backed transport. */
 	proxy?: string;
+	/** Reject direct image URLs with this error instead of decoding them with Pi's
+	 * resizeImage. Hosts without the Pi runtime set it; Pi leaves it unset. */
+	rejectDirectImages?: string;
 	/** Custom DNS resolver used for SSRF validation. Primarily a test seam. */
 	lookup?: Lookup;
 }
@@ -811,7 +820,7 @@ export async function extractContent(
 		declaredLinks = discoveredLinks;
 		if (signal?.aborted) return abortedResult(url);
 		if (!httpResult.error) return httpResult;
-		if (NON_RECOVERABLE_ERRORS.some(prefix => httpResult!.error!.startsWith(prefix)) || isRedirectPolicyError(httpResult.error) || isConfigParseError(httpResult.error)) {
+		if (isNonRecoverableHttpError(httpResult.error) || httpResult.error === options?.rejectDirectImages) {
 			return httpResult;
 		}
 		return null;
@@ -1175,11 +1184,19 @@ function responseSizeLimitError(maxBytes: number): Error {
 	return new Error(`Response too large (${Math.round(maxBytes / 1024 / 1024)}MB)`);
 }
 
+const BROWSER_ACCEPT = "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8";
+// Servers that support markdown content negotiation (Cloudflare Markdown for
+// Agents, Mintlify, Vercel) return markdown directly; others see the same
+// relative preferences as BROWSER_ACCEPT. Raw mode keeps BROWSER_ACCEPT so it
+// returns the server's normal representation.
+const MARKDOWN_FIRST_ACCEPT = "text/markdown,text/html;q=0.9,application/xhtml+xml;q=0.9,application/xml;q=0.8,image/avif;q=0.9,image/webp;q=0.9,image/apng;q=0.9,*/*;q=0.7";
+
 async function extractViaHttp(
 	url: string,
 	timeoutMs: number,
 	signal?: AbortSignal,
 	options?: ExtractOptions,
+	preferMarkdown = options?.mode !== "raw",
 ): Promise<HttpExtractedContent> {
 	const activityId = activityMonitor.logStart({ type: "fetch", url });
 
@@ -1199,7 +1216,7 @@ async function extractViaHttp(
 			__proxy: options?.proxy,
 			headers: {
 				"User-Agent": "OpenAI File Downloader, XaiImageApiFetch/1.0",
-				"Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8",
+				"Accept": preferMarkdown ? MARKDOWN_FIRST_ACCEPT : BROWSER_ACCEPT,
 				"Accept-Language": "en-US,en;q=0.9",
 				"Cache-Control": "no-cache",
 				"Sec-Fetch-Dest": "document",
@@ -1274,6 +1291,10 @@ async function extractViaHttp(
 			if (disabled) {
 				activityMonitor.logComplete(activityId, response.status);
 				return { url, title: "", content: "", error: disabled, mimeType, status: response.status };
+			}
+			if (options?.rejectDirectImages) {
+				activityMonitor.logComplete(activityId, response.status);
+				return { url, title: "", content: "", error: options.rejectDirectImages, mimeType, status: response.status };
 			}
 			try {
 				const buffer = await readResponseBufferWithLimit(response, maxResponseSize, () => responseSizeLimitError(maxResponseSize));
@@ -1350,7 +1371,24 @@ async function extractViaHttp(
 		if (!isHTML) {
 			activityMonitor.logComplete(activityId, response.status);
 			const title = extractTextTitle(text, url);
-			return { url, title, content: text, error: null };
+			if (mimeType !== "text/markdown" && mimeType !== "text/x-markdown") return { url, title, content: text, error: null };
+			const declaredLinks = discoverDeclaredWebLinks(null, response.headers.get("link"), response.url || url);
+			const markdown = { url, title, content: appendDeclaredWebLinks(text, declaredLinks), error: null, declaredLinks };
+			if (!preferMarkdown || text.trim().length >= MIN_USEFUL_CONTENT) return markdown;
+			// Short negotiated markdown is re-requested with the browser Accept header.
+			// That response stays authoritative for policy/config rejection, not-found
+			// status, cancellation, and any content it has. This markdown only fills a
+			// recoverable empty response, marked incomplete with its status and error.
+			const normal = await extractViaHttp(url, Math.max(1, timeoutMs - (Date.now() - startedAt)), signal, options, false);
+			if (signal?.aborted || isNonRecoverableHttpError(normal.error) ||
+				normal.status === 404 || normal.status === 410 || isAbortError(normal.error)) return normal;
+			const normalHasBody = normal.content.trim() !== appendDeclaredWebLinks("", normal.declaredLinks ?? []).trim();
+			if (normalHasBody || !markdown.content.trim()) return normal;
+			return {
+				...normal,
+				...markdown,
+				error: "Extracted content appears incomplete" + (normal.error ? `\nBrowser retry failed: ${normal.error}` : ""),
+			};
 		}
 
 		const { parseHTML } = await import("linkedom");

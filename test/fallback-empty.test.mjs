@@ -39,8 +39,11 @@ test("auto search falls through an empty provider to the next non-empty one", as
 			}
 			if (u.includes("perplexity.ai")) {
 				return new Response(JSON.stringify({
-					choices: [{ message: { content: "PPLX answer" } }],
-					citations: ["https://example.com/a", "https://example.com/b"],
+					id: "search-id",
+					results: [
+						{ title: "PPLX answer", url: "https://example.com/a", snippet: "PPLX answer" },
+						{ title: "PPLX second", url: "https://example.com/b", snippet: "second source" },
+					],
 				}), { status: 200, headers: { "content-type": "application/json" } });
 			}
 			throw new Error("unexpected fetch: " + u);
@@ -58,7 +61,7 @@ test("auto search falls through an empty provider to the next non-empty one", as
 	assert.equal(child.status, 0, child.stderr);
 	const r = JSON.parse(child.stdout.trim());
 	assert.equal(r.provider, "perplexity", "should fall through empty brave to perplexity");
-	assert.equal(r.answer, "PPLX answer");
+	assert.ok(r.answer.includes("PPLX answer"), `ответ собран из источников: ${r.answer}`);
 	assert.ok(r.n >= 2);
 });
 

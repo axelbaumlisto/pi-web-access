@@ -81,6 +81,31 @@ test("does not throttle when Brave reports remaining capacity", async () => {
 	assert.deepEqual(sleeps, []);
 });
 
+test("a zero-limit bucket from a prepaid plan does not block or delay requests", async () => {
+	const { BraveRateLimitCoordinator } = await import(limiterModuleUrl);
+	const sleeps = [];
+	const limiter = new BraveRateLimitCoordinator({ now: () => 0, safetyMarginMs: 100, sleep: async ms => { sleeps.push(ms); } });
+	const headers = new Headers({
+		"x-ratelimit-limit": "50, 0",
+		"x-ratelimit-remaining": "49, 0",
+		"x-ratelimit-reset": "1, 2523327",
+	});
+	limiter.observe(headers);
+	assert.equal(await limiter.run(async () => "ok"), "ok");
+	assert.deepEqual(sleeps, []);
+	assert.equal(limiter.retryDelay(headers), null);
+
+	const shortExhausted = new Headers({
+		"x-ratelimit-limit": "50, 0",
+		"x-ratelimit-remaining": "0, 0",
+		"x-ratelimit-reset": "1, 2523327",
+	});
+	assert.equal(limiter.retryDelay(shortExhausted), 1100);
+	limiter.observe(shortExhausted);
+	await limiter.run(async () => undefined);
+	assert.deepEqual(sleeps, [1100]);
+});
+
 test("a failed operation does not poison the queue", async () => {
 	const { BraveRateLimitCoordinator } = await import(limiterModuleUrl);
 	const limiter = new BraveRateLimitCoordinator();
