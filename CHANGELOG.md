@@ -4,7 +4,10 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
-## [pi-ext-int-search 1.6.3] - 2026-10-10 (fork release)
+## [pi-ext-int-search 1.6.4] - 2026-10-10 (fork release)
+
+Same content as 1.6.3, which npm left stuck in staging and never served.
+
 
 ### Fixed
 - **The memory source needed a `sqlite3` binary nobody installs.** On a phone without it the source reported

@@ -1,6 +1,6 @@
 {
 	"name": "pi-ext-int-search",
-	"version": "1.6.3",
+	"version": "1.6.4",
 	"description": "Hardened fork of nicobailon/pi-web-access (synced to v0.37.0) with unified proxy mode + destination-first credential gating, redacted errors, and memory_search over local history.",
 	"type": "module",
 	"bin": {
@@ -95,7 +95,7 @@
 	},
 	"pi": {
 		"extensions": [
-			"./index.ts"
+			"./dist"
 		],
 		"video": "https://github.com/axelbaumlisto/pi-web-access/raw/refs/heads/main/pi-web-fetch-demo.mp4",
 		"skills": [
