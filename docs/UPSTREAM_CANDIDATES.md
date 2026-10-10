@@ -1,5 +1,12 @@
 # What this fork could give back
 
+**Sent:** [#544](https://github.com/nicobailon/pi-web-access/pull/544) deadline ·
+[#545](https://github.com/nicobailon/pi-web-access/pull/545) Brave markup ·
+[#546](https://github.com/nicobailon/pi-web-access/pull/546) empty-provider fallthrough ·
+[#547](https://github.com/nicobailon/pi-web-access/pull/547) snippets in the summary prompt.
+Each is branched off upstream `main`, carries its own failing-without-the-fix test, and leaves
+this fork's features out.
+
 The fork is 66 files ahead of `nicobailon/pi-web-access`. Most of that is ours
 by definition — `memory_search`, unified proxy mode, destination-first
 credential gating — and belongs here. What follows is the rest: changes that fix
