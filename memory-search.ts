@@ -22,6 +22,7 @@ import { existsSync, readdirSync, readFileSync, statSync } from "node:fs";
 import { homedir } from "node:os";
 import { basename, join } from "node:path";
 import { execFile, execFileSync, spawn } from "node:child_process";
+import { createRequire } from "node:module";
 import { refreshSessionDigest, sessionDigestFiles, sessionSourceForDigest } from "./session-digest.ts";
 import type { QueryResultData } from "./storage.ts";
 
@@ -552,6 +553,35 @@ async function searchSessions(
 
 // ── source: claude-recall memories ───────────────────────────────────────────
 
+/**
+ * Read the recall database without the sqlite3 CLI.
+ *
+ * Shelling out to `sqlite3` makes the memory source depend on a program nobody
+ * installs: on a phone with no sqlite3 the source came back "crashed" and the
+ * tool reported no matches at all. Node ships its own reader, so the CLI is now
+ * only the fallback for runtimes without it.
+ *
+ * @returns rows, or null when this runtime has no built-in SQLite.
+ */
+function readRecallRows(dbPath: string, sql: string): Array<Record<string, unknown>> | null {
+	let DatabaseSync: (new (path: string, options?: { readOnly?: boolean }) => {
+		prepare: (sql: string) => { all: () => Array<Record<string, unknown>> };
+		close: () => void;
+	}) | undefined;
+	try {
+		({ DatabaseSync } = createRequire(import.meta.url)("node:sqlite"));
+	} catch {
+		return null;
+	}
+	if (!DatabaseSync) return null;
+	const db = new DatabaseSync(dbPath, { readOnly: true });
+	try {
+		return db.prepare(sql).all();
+	} finally {
+		db.close();
+	}
+}
+
 async function searchRecall(
 	tokens: string[],
 	scope: MemoryScope,
@@ -575,15 +605,20 @@ async function searchRecall(
 			: `is_active=1`;
 	// Alias COALESCE so the -json column key is a stable 'project_id' (D4).
 	const sql = `SELECT type, COALESCE(project_id,'') AS project_id, scope, timestamp, value FROM memories WHERE ${where};`;
-	const res = await execFileAsync("sqlite3", ["-json", RECALL_DB, sql], 64 * 1024 * 1024, signal);
-	if (res.status !== 0) {
-		// sqlite3 missing, DB locked, or timed out — broken, not empty (perf#3).
-		status.memory = "failed";
-		return [];
-	}
 	let rows: Array<Record<string, unknown>>;
 	try {
-		rows = JSON.parse(res.stdout || "[]");
+		const builtIn = readRecallRows(RECALL_DB, sql);
+		if (builtIn !== null) {
+			rows = builtIn;
+		} else {
+			const res = await execFileAsync("sqlite3", ["-json", RECALL_DB, sql], 64 * 1024 * 1024, signal);
+			if (res.status !== 0) {
+				// sqlite3 missing, DB locked, or timed out — broken, not empty (perf#3).
+				status.memory = "failed";
+				return [];
+			}
+			rows = JSON.parse(res.stdout || "[]");
+		}
 	} catch {
 		status.memory = "failed";
 		return [];

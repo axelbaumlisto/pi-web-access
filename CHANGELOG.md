@@ -4,6 +4,19 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+## [pi-ext-int-search 1.6.3] - 2026-10-10 (fork release)
+
+### Fixed
+- **The memory source needed a `sqlite3` binary nobody installs.** On a phone without it the source reported
+  `crashed` and `memory_search` answered that there were no matches — a confident empty answer. The recall
+  database is now read through Node's own SQLite; the CLI stays as the fallback for runtimes without it.
+
+### Added
+- `scripts/smoke-fleet.mjs`: runs each tool through a real `pi -p` on every machine and treats an empty answer
+  as a failure, because that is how both of this week's field bugs presented. It separates a dead feature from an
+  unreachable host and from a truncated-but-working scan. Its first run found the two bugs fixed in 1.6.2 and
+  1.6.3 plus the hosts where Perplexity is simply not configured.
+
 ## [pi-ext-int-search 1.6.2] - 2026-10-10 (fork release)
 
 ### Fixed
