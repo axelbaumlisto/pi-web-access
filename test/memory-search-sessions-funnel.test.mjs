@@ -132,7 +132,13 @@ test("when the byte budget is hit, the NEWEST session survives and the scan is l
 	const out = search(home, "zebra-token");
 	assert.equal(out.status.sessions, "partial", "budget cut must be reported");
 	assert.ok(out.hits.length > 0);
-	assert.match(out.hits[0].snippet, /NEWEST answer here/, "newest hit must survive the budget cut");
+	const where = out.hits.findIndex((h) => /NEWEST answer here/.test(h.snippet));
+	assert.match(
+		out.hits[0].snippet,
+		/NEWEST answer here/,
+		`newest hit must survive the budget cut: hits=${out.hits.length}, newest at ${where}, ` +
+			`first=${JSON.stringify(out.hits[0]?.snippet.slice(0, 60))}, status=${out.status.sessions}`,
+	);
 });
 
 function tinyCorpus(home, lines) {
