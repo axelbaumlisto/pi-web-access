@@ -442,6 +442,63 @@ async function planSessionScan(
 	return { discriminator: discriminator.token, files };
 }
 
+/**
+ * Files per rg call. One call over every file would be faster, but rg searches
+ * files in parallel and prints whichever finishes first: the byte budget then
+ * cuts an ARBITRARY set, and on a CI runner the newest session was dropped
+ * while old noise filled the budget. A batch is small enough that its files are
+ * neighbours in recency, so a cut still drops old data and never today's.
+ */
+const SESSIONS_SCAN_BATCH = 8;
+
+/**
+ * Second pass, newest-first under a shared byte budget. Returns the raw rg
+ * output, or null when the source is broken (tool missing) rather than empty.
+ */
+async function scanNewestFirst(
+	discriminator: string,
+	files: string[],
+	status: Partial<Record<MemorySource, SourceStatus>>,
+	signal?: AbortSignal,
+): Promise<string | null> {
+	let budget = SESSIONS_SCAN_BUDGET_BYTES;
+	const chunks: string[] = [];
+	let scanned = 0;
+	for (let i = 0; i < files.length && budget > 0; i += SESSIONS_SCAN_BATCH) {
+		const batch = files.slice(i, i + SESSIONS_SCAN_BATCH);
+		const res = await execFileStreaming(
+			ripgrep(),
+			["-i", "-F", "--no-heading", "--no-line-number", "--with-filename", "-e", discriminator, "--", ...batch],
+			budget,
+			signal,
+		);
+		// rg exits 1 when no matches — that is not an error.
+		if (res.status !== 0 && res.status !== 1) {
+			if (!res.stdout && chunks.length === 0) {
+				// ENOENT (rg missing) / killed with nothing printed — the source is
+				// broken, not empty. This is what tells "no matches" from "no scan".
+				status.sessions = "failed";
+				return null;
+			}
+			status.sessions = "partial";
+		}
+		if (res.stdout) chunks.push(res.stdout);
+		budget -= res.stdout.length;
+		scanned = Math.min(i + SESSIONS_SCAN_BATCH, files.length);
+		if (res.budgetHit) {
+			status.sessions = "partial";
+			break;
+		}
+		if (signal?.aborted) {
+			status.sessions = "partial";
+			break;
+		}
+	}
+	// Any file left unscanned means the answer is cut, whatever the exit codes said.
+	if (scanned < files.length) status.sessions = "partial";
+	return chunks.join("");
+}
+
 async function searchSessions(
 	tokens: string[],
 	scope: MemoryScope,
@@ -479,26 +536,9 @@ async function searchSessions(
 	// drops OLD data, never today's.
 	const plan = await planSessionScan(tokens, files, status, signal);
 	if (!plan) return [];
-	const res = await execFileStreaming(
-		ripgrep(),
-		["-i", "-F", "--no-heading", "--no-line-number", "--with-filename", "-e", plan.discriminator, "--", ...plan.files],
-		SESSIONS_SCAN_BUDGET_BYTES,
-		signal,
-	);
-	// rg exits 1 when no matches — that's not an error. On any other non-zero
-	// exit rg still PRINTED the matches it found, so keep partial stdout.
-	if (res.status === 1) return [];
-	const out = res.stdout;
-	if (res.status !== 0) {
-		if (!out) {
-			// ENOENT (rg missing) / killed with nothing printed — source is broken,
-			// not empty. Surfacing this distinguishes 'no matches' from 'no scan'.
-			status.sessions = "failed";
-			return [];
-		}
-		status.sessions = "partial";
-	}
-	if (res.budgetHit) status.sessions = "partial";
+	const res = await scanNewestFirst(plan.discriminator, plan.files, status, signal);
+	if (res === null) return [];
+	const out = res;
 
 	const sourceCache = new Map<string, { rel: string; project: string; mtime: number }>();
 	const hits: MemoryHit[] = [];
