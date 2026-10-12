@@ -94,6 +94,9 @@ async function hostReady(host) {
 	}
 }
 
+/** The provider was never set up here — distinct from a provider that broke. */
+const UNCONFIGURED = /API key not found|not configured|no credentials|Set [A-Z_]+_API_KEY/i;
+
 /** One probe on one host. Never throws: a dead host is a result, not a crash. */
 async function probeHost(host, key) {
 	const probe = PROBES[key];
@@ -116,6 +119,9 @@ async function probeHost(host, key) {
 	const timedOut = Number(seconds) >= timeoutSec;
 	const verdict = probe.expect.test(output) && !probe.reject.test(output)
 		? (probe.warn?.test(output) ? "частично" : "живо")
+		// A missing credential is a host that never had the provider, not a broken
+		// one: calling it ОТКАЗ hides the real failures behind expected noise.
+		: UNCONFIGURED.test(output) ? "не настроен"
 		: probe.reject.test(output) ? "ОТКАЗ"
 		: timedOut ? "ТАЙМАУТ" : "ПУСТО";
 	return { host, key, verdict, seconds, line: line.slice(0, 90) };
@@ -141,15 +147,17 @@ for (const host of hosts) {
 	}
 }
 
-const broken = results.filter((r) => r.verdict !== "живо" && r.verdict !== "частично");
+const skipped = results.filter((r) => r.verdict === "не настроен");
+const broken = results.filter((r) => !["живо", "частично", "не настроен"].includes(r.verdict));
 const partial = results.filter((r) => r.verdict === "частично");
 console.log();
 console.log(
-	`  проверок ${results.length}, живых ${results.length - broken.length - partial.length}` +
-	`, частично ${partial.length}, не ответили ${broken.length}` +
+	`  проверок ${results.length}, живых ${results.length - broken.length - partial.length - skipped.length}` +
+	`, частично ${partial.length}, не настроено ${skipped.length}, не ответили ${broken.length}` +
 	(unreachable.length ? `, без связи ${unreachable.length}` : ""),
 );
 for (const r of partial) console.log(`    ${r.host} / ${PROBES[r.key].title}: частично — ${r.line}`);
+for (const r of skipped) console.log(`    ${r.host} / ${PROBES[r.key].title}: не настроен — провайдера здесь нет`);
 for (const r of broken) console.log(`    ${r.host} / ${PROBES[r.key].title}: ${r.verdict} — ${r.line}`);
 for (const u of unreachable) console.log(`    ${u.host}: нет связи — ${u.reason}`);
 // Машина без связи не делает сборку плохой: это про сеть, а не про выпуск.
