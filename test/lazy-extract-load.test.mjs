@@ -106,7 +106,7 @@ function buildChildScript(moduleUrl) {
 
 			assert.equal(existsSync(markerPath), true, "extract.ts did not load on first use");
 			assert.equal(result.details.successful, 1);
-			assert.match(result.content.at(-1).text, /preserving first-use extraction/);
+			assert.match(result.content.find((item) => item.type === "text").text, /preserving first-use extraction/);
 		} finally {
 			await new Promise((resolve) => server.close(resolve));
 		}

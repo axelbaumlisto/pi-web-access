@@ -71,6 +71,10 @@ export async function searchWithDuckDuckGo(query: string, options: SearchOptions
 
 		const { parseHTML } = await import("linkedom");
 		const { document } = parseHTML(await response.text());
+		// DuckDuckGo's bot check answers 202 with an anomaly/challenge page instead of results.
+		if (response.status === 202 || document.querySelector(".anomaly-modal__box, #challenge-form")) {
+			throw new Error(`DuckDuckGo blocked the request with a bot check (HTTP ${response.status}, rate limited); use another search provider`);
+		}
 		const filters = normalizeDomainFilters(options.domainFilter);
 		const results: SearchResult[] = [];
 		let parseableResults = 0;
@@ -87,8 +91,8 @@ export async function searchWithDuckDuckGo(query: string, options: SearchOptions
 			results.push({ title, url: resultUrl, snippet });
 			if (results.length >= normalizeSearchResultCount(options.numResults)) break;
 		}
-		if (parseableResults === 0) {
-			throw new Error("DuckDuckGo returned no parseable results (invalid response)");
+		if (parseableResults === 0 && !document.querySelector(".no-results__message")) {
+			throw new Error("DuckDuckGo returned no parseable results (invalid response; the page format may have changed)");
 		}
 
 		activityMonitor.logComplete(activityId, response.status);

@@ -281,17 +281,17 @@ function isAbortError(err: unknown): boolean {
 	return errorMessage(err).toLowerCase().includes("abort");
 }
 
-// Upstream v0.33+: OpenAI search honours numResults and recencyFilter itself
-// (instructions + result slicing + alpha `recency`), so AUTO no longer skips it
-// for those options. The old fork gate would have fallen through to Exa.
-async function tryOpenAIInAuto(query: string, options: FullSearchOptions, fallback: AutoFallback): Promise<AttributedSearchResponse | null> {
+type TakeAutoResult = (result: SearchResponse, provider: ResolvedSearchProvider) => AttributedSearchResponse | null;
+
+async function tryOpenAIInAuto(query: string, options: FullSearchOptions, fallbackErrors: string[], take: TakeAutoResult): Promise<AttributedSearchResponse | null> {
 	try {
 		if (await isOpenAISearchAvailable(options.extensionContext)) {
-			return nonEmptyOrThrow(await searchWithOpenAI(query, options, options.extensionContext), "openai");
+			const result = await searchWithOpenAI(query, options, options.extensionContext);
+			return take(result, "openai");
 		}
 	} catch (err) {
 		if (isAbortError(err)) throw err;
-		fallback.push("OpenAI", err);
+		fallbackErrors.push(`OpenAI: ${redactError(errorMessage(err))}`);
 	}
 	return null;
 }
@@ -326,46 +326,6 @@ async function searchWithGemini(
 	}
 
 	return null;
-}
-
-/** A provider response with neither a synthesized answer nor any source. */
-function isEmptyResponse(r: SearchResponse): boolean {
-	return (!r.results || r.results.length === 0) && !r.answer?.trim();
-}
-
-/**
- * AUTO-mode empty-result fallback (fork): a provider that answers HTTP 200 with
- * neither an answer nor any source must NOT stop the chain. `nonEmptyOrThrow`
- * turns such a response into an `EmptyResultError` so the provider's ordinary
- * `catch` records it and the loop continues; the attributed empty response is
- * kept so the caller still gets an honest "no results" from a real provider if
- * EVERY provider comes back empty. Explicit / "all" / routing modes stay strict.
- */
-class EmptyResultError extends Error {
-	readonly empty: AttributedSearchResponse;
-	constructor(empty: AttributedSearchResponse) {
-		super(`${empty.provider}: empty result`);
-		this.name = "EmptyResultError";
-		this.empty = empty;
-	}
-}
-
-function nonEmptyOrThrow(result: SearchResponse | null, name: ResolvedSearchProvider): AttributedSearchResponse {
-	if (!result) throw new Error(`${name}: no result`);
-	const attributed = { ...result, provider: name };
-	if (isEmptyResponse(result)) throw new EmptyResultError(attributed);
-	return attributed;
-}
-
-/** Per-search accumulator for the auto chain: diagnostics + last empty response. */
-class AutoFallback {
-	readonly errors: string[] = [];
-	lastEmpty: AttributedSearchResponse | undefined;
-	/** Record a provider failure; the message is pattern-redacted (F3) for every provider. */
-	push(label: string, err: unknown): void {
-		if (err instanceof EmptyResultError) this.lastEmpty = err.empty;
-		this.errors.push(`${label}: ${redactError(errorMessage(err))}`);
-	}
 }
 
 function providerErrorStatus(message: string): number | undefined {
@@ -702,181 +662,202 @@ export async function search(query: string, options: FullSearchOptions = {}): Pr
 		return searchWithConfiguredRouting(query, options, config.searchRouting);
 	}
 
-	// See EmptyResultError / nonEmptyOrThrow: every provider below is wrapped so an
-	// HTTP-200-but-empty answer continues the chain instead of ending it.
-	const fallback = new AutoFallback();
+	const fallbackErrors: string[] = [];
+	// A 200 with neither an answer nor a source keeps the chain going. If every
+	// provider is empty, the first empty answer beats a synthesized failure.
+	let firstEmpty: AttributedSearchResponse | undefined;
+	const take: TakeAutoResult = (result, provider) => {
+		const response = { ...result, provider };
+		if (result.results?.length || result.answer?.trim()) return response;
+		firstEmpty ??= response;
+		fallbackErrors.push(`${providerLabel(provider)}: no results`);
+		return null;
+	};
 	const allowed = new Set(config.allowedProviders ?? RESOLVED_SEARCH_PROVIDERS);
 
 	if (allowed.has("searxng") && isSearXNGAvailable()) {
 		try {
-			return nonEmptyOrThrow(await searchWithSearXNG(query, options), "searxng");
+			const result = await searchWithSearXNG(query, options);
+			const response = take(result, "searxng"); if (response) return response;
 		} catch (err) {
 			if (isAbortError(err)) throw err;
-			fallback.push("SearXNG", err);
+			fallbackErrors.push(`SearXNG: ${redactError(errorMessage(err))}`);
 		}
 	}
 
 	let triedOpenAI = false;
 	if (allowed.has("openai") && (!options.extensionContext || isOpenAISubscriptionModelSelected(options.extensionContext))) {
 		triedOpenAI = true;
-		const result = await tryOpenAIInAuto(query, options, fallback);
+		const result = await tryOpenAIInAuto(query, options, fallbackErrors, take);
 		if (result) return result;
 	}
 
 	if (allowed.has("exa") && isExaAvailable()) {
 		try {
-			return nonEmptyOrThrow(await searchWithExa(query, options), "exa");
+			const result = await searchWithExa(query, options);
+			const response = result && take(result, "exa"); if (response) return response;
 		} catch (err) {
 			if (err instanceof CredentialResolutionError || isAbortError(err)) throw err;
-			fallback.push("Exa", err);
+			fallbackErrors.push(`Exa: ${redactError(errorMessage(err))}`);
 		}
 	}
 
 	if (allowed.has("openai") && !triedOpenAI) {
-		const result = await tryOpenAIInAuto(query, options, fallback);
+		const result = await tryOpenAIInAuto(query, options, fallbackErrors, take);
 		if (result) return result;
 	}
 
 	if (allowed.has("brave") && isBraveAvailable()) {
 		try {
-			return nonEmptyOrThrow(await searchWithBrave(query, options), "brave");
+			const result = await searchWithBrave(query, options);
+			const response = take(result, "brave"); if (response) return response;
 		} catch (err) {
 			if (isAbortError(err)) throw err;
-			fallback.push("Brave", err);
+			fallbackErrors.push(`Brave: ${redactError(errorMessage(err))}`);
 		}
 	}
 
 	if (allowed.has("parallel") && isParallelAvailable()) {
 		try {
-			return nonEmptyOrThrow(await searchWithParallel(query, options), "parallel");
+			const result = await searchWithParallel(query, options);
+			const response = take(result, "parallel"); if (response) return response;
 		} catch (err) {
 			if (isAbortError(err)) throw err;
-			fallback.push("Parallel", err);
+			fallbackErrors.push(`Parallel: ${redactError(errorMessage(err))}`);
 		}
 	}
 
 	if (allowed.has("tinyfish") && isTinyFishAvailable()) {
 		try {
-			return nonEmptyOrThrow(await searchWithTinyFish(query, options), "tinyfish");
+			const result = await searchWithTinyFish(query, options);
+			const response = take(result, "tinyfish"); if (response) return response;
 		} catch (err) {
 			if (isAbortError(err)) throw err;
-			fallback.push("TinyFish", err);
+			fallbackErrors.push(`TinyFish: ${redactError(errorMessage(err))}`);
 		}
 	}
 
 	if (allowed.has("search1api") && isSearch1APIAvailable()) {
 		try {
-			return nonEmptyOrThrow(await searchWithSearch1API(query, options), "search1api");
+			const result = await searchWithSearch1API(query, options);
+			const response = take(result, "search1api"); if (response) return response;
 		} catch (err) {
 			if (isAbortError(err)) throw err;
-			fallback.push("Search1API", err);
+			fallbackErrors.push(`Search1API: ${redactError(errorMessage(err))}`);
 		}
 	}
 
 	if (allowed.has("searchinfinity") && isSearchinfinityAvailable()) {
 		try {
-			return nonEmptyOrThrow(await searchWithSearchinfinity(query, options), "searchinfinity");
+			const result = await searchWithSearchinfinity(query, options);
+			const response = take(result, "searchinfinity"); if (response) return response;
 		} catch (err) {
 			if (isAbortError(err)) throw err;
-			fallback.push("Searchinfinity", err);
+			fallbackErrors.push(`Searchinfinity: ${redactError(errorMessage(err))}`);
 		}
 	}
 
 	if (allowed.has("querit") && isQueritAvailable()) {
 		try {
-			return nonEmptyOrThrow(await searchWithQuerit(query, options), "querit");
+			const result = await searchWithQuerit(query, options);
+			const response = take(result, "querit"); if (response) return response;
 		} catch (err) {
 			if (isAbortError(err)) throw err;
-			fallback.push("Querit", err);
+			fallbackErrors.push(`Querit: ${redactError(errorMessage(err))}`);
 		}
 	}
 
 	if (allowed.has("tavily") && isTavilyAvailable()) {
 		try {
-			return nonEmptyOrThrow(await searchWithTavily(query, options), "tavily");
+			const result = await searchWithTavily(query, options);
+			const response = take(result, "tavily"); if (response) return response;
 		} catch (err) {
 			if (isAbortError(err)) throw err;
-			fallback.push("Tavily", err);
+			fallbackErrors.push(`Tavily: ${redactError(errorMessage(err))}`);
 		}
 	}
 
 	if (allowed.has("firecrawl") && isFirecrawlAvailable()) {
 		try {
-			return nonEmptyOrThrow(await searchWithFirecrawl(query, options), "firecrawl");
+			const result = await searchWithFirecrawl(query, options);
+			const response = take(result, "firecrawl"); if (response) return response;
 		} catch (err) {
 			if (isAbortError(err)) throw err;
-			fallback.push("Firecrawl", err);
+			fallbackErrors.push(`Firecrawl: ${redactError(errorMessage(err))}`);
 		}
 	}
 
 	if (allowed.has("jina") && isJinaSearchAvailable()) {
 		try {
-			return nonEmptyOrThrow(await searchWithJina(query, options), "jina");
+			const result = await searchWithJina(query, options);
+			const response = take(result, "jina"); if (response) return response;
 		} catch (err) {
 			if (isAbortError(err)) throw err;
-			fallback.push("Jina", err);
+			fallbackErrors.push(`Jina: ${redactError(errorMessage(err))}`);
 		}
 	}
 
 	if (allowed.has("serpdive") && isSerpdiveAvailable()) {
 		try {
-			return nonEmptyOrThrow(await searchWithSerpdive(query, options), "serpdive");
+			const result = await searchWithSerpdive(query, options);
+			const response = take(result, "serpdive"); if (response) return response;
 		} catch (err) {
 			if (isAbortError(err)) throw err;
-			fallback.push("SERPdive", err);
+			fallbackErrors.push(`SERPdive: ${redactError(errorMessage(err))}`);
 		}
 	}
 
 	if (allowed.has("kagi") && isKagiAvailable()) {
 		try {
-			return nonEmptyOrThrow(await searchWithKagi(query, options), "kagi");
+			const result = await searchWithKagi(query, options);
+			const response = take(result, "kagi"); if (response) return response;
 		} catch (err) {
 			if (isAbortError(err)) throw err;
-			fallback.push("Kagi", err);
+			fallbackErrors.push(`Kagi: ${redactError(errorMessage(err))}`);
 		}
 	}
 
 	if (allowed.has("bocha") && isBochaAvailable()) {
 		try {
-			return nonEmptyOrThrow(await searchWithBocha(query, options), "bocha");
+			const result = await searchWithBocha(query, options);
+			const response = take(result, "bocha"); if (response) return response;
 		} catch (err) {
 			if (isAbortError(err)) throw err;
-			fallback.push("Bocha", err);
+			fallbackErrors.push(`Bocha: ${redactError(errorMessage(err))}`);
 		}
 	}
 
 	if (allowed.has("ollama") && isOllamaAvailable()) {
 		try {
-			return nonEmptyOrThrow(await searchWithOllama(query, options), "ollama");
+			const result = await searchWithOllama(query, options);
+			const response = take(result, "ollama"); if (response) return response;
 		} catch (err) {
 			if (isAbortError(err)) throw err;
-			fallback.push("Ollama", err);
+			fallbackErrors.push(`Ollama: ${redactError(errorMessage(err))}`);
 		}
 	}
 
 	if (allowed.has("perplexity") && isPerplexityAvailable()) {
 		try {
-			return nonEmptyOrThrow(await searchWithPerplexity(query, options), "perplexity");
+			const result = await searchWithPerplexity(query, options);
+			const response = take(result, "perplexity"); if (response) return response;
 		} catch (err) {
 			if (isAbortError(err)) throw err;
-			fallback.push("Perplexity", err);
+			fallbackErrors.push(`Perplexity: ${redactError(errorMessage(err))}`);
 		}
 	}
 
 	if (allowed.has("gemini")) try {
-		return nonEmptyOrThrow(await searchWithGemini(query, options, false), "gemini");
+		const geminiResult = await searchWithGemini(query, options, false);
+		const response = geminiResult && take(geminiResult, "gemini"); if (response) return response;
 	} catch (err) {
 		if (isAbortError(err)) throw err;
-		fallback.push("Gemini", err);
+		fallbackErrors.push(`Gemini: ${redactError(errorMessage(err))}`);
 	}
 
-	// All available providers returned empty (but none errored fatally) — return
-	// the last empty response rather than throwing, so the caller gets an honest
-	// "no results" from a real provider instead of an error.
-	if (fallback.lastEmpty) return fallback.lastEmpty;
-
-	if (fallback.errors.length > 0) {
-		throw new Error(`Auto provider search failed:\n  - ${fallback.errors.join("\n  - ")}`);
+	if (firstEmpty) return firstEmpty;
+	if (fallbackErrors.length > 0) {
+		throw new Error(`Auto provider search failed:\n  - ${fallbackErrors.join("\n  - ")}`);
 	}
 
 	throw new Error(
@@ -928,8 +909,8 @@ async function searchWithGeminiApi(query: string, options: SearchOptions = {}): 
 		const metadata = data.candidates?.[0]?.groundingMetadata;
 		const resolvedResults = await resolveGroundingChunks(metadata?.groundingChunks, options.signal);
 		const uniqueResults = dedupeResultsByUrl(resolvedResults);
-		// Cap ONLY when the caller supplies a valid explicit count; otherwise return
-		// every unique chunk (preserving the original no-default-cap behavior).
+		// Fork: cap ONLY when the caller supplies a valid explicit count; otherwise
+		// return every unique chunk.
 		const cap = normalizeResultCount(options.numResults);
 		const results = cap === null ? uniqueResults : uniqueResults.slice(0, cap);
 
@@ -974,7 +955,9 @@ async function searchWithGeminiWeb(query: string, options: SearchOptions = {}): 
 	}
 }
 
-function appendSearchConstraints(prompt: string, options: SearchOptions): string {
+function buildSearchPrompt(query: string, options: SearchOptions): string {
+	let prompt = `Search the web and answer the following question. Include source URLs for your claims.\nFormat your response as:\n1. A direct answer to the question\n2. Cited sources as markdown links\n\nQuestion: ${query}`;
+
 	if (options.recencyFilter) {
 		const labels: Record<string, string> = {
 			day: "past 24 hours",
@@ -995,9 +978,25 @@ function appendSearchConstraints(prompt: string, options: SearchOptions): string
 	return prompt;
 }
 
-function buildSearchPrompt(query: string, options: SearchOptions): string {
-	const prompt = `Search the web and answer the following question. Include source URLs for your claims.\nFormat your response as:\n1. A direct answer to the question\n2. Cited sources as markdown links\n\nQuestion: ${query}`;
-	return appendSearchConstraints(prompt, options);
+function appendSearchConstraints(prompt: string, options: SearchOptions): string {
+	if (options.recencyFilter) {
+		const labels: Record<string, string> = {
+			day: "past 24 hours",
+			week: "past week",
+			month: "past month",
+			year: "past year",
+		};
+		prompt += `\n\nOnly include results from the ${labels[options.recencyFilter]}.`;
+	}
+
+	if (options.domainFilter?.length) {
+		const includes = options.domainFilter.filter(d => !d.startsWith("-"));
+		const excludes = options.domainFilter.filter(d => d.startsWith("-")).map(d => d.slice(1));
+		if (includes.length) prompt += `\n\nOnly cite sources from: ${includes.join(", ")}`;
+		if (excludes.length) prompt += `\n\nDo not cite sources from: ${excludes.join(", ")}`;
+	}
+
+	return prompt;
 }
 
 // Public numResults contract: integer 1..20. Anything absent/invalid means
@@ -1082,6 +1081,8 @@ async function resolveRedirect(proxyUrl: URL, signal?: AbortSignal): Promise<str
 		});
 		const location = res.headers.get("location");
 		if (!location) return null;
+		// Fork: a redirect target is attacker-controlled, so it is validated and
+		// must stay on https before anything follows it.
 		const resolved = new URL(location, proxyUrl);
 		if (resolved.protocol !== "https:") return null;
 		return (await validateRemoteUrl(resolved)).toString();

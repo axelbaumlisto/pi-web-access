@@ -274,6 +274,7 @@ function loadFetchRouting(): FetchRouting {
 export interface RegisteredToolNames {
 	webSearch?: string;
 	fetchContent?: string;
+	getSearchContent?: string;
 }
 
 /** Guidance for definitive origin 404/410 responses: no extraction provider
@@ -1279,7 +1280,10 @@ async function extractViaHttp(
 		if (options?.mode === "raw") {
 			if (!isTextContentType(contentType)) {
 				activityMonitor.logComplete(activityId, response.status);
-				return { url, title: "", content: "", error: `Unsupported content type in raw mode: ${mimeType || "missing"}`, mimeType, status: response.status };
+				const hint = isPDFContent
+					? " — raw mode does not decode PDFs; retry without mode (Markdown extraction) or with mode \"answer\" and a prompt"
+					: "";
+				return { url, title: "", content: "", error: `Unsupported content type in raw mode: ${mimeType || "missing"}${hint}`, mimeType, status: response.status };
 			}
 			const text = await readTextResponseWithLimit(response, maxResponseSize);
 			activityMonitor.logComplete(activityId, response.status);
@@ -1330,7 +1334,7 @@ async function extractViaHttp(
 					title: result.title,
 					content: options?.mode === "answer"
 						? result.content
-						: `PDF extracted and saved to: ${result.outputPath}\n\nPages: ${result.pages}\nCharacters: ${result.chars}`,
+						: `PDF extracted and saved to: ${result.outputPath}\n\n${result.pages > 0 ? `Pages: ${result.pages}\n` : ""}Characters: ${result.chars}`,
 					error: null,
 				};
 			} catch (err) {

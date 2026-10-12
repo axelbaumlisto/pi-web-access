@@ -58,8 +58,9 @@ test("snippet budget shrinks when the provider already returned an answer", asyn
 		{ query: "q", answer: "A full provider answer that already carries the substance.", provider: "p", error: null, results: sources },
 	]);
 
-	assert.ok(/z{600}/.test(evidence) && !/z{601}/.test(evidence), "no answer → 600-char snippets");
-	assert.ok(/z{200}/.test(corroboration) && !/z{201}/.test(corroboration), "answer present → 200-char snippets");
+	// The ellipsis is charged to the budget, so a clamped snippet is limit-1 chars plus "…".
+	assert.ok(/z{599}…/.test(evidence) && !/z{600}/.test(evidence), "no answer → 600-char snippets");
+	assert.ok(/z{199}…/.test(corroboration) && !/z{200}/.test(corroboration), "answer present → 200-char snippets");
 	assert.ok(
 		corroboration.length < evidence.length / 2,
 		`corroboration prompt is far smaller: ${corroboration.length} vs ${evidence.length}`,

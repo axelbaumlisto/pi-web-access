@@ -12,6 +12,8 @@ import { redactError, redactProviderError } from "./redact.ts";
 const chatUrl = () => providerUrl("perplexity");
 const CONFIG_PATH = getWebSearchConfigPath();
 
+const REQUEST_TIMEOUT_MS = 30_000;
+
 const RATE_LIMIT = {
 	maxRequests: 10,
 	windowMs: 60 * 1000,
@@ -131,6 +133,12 @@ async function postPerplexity(
 
 	const apiKey = await getApiKey(options.signal);
 
+	// A stalled connection otherwise holds the search for the whole turn. The deadline is reported as a
+	// timeout, not an abort, so callers fall through to another provider instead of treating it as cancellation.
+	const timeout = AbortSignal.timeout(REQUEST_TIMEOUT_MS);
+	const timedOut = () => timeout.aborted && !options.signal?.aborted;
+	const timeoutError = () => new Error("Perplexity API error 408: request timed out");
+
 	let response: Response;
 	try {
 		response = await fetchWithCredentialRedirects(url, {
@@ -140,14 +148,13 @@ async function postPerplexity(
 				"Content-Type": "application/json",
 			},
 			body: JSON.stringify(body),
-			// Fork: every request carries its own 30s deadline. Without it a
-			// stalled gateway holds the search for the rest of the turn.
-			signal: AbortSignal.any([
-				AbortSignal.timeout(30000),
-				...(options.signal ? [options.signal] : []),
-			]),
+			signal: options.signal ? AbortSignal.any([options.signal, timeout]) : timeout,
 		}, ["Authorization"]);
 	} catch (err) {
+		if (timedOut()) {
+			activityMonitor.logError(activityId, "request timed out");
+			throw timeoutError();
+		}
 		const message = err instanceof Error ? err.message : String(err);
 		const redactedMessage = redactCredential(message, apiKey);
 		if (redactedMessage.toLowerCase().includes("abort")) {
@@ -164,13 +171,20 @@ async function postPerplexity(
 	activityMonitor.logComplete(activityId, response.status);
 
 	if (!response.ok) {
-		const errorText = redactProviderError(await response.text(), apiKey);
+		let errorText: string;
+		try {
+			errorText = redactProviderError(await response.text(), apiKey);
+		} catch (err) {
+			if (timedOut()) throw timeoutError();
+			throw err;
+		}
 		throw new Error(`Perplexity API error ${response.status}: ${errorText}`);
 	}
 
 	try {
 		return await response.json();
 	} catch (err) {
+		if (timedOut()) throw timeoutError();
 		const message = err instanceof Error ? err.message : String(err);
 		throw new Error(`Perplexity API returned invalid JSON: ${redactError(message)}`);
 	}

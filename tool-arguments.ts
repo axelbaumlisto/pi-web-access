@@ -1,6 +1,7 @@
 // Some models send array arguments as a JSON string, for example
 // `provider: "[\"parallel-mcp\"]"`, which fails schema validation before the tool
-// runs. Parse such strings back into arrays of strings; leave anything else as is.
+// runs. Parse such strings back into arrays of strings, reject strings that start
+// with "[" but are not valid JSON, and leave anything else as is.
 export function parseStringifiedArrays(args: unknown, keys: readonly string[]): unknown {
 	if (!args || typeof args !== "object" || Array.isArray(args)) return args;
 	const input = args as Record<string, unknown>;
@@ -14,7 +15,9 @@ export function parseStringifiedArrays(args: unknown, keys: readonly string[]): 
 				output ??= { ...input };
 				output[key] = parsed;
 			}
-		} catch {}
+		} catch {
+			throw new Error(`${key} must be an array of strings; the given value is not valid JSON`);
+		}
 	}
 	return output ?? args;
 }

@@ -17,36 +17,6 @@ interface WebSearchConfig {
 	braveBaseUrl?: unknown;
 }
 
-// Fork: Brave returns HTML in titles/snippets; strip tags and decode entities.
-function stripHtml(s: string): string {
-	const namedEntities: Record<string, string> = {
-		"&amp;": "&",
-		"&lt;": "<",
-		"&gt;": ">",
-		"&quot;": "\"",
-		"&#39;": "'",
-		"&#x27;": "'",
-		"&nbsp;": " ",
-	};
-
-	return s
-		.replace(/<[^>]+>/g, "")
-		.replace(/&(?:amp|lt|gt|quot|nbsp|#39|#x27);|&#\d+;|&#x[0-9a-f]+;/gi, (entity) => {
-			const named = namedEntities[entity.toLowerCase()];
-			if (named !== undefined) return named;
-
-			const radix = entity.slice(0, 3).toLowerCase() === "&#x" ? 16 : 10;
-			const value = Number.parseInt(entity.slice(radix === 16 ? 3 : 2, -1), radix);
-			try {
-				return String.fromCodePoint(value);
-			} catch {
-				return entity;
-			}
-		})
-		.replace(/[ \t]{2,}/g, " ")
-		.trim();
-}
-
 interface NormalizedDomainFilters {
 	allowed: string[];
 	blocked: string[];
@@ -138,6 +108,28 @@ function matchesDomainFilters(url: string, filters: NormalizedDomainFilters): bo
 	}
 
 	return !filters.blocked.some(domain => hostMatchesDomain(hostname, domain));
+}
+
+const HTML_ENTITIES: Record<string, string> = {
+	"&amp;": "&", "&lt;": "<", "&gt;": ">", "&quot;": "\"", "&apos;": "'", "&nbsp;": " ",
+	"&mdash;": "—", "&ndash;": "–", "&hellip;": "…", "&rsquo;": "’", "&lsquo;": "‘",
+	"&rdquo;": "”", "&ldquo;": "“", "&middot;": "·", "&bull;": "•", "&deg;": "°",
+};
+
+/** Brave marks matched terms with tags and escapes the rest. */
+function stripHtml(value: string): string {
+	return value
+		.replace(/<[^>]*>/g, "")
+		.replace(/&[a-z]+;|&#x?[0-9a-f]+;/gi, (entity) => {
+			const named = HTML_ENTITIES[entity.toLowerCase()];
+			if (named) return named;
+			const numeric = /^&#(x?)([0-9a-f]+);$/i.exec(entity);
+			if (!numeric) return entity;
+			const code = Number.parseInt(numeric[2], numeric[1] ? 16 : 10);
+			const valid = code <= 0x10ffff && (code < 0xd800 || code > 0xdfff);
+			return valid ? String.fromCodePoint(code) : entity;
+		})
+		.trim();
 }
 
 export function isBraveAvailable(): boolean {

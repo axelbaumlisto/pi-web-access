@@ -1,7 +1,6 @@
 import type { ModelThinkingLevel, ThinkingLevel } from "@earendil-works/pi-ai";
 import type { complete, Api, Message, Model } from "@earendil-works/pi-ai/compat";
 import type { ExtensionContext } from "@earendil-works/pi-coding-agent";
-import { openCodeSessionHeaders } from "./opencode-session-headers.ts";
 import { findModelWithProviderRouting, isModelInScope, splitThinkingSuffix, type SummaryThinkingLevel } from "./summary-model-scope.ts";
 import type { QueryResultData } from "./storage.ts";
 
@@ -82,10 +81,9 @@ const SNIPPET_BUDGETS = {
 
 function clampSnippet(snippet: string, budgetLeft: number, perSource: number): string {
 	const text = snippet.replace(/\s+/g, " ").trim();
-	if (!text) return "";
 	const limit = Math.min(perSource, budgetLeft);
-	if (limit <= 0) return "";
-	return text.length <= limit ? text : `${text.slice(0, limit)}…`;
+	if (!text || limit <= 0) return "";
+	return text.length <= limit ? text : `${text.slice(0, limit - 1)}…`;
 }
 
 function summarizeQueryResult(result: QueryResultData): string {
@@ -107,9 +105,7 @@ function summarizeQueryResult(result: QueryResultData): string {
 	lines.push("Sources:");
 	// The snippet IS the evidence when a provider returns no answer text — which
 	// is always true for history matches, and common for raw result providers.
-	// Sending titles and URLs alone made the model report "no body text" while
-	// the answer sat in the snippets it never saw.
-	const budget = result.answer.trim() ? SNIPPET_BUDGETS.corroboration : SNIPPET_BUDGETS.evidence;
+	const budget = result.answer?.trim() ? SNIPPET_BUDGETS.corroboration : SNIPPET_BUDGETS.evidence;
 	let budgetLeft = budget.perQuery;
 	for (let i = 0; i < result.results.length; i++) {
 		const source = result.results[i];
@@ -447,7 +443,9 @@ export async function generateSummaryDraft(
 		for (const { model, apiKey, headers, thinkingLevel } of resolved.candidates) {
 			const startedAt = Date.now();
 			try {
-				const sessionHeaders = openCodeSessionHeaders(model, ctx.sessionManager);
+				// sessionId lets pi-ai's OpenCode providers add x-opencode-session. cacheRetention "none" keeps this
+				// one-off call out of the session's prompt cache and Codex continuation, as Pi does for compaction.
+				const sessionId = ctx.sessionManager?.getSessionId?.();
 				const userMessage: Message = {
 					role: "user",
 					content: [{ type: "text", text: prompt }],
@@ -458,16 +456,16 @@ export async function generateSummaryDraft(
 					? requestedThinkingLevel as ThinkingLevel
 					: undefined;
 				const completionOptions = {
-					...(usesRegistryComplete
-						? (sessionHeaders ? { transformHeaders: (requestHeaders: Record<string, string>) => ({ ...requestHeaders, ...sessionHeaders }) } : {})
-						: { apiKey, headers: sessionHeaders ? { ...headers, ...sessionHeaders } : headers }),
+					...(usesRegistryComplete ? {} : { apiKey, headers }),
+					sessionId,
+					cacheRetention: "none" as const,
 					signal: completionSignal,
 					...(requestedThinkingLevel ? { reasoning: requestedThinkingLevel } : {}),
 					...(enabledThinkingLevel ? { reasoningEffort: enabledThinkingLevel } : {}),
 				};
 				checkSummaryDeadline();
 				const completion = thinkingLevel !== undefined && !customCompleteFn && !usesRegistryComplete
-					? piAiCompat!.completeSimple(model, { messages: [userMessage] }, { apiKey, headers: sessionHeaders ? { ...headers, ...sessionHeaders } : headers, signal: completionSignal, ...(enabledThinkingLevel ? { reasoning: enabledThinkingLevel } : {}) })
+					? piAiCompat!.completeSimple(model, { messages: [userMessage] }, { apiKey, headers, sessionId, cacheRetention: "none", signal: completionSignal, ...(enabledThinkingLevel ? { reasoning: enabledThinkingLevel } : {}) })
 					: completeFn(model, { messages: [userMessage] }, completionOptions);
 
 				const response = await raceSummaryOperation(Promise.resolve(completion));

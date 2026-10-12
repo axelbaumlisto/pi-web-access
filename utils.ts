@@ -326,7 +326,7 @@ export function installGlobalProxyFetch(): void {
 	const current = globalThis.fetch as ProxiedFetch;
 	if (typeof current !== "function" || current.__piWebAccessProxyFetch === true) return;
 	const nativeFetch = current;
-	const wrapped: ProxiedFetch = ((input: RequestInfo | URL, init?: ProxiedRequestInit) => {
+	const wrapped: ProxiedFetch = (async (input: RequestInfo | URL, init?: ProxiedRequestInit) => {
 		// Prefer caller-attached __proxy (survives pLimit context loss) over AsyncLocalStorage.
 		const proxy = init?.__proxy ?? getActiveProxy();
 		if (!proxy) return nativeFetch(input, init);
@@ -339,13 +339,24 @@ export function installGlobalProxyFetch(): void {
 		if (!url || (url.protocol !== "http:" && url.protocol !== "https:") || isProxyBypassedUrl(url)) {
 			return nativeFetch(input, init);
 		}
+		if (input instanceof Request) {
+			const request = new Request(input, init);
+			request.signal.throwIfAborted();
+			// Abort body buffering as well as the curl process.
+			const body = request.body === null ? null : new Uint8Array(await new Response(
+				request.body.pipeThrough(new TransformStream(), { signal: request.signal }),
+			).arrayBuffer());
+			init = { ...init, method: request.method, headers: request.headers, body, signal: request.signal, redirect: request.redirect };
+		}
 		return fetchViaCurl(url, init ?? {}, proxy);
 	});
 	wrapped.__piWebAccessProxyFetch = true;
 	globalThis.fetch = wrapped;
 }
 
-function parseHeaderDump(dump: string): { status: number; statusText: string; headers: Array<[string, string]> } {
+// GET bodies are decoded by --compressed, so their length/encoding headers no longer match.
+// HEAD has no body, and its Content-Length is usually why the caller asked.
+function parseHeaderDump(dump: string, keepLengthHeaders: boolean): { status: number; statusText: string; headers: Array<[string, string]> } {
 	const blocks = dump.split(/\r?\n\r?\n/).filter((block) => /^HTTP\/[\d.]+\s+\d{3}/.test(block.trim()));
 	const block = (blocks.length > 0 ? blocks[blocks.length - 1] : "").trim();
 	const lines = block.split(/\r?\n/);
@@ -363,7 +374,7 @@ function parseHeaderDump(dump: string): { status: number; statusText: string; he
 		const separator = line.indexOf(":");
 		if (separator > 0) {
 			const name = line.slice(0, separator).trim();
-			if (name.toLowerCase() === "content-encoding" || name.toLowerCase() === "content-length") continue;
+			if (!keepLengthHeaders && (name.toLowerCase() === "content-encoding" || name.toLowerCase() === "content-length")) continue;
 			headers.push([name, line.slice(separator + 1).trim()]);
 		}
 	}
@@ -429,7 +440,8 @@ async function fetchViaCurlOnce(url: URL, init: RequestInit, proxyUrl: string): 
 		"--write-out", "%{json}",
 	];
 
-	if (method !== "GET" && method !== "HEAD") args.push("-X", method);
+	if (method === "HEAD") args.push("--head");
+	else if (method !== "GET") args.push("-X", method);
 
 	for (const [name, value] of headers.entries()) {
 		if (value === "") continue;
@@ -447,6 +459,9 @@ async function fetchViaCurlOnce(url: URL, init: RequestInit, proxyUrl: string): 
 		await writeFile(requestBodyFile, buffer);
 		args.push("--data-binary", `@${requestBodyFile}`);
 		if (method === "GET") args.unshift("-X", "GET");
+	} else if ((method === "POST" || method === "PUT") && !headers.has("content-length")) {
+		// Native fetch sends a zero length for a bodyless POST/PUT; some origins answer 411 without it.
+		args.push("-H", "Content-Length: 0");
 	}
 
 	args.push(url.toString());
@@ -499,7 +514,7 @@ async function fetchViaCurlOnce(url: URL, init: RequestInit, proxyUrl: string): 
 		await rm(dir, { recursive: true, force: true }).catch(() => {});
 	}
 
-	const { status, statusText, headers: responseHeaders } = parseHeaderDump(dump);
+	const { status, statusText, headers: responseHeaders } = parseHeaderDump(dump, method === "HEAD");
 	if (status === 0) {
 		throw new Error(`Proxy fetch to ${url.toString()} via ${redactProxyUrl(proxyUrl)} returned no HTTP status`);
 	}
@@ -517,7 +532,7 @@ async function fetchViaCurlOnce(url: URL, init: RequestInit, proxyUrl: string): 
 		// Older curl without %{json}; the header dump already provided the status.
 	}
 
-	const nullBody = status === 204 || status === 205 || status === 304;
+	const nullBody = method === "HEAD" || status === 204 || status === 205 || status === 304;
 	const response = new Response(nullBody ? null : new Uint8Array(bodyBuffer), {
 		status,
 		statusText: statusText || undefined,
