@@ -4,6 +4,30 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+## [pi-ext-int-search 1.7.0] - 2026-10-12 (fork release)
+
+Synced to upstream v0.38.0, which now carries four fixes this fork sent back
+(#544 Perplexity deadline, #545 Brave markup, #546 AUTO empty-provider
+fall-through, #547 snippets in the summary prompt). Upstream's own versions are
+used; the fork copies are gone.
+
+### Fixed
+- **History search could return stale sessions and drop today's.** The second
+  pass handed every digest file to one ripgrep call, and ripgrep searches them
+  in parallel and prints whichever finishes first — so the byte budget cut an
+  arbitrary set, not the oldest. On a CI runner the newest session never
+  printed at all while 17 older ones filled the budget. The scan now runs in
+  batches of 8 files, newest batch first, sharing one budget.
+- **A deadline looked like a cancellation** (upstream's take on #544): a
+  Perplexity request that hits its own 30 s limit is reported as a 408 timeout,
+  so the chain moves on instead of treating it as the caller giving up.
+- **A clamped snippet overran its budget by one character** (upstream's take on
+  #547): the ellipsis is now charged to the limit.
+- **CI could not install or run this package off a developer machine.** The
+  lockfile recorded one @esbuild platform instead of 26, so `npm ci` failed on
+  Linux, and the runner had no ripgrep, so a third of the history tests failed
+  for a missing tool. Both are fixed in the workflow and the lockfile.
+
 ## [pi-ext-int-search 1.6.4] - 2026-10-10 (fork release)
 
 Same content as 1.6.3, which npm left stuck in staging and never served.
