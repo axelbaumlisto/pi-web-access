@@ -1,11 +1,21 @@
 # What this fork could give back
 
-**Sent:** [#544](https://github.com/nicobailon/pi-web-access/pull/544) deadline ·
+**Merged upstream, all four:**
+[#544](https://github.com/nicobailon/pi-web-access/pull/544) Perplexity deadline ·
 [#545](https://github.com/nicobailon/pi-web-access/pull/545) Brave markup ·
 [#546](https://github.com/nicobailon/pi-web-access/pull/546) empty-provider fallthrough ·
 [#547](https://github.com/nicobailon/pi-web-access/pull/547) snippets in the summary prompt.
-Each is branched off upstream `main`, carries its own failing-without-the-fix test, and leaves
-this fork's features out.
+
+The maintainer tightened two of them before merging, and both corrections were of one kind — we
+proved the mechanism was wired up, not that it behaved correctly at the boundary:
+
+- **#544**: our shared `AbortSignal.any` made a deadline indistinguishable from caller
+  cancellation, so the provider reported "aborted". Upstream separates them and reports a 408
+  timeout, which lets the chain move on.
+- **#547**: the ellipsis was appended *outside* the limit, so a clamped snippet overran its budget
+  by one character.
+
+Both now live in this fork through the v0.38.0 merge; our own copies are gone.
 
 The fork is 66 files ahead of `nicobailon/pi-web-access`. Most of that is ours
 by definition — `memory_search`, unified proxy mode, destination-first
