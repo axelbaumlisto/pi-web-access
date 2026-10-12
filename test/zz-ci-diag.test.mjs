@@ -29,14 +29,14 @@ test("DIAG: what the digest sees on this runner", () => {
 		console.log("DIAGOUT " + JSON.stringify({ ms: Date.now() - t0, refresh: r, count: files.length, first: names.slice(0,3), hasNewest: names.includes("2026-09-04T12-00-00-000Z_new.jsonl") }));
 
 		// Сырой второй проход: сколько байт отдал rg, в каком порядке и что распарсилось.
-		const ms = await import(${JSON.stringify('../memory-search.ts')});
+		const ms = await import(${JSON.stringify(new URL("../memory-search.ts", import.meta.url).href)});
 		const res = await ms.searchMemory("zebra-token", { scope: "all", sources: ["sessions"], limit: 10, cwd: "/tmp" });
 		const { execFileSync } = await import("node:child_process");
 		const rgPath = process.env.RG_PATH || "rg";
 		let bytes = 0, firstFile = "", rows = 0;
 		try {
 			const raw = execFileSync(rgPath, ["-i","-F","--no-heading","--no-line-number","--with-filename","-e","zebra-token","--", ...files], { maxBuffer: 400*1024*1024, encoding: "utf8" });
-			bytes = raw.length; rows = raw.split("\n").length;
+			bytes = raw.length; rows = raw.split(String.fromCharCode(10)).length;
 			const sep = raw.indexOf(".jsonl:");
 			firstFile = (m.sessionSourceForDigest(raw.slice(0, sep + 6)) || "").split("/").pop();
 		} catch (e) { firstFile = "ERR " + (e.message || "").slice(0, 60); }
